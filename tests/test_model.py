@@ -867,6 +867,21 @@ def test_kv_cache_shapes():
         assert layer_past.shape == (1, 8, kv_dim)
 
 
+def test_swiglu_clamp_caps_extremes_and_noop_when_none():
+    from osrt.model import ExpertFFN
+    # clamp=None must be bit-identical to a plain SwiGLU.
+    e = ExpertFFN(8, 16, clamp=None)
+    xx = torch.randn(3, 8)
+    ref = e.w_down(F.silu(e.w_gate(xx)) * e.w_up(xx))
+    assert torch.allclose(e(xx), ref)
+    # clamp keeps the output finite even with pathological weights.
+    ec = ExpertFFN(8, 16, clamp=10.0)
+    with torch.no_grad():
+        ec.w_gate.weight.mul_(1000)
+        ec.w_up.weight.mul_(1000)
+    assert torch.isfinite(ec(torch.randn(4, 8) * 5)).all()
+
+
 def test_gqa_grouped_heads_cache_and_decode():
     """GQA with fewer KV heads than query heads: latent cache is sized to
     num_kv_heads, and cached decode matches a full forward pass."""

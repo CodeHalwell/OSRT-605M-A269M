@@ -60,6 +60,10 @@ class OSRTConfig(PretrainedConfig):
         n_hc: int = 4,
         mhc_sinkhorn_iters: int = 20,
 
+        # SwiGLU stability clamp applied inside every expert (shared + routed).
+        # None disables it (bit-identical to the un-clamped path).
+        swiglu_clamp: float | None = None,
+
         # --- MoE (v5 architecture) ---
         # No dense FFN. Shared expert replaces it at larger hidden size.
         # 8 routed experts × hidden 2048, top-2 (Mixtral-style).
@@ -225,6 +229,7 @@ class OSRTConfig(PretrainedConfig):
         self.use_mhc = use_mhc
         self.n_hc = n_hc
         self.mhc_sinkhorn_iters = mhc_sinkhorn_iters
+        self.swiglu_clamp = swiglu_clamp
 
         self.num_routed_experts = num_routed_experts
         self.top_k_experts = top_k_experts

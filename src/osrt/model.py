@@ -96,15 +96,25 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 class ExpertFFN(nn.Module):
     """SwiGLU feed-forward. Used for both shared and routed experts."""
 
-    def __init__(self, dim: int, hidden: int) -> None:
+    def __init__(self, dim: int, hidden: int, clamp: float | None = None) -> None:
         super().__init__()
         hidden = 64 * ((hidden + 63) // 64)  # TC-align
         self.w_gate = nn.Linear(dim, hidden, bias=False)
         self.w_up = nn.Linear(dim, hidden, bias=False)
         self.w_down = nn.Linear(hidden, dim, bias=False)
+        # Optional SwiGLU stability clamp (ARCHITECTURE.md §7.8): bound the
+        # gate (max) and up (both sides) pre-activations so a single extreme
+        # activation can't blow up the product. None → no clamp (no-op for a
+        # healthy model; the bound just caps tails).
+        self.clamp = clamp
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+        gate = self.w_gate(x)
+        up = self.w_up(x)
+        if self.clamp is not None:
+            gate = gate.clamp(max=self.clamp)
+            up = up.clamp(min=-self.clamp, max=self.clamp)
+        return self.w_down(F.silu(gate) * up)
 
 
 def orthogonal_expert_init(expert: ExpertFFN, seed: int, gain: float = 1.0) -> None:
@@ -181,11 +191,14 @@ class MoELayer(nn.Module):
 
         # Shared expert: always active, larger hidden than routed experts.
         # Replaces v4's parallel dense FFN.
-        self.shared_expert = ExpertFFN(config.dim, config.shared_expert_hidden)
+        clamp = getattr(config, "swiglu_clamp", None)
+        self.shared_expert = ExpertFFN(
+            config.dim, config.shared_expert_hidden, clamp=clamp,
+        )
 
         # Routed experts
         self.experts = nn.ModuleList([
-            ExpertFFN(config.dim, config.expert_hidden)
+            ExpertFFN(config.dim, config.expert_hidden, clamp=clamp)
             for _ in range(self.num_routed)
         ])
 
