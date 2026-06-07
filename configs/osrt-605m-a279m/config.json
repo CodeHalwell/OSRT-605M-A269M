@@ -50,6 +50,7 @@
   "router_seq_balance_loss_coeff": 0.0,
   "router_z_loss_coeff": 0.001,
   "shared_expert_hidden": 2816,
+  "spec_draft_loops": 3,
   "swiglu_clamp": 10.0,
   "system_token_id": 13,
   "think_close_id": 8,
