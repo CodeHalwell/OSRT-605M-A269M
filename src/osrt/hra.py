@@ -93,7 +93,9 @@ def inject_hra(
     rank: int = 256,
     scale: float = 1.0,
     freeze_pretrained: bool = False,
-    target_modules: tuple[str, ...] = ("qkv", "out_proj", "w_gate", "w_up", "w_down"),
+    target_modules: tuple[str, ...] = (
+        "q_proj", "kv_down", "v_from_k", "out_proj", "w_gate", "w_up", "w_down",
+    ),
 ) -> list[nn.Parameter]:
     """Inject HRA adapters into all target linear layers in the model.
 

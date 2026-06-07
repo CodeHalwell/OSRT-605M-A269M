@@ -37,6 +37,12 @@ class OSRTConfig(PretrainedConfig):
         dim: int = 1536,
         heads: int = 24,
         head_dim: int = 64,
+        # GQA: query heads share num_kv_heads K/V heads (groups of
+        # heads // num_kv_heads). None → num_kv_heads = heads (no grouping).
+        # The K/V are derived from a single compressed latent (MLA-style):
+        # we cache only that latent and recompute K and V from it, so the
+        # cache is ~half a full K+V cache regardless of the GQA ratio.
+        num_kv_heads: int | None = None,
         vocab_size: int = 32768,
         real_vocab_size: int = 32768,
 
@@ -201,6 +207,7 @@ class OSRTConfig(PretrainedConfig):
         self.dim = dim
         self.heads = heads
         self.head_dim = head_dim
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else heads
         self.real_vocab_size = real_vocab_size
 
         self.num_blocks = num_blocks
@@ -269,6 +276,12 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"heads ({self.heads}) * head_dim ({self.head_dim}) = "
                 f"{self.heads * self.head_dim} must equal dim ({self.dim})"
+            )
+        # GQA: query heads must split evenly into KV-head groups.
+        if self.heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"heads ({self.heads}) must be divisible by num_kv_heads "
+                f"({self.num_kv_heads}) for grouped-query attention"
             )
         # RoPE rotates pairs of dimensions, so head_dim must be even.
         if self.head_dim % 2 != 0:

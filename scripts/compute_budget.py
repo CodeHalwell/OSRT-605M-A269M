@@ -20,7 +20,7 @@ from osrt.model import OSRTForCausalLM
 # Map a parameter name to a budget category.
 _CATEGORIES = [
     ("embedding", lambda n: "embedding" in n),
-    ("attention", lambda n: any(k in n for k in ("qkv", "out_proj", "norm_q", "norm_k", "norm_attn"))),
+    ("attention", lambda n: any(k in n for k in ("q_proj", "kv_down", "v_from_k", "out_proj", "norm_q", "norm_k", "norm_attn"))),
     ("shared_expert", lambda n: "shared_expert" in n),
     ("routed_experts", lambda n: ".moe.experts." in n),
     ("router", lambda n: "router" in n or "moe_gate" in n),

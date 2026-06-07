@@ -859,10 +859,38 @@ def test_kv_cache_shapes():
     expected_layers = cfg.num_blocks * cfg.recursive_loops
     assert out.past_key_values is not None
     assert len(out.past_key_values) == expected_layers
+    # MLA-style cache: one un-rotated latent per effective layer,
+    # shape (batch, seq, kv_dim) where kv_dim = num_kv_heads * head_dim.
+    kv_dim = cfg.num_kv_heads * cfg.head_dim
     for layer_past in out.past_key_values:
-        k, v = layer_past
-        assert k.shape == (1, cfg.heads, 8, cfg.head_dim)
-        assert v.shape == (1, cfg.heads, 8, cfg.head_dim)
+        assert isinstance(layer_past, torch.Tensor)
+        assert layer_past.shape == (1, 8, kv_dim)
+
+
+def test_gqa_grouped_heads_cache_and_decode():
+    """GQA with fewer KV heads than query heads: latent cache is sized to
+    num_kv_heads, and cached decode matches a full forward pass."""
+    cfg = tiny_config(heads=4, head_dim=32, num_kv_heads=2)
+    assert cfg.dim == 128 and cfg.num_kv_heads == 2
+    model = OSRTForCausalLM(cfg)
+    model.eval()
+
+    full = torch.randint(0, cfg.vocab_size, (1, 6))
+    # Latent cache dim follows num_kv_heads, not query heads.
+    out = model(input_ids=full[:, :5], use_cache=True)
+    kv_dim = cfg.num_kv_heads * cfg.head_dim
+    assert out.past_key_values[0].shape == (1, 5, kv_dim)
+
+    # One cached decode step must match the equivalent full forward.
+    step = model(
+        input_ids=full[:, 5:6],
+        past_key_values=out.past_key_values,
+        use_cache=True,
+    )
+    ref = model(input_ids=full, use_cache=False)
+    assert torch.allclose(
+        step.logits[:, -1], ref.logits[:, -1], atol=1e-4,
+    ), "GQA cached decode diverged from full forward"
 
 
 def test_kv_cache_extend_matches_full_pass():
@@ -1668,8 +1696,8 @@ def test_hybrid_optimizer_step_updates_both_kinds_of_params():
     hybrid = HybridMuonAdamW(muon, adamw)
 
     # Snapshot one Muon-managed and one AdamW-managed parameter.
-    qkv_weight_before = (
-        model.model.blocks[0].qkv.weight.detach().clone()
+    q_weight_before = (
+        model.model.blocks[0].q_proj.weight.detach().clone()
     )
     embedding_before = model.model.embedding.weight.detach().clone()
 
@@ -1679,13 +1707,13 @@ def test_hybrid_optimizer_step_updates_both_kinds_of_params():
     out.loss.backward()
     hybrid.step()
 
-    qkv_diff = (
-        model.model.blocks[0].qkv.weight.detach() - qkv_weight_before
+    q_diff = (
+        model.model.blocks[0].q_proj.weight.detach() - q_weight_before
     ).abs().max().item()
     emb_diff = (
         model.model.embedding.weight.detach() - embedding_before
     ).abs().max().item()
-    assert qkv_diff > 0, "Muon should have updated qkv.weight"
+    assert q_diff > 0, "Muon should have updated q_proj.weight"
     assert emb_diff > 0, "AdamW should have updated embedding.weight"
 
 

@@ -18,6 +18,7 @@ OSRT_605M_A279M: dict = dict(
     dim=1536,
     heads=24,
     head_dim=64,
+    num_kv_heads=8,            # GQA 24/8 + MLA-style compressed-latent KV cache
     vocab_size=65536,
     real_vocab_size=65536,
     num_blocks=3,

@@ -695,10 +695,23 @@ class RecursiveBlock(nn.Module):
         super().__init__()
         self.heads = config.heads
         self.head_dim = config.head_dim
+        self.kv_heads = config.num_kv_heads
+        self.kv_dim = self.kv_heads * self.head_dim
+        self.group_size = self.heads // self.kv_heads
 
-        # Attention
+        # Attention — GQA with an MLA-style compressed K/V latent.
+        #   q_proj:    full query projection (heads × head_dim)
+        #   kv_down:   compress the hidden state to a single latent of
+        #              kv_dim (= kv_heads × head_dim). THIS is the only
+        #              thing cached — un-rotated.
+        #   v_from_k:  derive V from that same latent (V = W·c + b). Both
+        #              K and V are linear functions of one cached latent,
+        #              the same expressivity class as DeepSeek MLA's shared
+        #              c_KV, at ~half the cache of storing K and V.
         self.norm_attn = nn.RMSNorm(config.dim)
-        self.qkv = nn.Linear(config.dim, config.dim * 3, bias=False)
+        self.q_proj = nn.Linear(config.dim, self.heads * self.head_dim, bias=False)
+        self.kv_down = nn.Linear(config.dim, self.kv_dim, bias=False)
+        self.v_from_k = nn.Linear(self.kv_dim, self.kv_dim, bias=True)
         # QK-Norm: per-head RMSNorm on q and k before RoPE+SDPA. Bounds
         # attention logits so they don't explode in bf16/fp8 — protects
         # the downstream MoE router from inheriting pathological hidden
@@ -739,55 +752,65 @@ class RecursiveBlock(nn.Module):
         rope_cos: Tensor,
         rope_sin: Tensor,
         loop_idx: int,
-        past_key_value: tuple[Tensor, Tensor] | None = None,
+        past_key_value: Tensor | None = None,
         use_cache: bool = False,
-    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+    ) -> tuple[Tensor, Tensor | None]:
         B, S, D = x.shape
 
         # Per-pass residual adapter (unchanged from v4)
         adapter_out = adapter_scale * (x @ adapter_a @ adapter_b)
 
-        # ── Attention with RoPE ──
+        # ── Attention: GQA + MLA-style compressed K/V latent ──
         h = self.norm_attn(x)
-        qkv = self.qkv(h)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, S, self.heads, self.head_dim)
-        k = k.view(B, S, self.heads, self.head_dim)
-        v = v.view(B, S, self.heads, self.head_dim)
-        # QK-Norm: applied BEFORE RoPE so the rotation operates on
-        # already-bounded vectors. Cached K from prior decode steps was
-        # rotated post-norm at insertion time, so applying norm only to
-        # the new K (which is what happens here, before the cat with
-        # past_key_value below) keeps the cache consistent.
+        q = self.q_proj(h).view(B, S, self.heads, self.head_dim)
+        c_kv_new = self.kv_down(h)            # (B, S, kv_dim) — un-rotated latent
+
+        # The cache holds ONLY the un-rotated latent. K and V are recomputed
+        # from the full latent every step: RoPE is positional and V-from-K
+        # must operate on un-rotated K, so neither may be cached rotated.
+        if past_key_value is not None:
+            c_kv = torch.cat([past_key_value, c_kv_new], dim=1)  # (B, L+S, kv_dim)
+        else:
+            c_kv = c_kv_new
+        present_kv = c_kv if use_cache else None
+        total_len = c_kv.shape[1]
+        past_len = total_len - S
+
+        # Derive K and V from the same latent (both linear in c_kv).
+        k = c_kv.view(B, total_len, self.kv_heads, self.head_dim)
+        v = self.v_from_k(c_kv).view(B, total_len, self.kv_heads, self.head_dim)
+
+        # QK-Norm before RoPE.
         q = self.norm_q(q)
         k = self.norm_k(k)
-        q = apply_rope(q, rope_cos.to(q.dtype), rope_sin.to(q.dtype))
-        k = apply_rope(k, rope_cos.to(k.dtype), rope_sin.to(k.dtype))
+        # Queries rotate at the new positions [past_len:total_len]; keys were
+        # just rebuilt un-rotated, so they rotate over the whole [0:total_len].
+        q = apply_rope(
+            q, rope_cos[:, past_len:total_len].to(q.dtype),
+            rope_sin[:, past_len:total_len].to(q.dtype),
+        )
+        k = apply_rope(
+            k, rope_cos[:, :total_len].to(k.dtype),
+            rope_sin[:, :total_len].to(k.dtype),
+        )
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        past_len = past_key_value[0].shape[2] if past_key_value is not None else 0
-        if past_key_value is not None:
-            k = torch.cat([past_key_value[0], k], dim=2)
-            v = torch.cat([past_key_value[1], v], dim=2)
-        present_kv = (k, v) if use_cache else None
-
-        q_len = q.shape[2]
-        k_len = k.shape[2]
-        if past_len > 0 and q_len > 1:
+        # GQA attention: q has `heads`, k/v have `kv_heads`; enable_gqa lets
+        # SDPA broadcast KV groups without materialising repeated heads.
+        gqa = self.group_size > 1
+        if past_len > 0 and S > 1:
             attn_mask = torch.full(
-                (q_len, k_len), float("-inf"),
-                device=q.device, dtype=q.dtype,
+                (S, total_len), float("-inf"), device=q.device, dtype=q.dtype,
             )
             attn_mask = torch.triu(attn_mask, diagonal=1 + past_len)
             attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, is_causal=False,
+                q, k, v, attn_mask=attn_mask, enable_gqa=gqa,
             )
         else:
-            is_causal = (q_len == k_len)
-            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=(S > 1), enable_gqa=gqa,
+            )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
-
-        # Attention residual + adapter
         x = x + self.out_proj(attn_out) + adapter_out
 
         # ── MoE FFN: shared (always full weight) + routed (gated) ──
@@ -876,12 +899,12 @@ class OSRTModel(OSRTPreTrainedModel):
     def forward(
         self,
         input_ids: Tensor,
-        past_key_values: list[tuple[Tensor, Tensor]] | None = None,
+        past_key_values: list[Tensor] | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> tuple[
         Tensor, list[Tensor], Tensor, Tensor, Tensor,
-        list[tuple[Tensor, Tensor]] | None,
+        list[Tensor] | None,
     ]:
         """Forward pass.
 
@@ -905,17 +928,12 @@ class OSRTModel(OSRTPreTrainedModel):
             for idx, layer_past in enumerate(past_key_values):
                 if layer_past is None:
                     continue
-                if not isinstance(layer_past, tuple) or len(layer_past) != 2:
+                if not isinstance(layer_past, torch.Tensor):
                     raise ValueError(
-                        f"past_key_values[{idx}] must be a (key, value) tuple."
+                        f"past_key_values[{idx}] must be a latent Tensor "
+                        f"(B, seq, kv_dim)."
                     )
-                key, value = layer_past
-                if (not isinstance(key, torch.Tensor)
-                        or not isinstance(value, torch.Tensor)):
-                    raise ValueError(
-                        f"past_key_values[{idx}] must contain Tensors."
-                    )
-                layer_len = key.shape[2]
+                layer_len = layer_past.shape[1]
                 if past_length == 0:
                     past_length = layer_len
                 elif layer_len != past_length:
@@ -924,9 +942,13 @@ class OSRTModel(OSRTPreTrainedModel):
                     )
 
         required_seq_len = past_length + S
+        # Pass the FULL-range [0:required_seq_len] cos/sin to each block: K is
+        # rebuilt un-rotated from the cached latent and must be rotated over
+        # the whole span, while Q is rotated only at its new positions. The
+        # block slices each internally from past_len.
         if required_seq_len <= self.rope_cos.shape[1]:
-            cos = self.rope_cos[:, past_length:required_seq_len, :, :]
-            sin = self.rope_sin[:, past_length:required_seq_len, :, :]
+            cos = self.rope_cos[:, :required_seq_len, :, :]
+            sin = self.rope_sin[:, :required_seq_len, :, :]
         else:
             rope_cos, rope_sin = compute_rope_freqs(
                 required_seq_len,
@@ -935,10 +957,10 @@ class OSRTModel(OSRTPreTrainedModel):
                 device=x.device,
                 scaling=getattr(self.config, "rope_scaling", None),
             )
-            cos = rope_cos[:, past_length:required_seq_len, :, :].to(
+            cos = rope_cos[:, :required_seq_len, :, :].to(
                 device=self.rope_cos.device, dtype=self.rope_cos.dtype
             )
-            sin = rope_sin[:, past_length:required_seq_len, :, :].to(
+            sin = rope_sin[:, :required_seq_len, :, :].to(
                 device=self.rope_sin.device, dtype=self.rope_sin.dtype
             )
 
@@ -984,7 +1006,7 @@ class OSRTModel(OSRTPreTrainedModel):
             raise ValueError(
                 "KV caching is incompatible with gradient checkpointing."
             )
-        presents: list[tuple[Tensor, Tensor]] | None = [] if use_cache else None
+        presents: list[Tensor] | None = [] if use_cache else None
 
         for loop in range(n_loops_to_run):
             for block_idx, block in enumerate(self.blocks):
@@ -1105,7 +1127,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         self,
         input_ids: Tensor,
         labels: Tensor | None = None,
-        past_key_values: list[tuple[Tensor, Tensor] | None] | None = None,
+        past_key_values: list[Tensor | None] | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
@@ -1277,8 +1299,8 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # Prefill over the prompt, keeping KV cache for decode.
         # HF's CausalLMOutputWithPast types past_key_values as
         # `Cache | None`, but our forward returns a plain list of
-        # (k, v) tuples. Cast locally so ty/mypy line up with runtime.
-        PastKV = list[tuple[Tensor, Tensor] | None]
+        # per-layer latent tensors. Cast locally so ty/mypy line up.
+        PastKV = list[Tensor | None]
         context = input_ids[:, -self.config.max_position_embeddings:]
         out = self.forward(context, use_cache=True)
         past_key_values = cast("PastKV | None", out.past_key_values)
