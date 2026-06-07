@@ -25,7 +25,7 @@ OSRT_605M_A279M: dict = dict(
     recursive_loops=6,
     num_routed_experts=8,
     top_k_experts=2,
-    expert_hidden=3968,        # routed experts (widened)
+    expert_hidden=4032,        # routed experts (widened to land ~605M/269M)
     shared_expert_hidden=2816,  # shared expert (shrunk; shifts capacity to sparse path)
     adapter_rank=16,
     # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8): 4-channel
