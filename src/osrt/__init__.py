@@ -19,6 +19,11 @@ from osrt.model import (
     RecursiveBlock,
     orthogonal_expert_init,
 )
+from osrt.quant import (
+    QuantizedKV,
+    dequantize_kv_latent,
+    quantize_kv_latent,
+)
 
 __all__ = [
     "ExpertFFN",
@@ -27,7 +32,10 @@ __all__ = [
     "OSRTForCausalLM",
     "OSRTModel",
     "OSRTPreTrainedModel",
+    "QuantizedKV",
     "RecursiveBlock",
+    "dequantize_kv_latent",
     "orthogonal_expert_init",
+    "quantize_kv_latent",
 ]
 __version__ = "0.6.0"
