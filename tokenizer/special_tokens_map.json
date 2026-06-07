@@ -1,0 +1,18 @@
+{
+  "bos_token": "<|begin_of_text|>",
+  "eos_token": "<|end_of_text|>",
+  "pad_token": "<|padding|>",
+  "unk_token": "<|unknown|>",
+  "additional_special_tokens": [
+    "<|fim_prefix|>",
+    "<|fim_middle|>",
+    "<|fim_suffix|>",
+    "<|think|>",
+    "<|/think|>",
+    "<|answer|>",
+    "<|/answer|>",
+    "<|user|>",
+    "<|assistant|>",
+    "<|system|>"
+  ]
+}
