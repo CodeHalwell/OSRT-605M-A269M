@@ -30,7 +30,12 @@ OSRT_605M_A279M: dict = dict(
     adapter_rank=16,
     # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8): 4-channel
     # residual stream, Birkhoff/Sinkhorn doubly-stochastic mixing.
-    use_mhc=True,
+    # DEFAULT OFF: the CPU pre-flight (scripts/ablate_features.py) showed mHC
+    # robustly amplifies gradient norms 10-700x and NaNs under sustained
+    # training. Code + tests are kept; stabilization (per-channel stream norm,
+    # bounded/straight-through Sinkhorn, smaller alpha-init) and re-enabling are
+    # deferred to the small-GPU sanity run where gradients can be measured.
+    use_mhc=False,
     n_hc=4,
     mhc_sinkhorn_iters=20,
     swiglu_clamp=10.0,         # DeepSeek-style SwiGLU stability clamp (§7.8)

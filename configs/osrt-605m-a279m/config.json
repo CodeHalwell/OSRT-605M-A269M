@@ -55,7 +55,7 @@
   "top_k_experts": 2,
   "transformers_version": "5.10.2",
   "unk_token_id": 3,
-  "use_mhc": true,
+  "use_mhc": false,
   "user_token_id": 11,
   "vocab_size": 65536
 }
