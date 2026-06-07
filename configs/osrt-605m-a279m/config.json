@@ -4,6 +4,7 @@
   "answer_close_id": 10,
   "answer_open_id": 9,
   "assistant_token_id": 12,
+  "attention_sink": true,
   "aux_loop_loss_weight": 0.05,
   "bos_token_id": 1,
   "dim": 1536,

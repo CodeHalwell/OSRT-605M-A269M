@@ -34,6 +34,7 @@ OSRT_605M_A279M: dict = dict(
     n_hc=4,
     mhc_sinkhorn_iters=20,
     swiglu_clamp=10.0,         # DeepSeek-style SwiGLU stability clamp (§7.8)
+    attention_sink=True,       # per-head learnable softmax-denominator sink (§6.6)
     # lean-v6 training stack (all already supported by the v5 model code)
     aux_loop_loss_weight=0.05,   # on from step 1 — anti loop-collapse
     router_aux_loss_coeff=0.10,  # v5-proven balance pressure

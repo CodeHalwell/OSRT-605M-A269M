@@ -64,6 +64,14 @@ class OSRTConfig(PretrainedConfig):
         # None disables it (bit-identical to the un-clamped path).
         swiglu_clamp: float | None = None,
 
+        # Attention sink (ARCHITECTURE.md §6.6). When True, each RecursiveBlock
+        # carries a per-head learnable sink logit that is added to the softmax
+        # DENOMINATOR only (the sink has a zero "value", so it never contributes
+        # to the output). This lets a query's attention weights sum to < 1 —
+        # the head can attend to "nothing" when no key is relevant. False keeps
+        # the exact F.scaled_dot_product_attention path (bit-identical to before).
+        attention_sink: bool = False,
+
         # --- MoE (v5 architecture) ---
         # No dense FFN. Shared expert replaces it at larger hidden size.
         # 8 routed experts × hidden 2048, top-2 (Mixtral-style).
@@ -254,6 +262,7 @@ class OSRTConfig(PretrainedConfig):
         self.n_hc = n_hc
         self.mhc_sinkhorn_iters = mhc_sinkhorn_iters
         self.swiglu_clamp = swiglu_clamp
+        self.attention_sink = attention_sink
 
         self.num_routed_experts = num_routed_experts
         self.top_k_experts = top_k_experts

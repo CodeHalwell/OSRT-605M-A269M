@@ -905,6 +905,20 @@ class RecursiveBlock(nn.Module):
         self.norm_k = nn.RMSNorm(config.head_dim)
         self.out_proj = nn.Linear(config.dim, config.dim, bias=False)
 
+        # Attention sink (ARCHITECTURE.md §6.6). Per-head learnable sink logits,
+        # initialised to zeros (sink_logit=0 ⇒ the sink contributes exp(0)=1 to
+        # the denominator). The sink adds an extra term to the softmax
+        # denominator only — its "value" is zero, so it never enters the
+        # numerator/output:
+        #   s_{h,i,j} = exp(z_{h,i,j}) / (Σ_k exp(z_{h,i,k}) + exp(sink[h]))
+        # This lets a query's weights sum to < 1 (a head can attend to
+        # "nothing" when no key is relevant). The parameter is 1D (heads,) →
+        # routed to AdamW by build_param_groups with no change there. None when
+        # disabled so the standard SDPA path stays bit-identical.
+        self.attention_sink = config.attention_sink
+        if config.attention_sink:
+            self.sink_logits = nn.Parameter(torch.zeros(self.heads))
+
         # MoE (shared + routed), pre-norm
         self.norm_moe = nn.RMSNorm(config.dim)
         self.moe = MoELayer(config, moe_seed=block_idx, block_idx=block_idx)
@@ -994,7 +1008,14 @@ class RecursiveBlock(nn.Module):
         # GQA attention: q has `heads`, k/v have `kv_heads`; enable_gqa lets
         # SDPA broadcast KV groups without materialising repeated heads.
         gqa = self.group_size > 1
-        if past_len > 0 and S > 1:
+        if self.attention_sink:
+            # Attention sink (ARCHITECTURE.md §6.6): the sink adds an extra term
+            # to the softmax denominator only, which SDPA cannot express. Use
+            # the manual path so we can apply the exact log-sum-exp rescale.
+            attn_out = self._attention_with_sink(
+                q, k, v, S, total_len, past_len,
+            )
+        elif past_len > 0 and S > 1:
             attn_mask = torch.full(
                 (S, total_len), float("-inf"), device=q.device, dtype=q.dtype,
             )
@@ -1008,6 +1029,72 @@ class RecursiveBlock(nn.Module):
             )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
         return self.out_proj(attn_out) + adapter_out, present_kv
+
+    def _attention_with_sink(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        S: int,
+        total_len: int,
+        past_len: int,
+    ) -> Tensor:
+        """Manual GQA attention with a per-head learnable sink (§6.6/§6.7).
+
+        Exact log-sum-exp rescale of the standard attention output. If `out`
+        and `lse = log Σ_k exp(z_{i,k})` are the usual (sink-free) attention
+        output and per-query log-sum-exp of the scores, then adding exp(sink[h])
+        to the denominator simply multiplies the output by
+            Σexp(z) / (Σexp(z) + exp(sink)) = sigmoid(lse - sink[h]),
+        because the sink's value is zero and so contributes nothing to the
+        numerator. We therefore compute the masked scores, derive `out` and
+        `lse` from one softmax/logsumexp, and rescale per head.
+
+        flex_attention(return_lse=True) was investigated as the "flash + lse"
+        route but on this target (torch 2.12, CPU) it (a) emits a deprecation
+        warning for return_lse, (b) without torch.compile materialises the full
+        score matrix anyway (no fused-kernel speedup), and (c) needs a custom
+        mask_mod to express GQA broadcasting. The manual path below materialises
+        the same score matrix, reuses the EXACT causal masking the SDPA path
+        uses, and is fully correct; it is O(S·total_len) in memory per head —
+        fine for our sequence lengths and the simplest thing that is provably
+        right. Inputs q:(B,heads,S,hd), k/v:(B,kv_heads,total_len,hd).
+        """
+        B, H, _, hd = q.shape
+        # Expand GQA groups so every query head sees its KV head. SDPA does this
+        # internally via enable_gqa; here we do it explicitly with
+        # repeat_interleave on the kv-head dim (groups of `group_size`).
+        if self.group_size > 1:
+            k = k.repeat_interleave(self.group_size, dim=1)
+            v = v.repeat_interleave(self.group_size, dim=1)
+
+        scale = 1.0 / math.sqrt(hd)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B,H,S,total_len)
+
+        # Causal masking — identical semantics to the SDPA path. For the
+        # cached-decode case the S query positions occupy [past_len:total_len],
+        # so a key j is visible to query i iff j <= past_len + i. With S == 1
+        # (single-token decode) all `total_len` keys are visible and no mask is
+        # needed (matches SDPA's is_causal=False branch).
+        if S > 1:
+            row = torch.arange(S, device=scores.device).view(S, 1)
+            col = torch.arange(total_len, device=scores.device).view(1, total_len)
+            causal = col <= (past_len + row)  # (S, total_len) bool, True = keep
+            scores = scores.masked_fill(~causal, float("-inf"))
+
+        # Per-query log-sum-exp of the (masked) scores, then standard softmax.
+        # Compute in fp32 for a stable exp/log; the sink rescale is sensitive to
+        # the lse magnitude. lse: (B,H,S).
+        scores_f = scores.float()
+        lse = torch.logsumexp(scores_f, dim=-1)
+        attn_weights = torch.softmax(scores_f, dim=-1).to(v.dtype)
+        out = torch.matmul(attn_weights, v)  # (B,H,S,hd)
+
+        # Sink rescale: multiply each head's output by sigmoid(lse - sink[h]).
+        # sink_logits: (H,) → broadcast over (B,H,S). Done in fp32 then cast.
+        sink = self.sink_logits.float().view(1, H, 1)
+        rescale = torch.sigmoid(lse - sink).unsqueeze(-1).to(out.dtype)
+        return out * rescale
 
     def _moe(
         self, x_in: Tensor, loop_idx: int, token_ids: Tensor | None = None,
