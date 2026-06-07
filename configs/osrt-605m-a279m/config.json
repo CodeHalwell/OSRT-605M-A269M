@@ -24,6 +24,8 @@
   "max_position_embeddings": 4096,
   "mhc_sinkhorn_iters": 20,
   "model_type": "osrt",
+  "mtp_heads": 2,
+  "mtp_loss_weight": 0.3,
   "n_hc": 4,
   "num_blocks": 3,
   "num_kv_heads": 8,

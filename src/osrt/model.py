@@ -1152,6 +1152,33 @@ class RecursiveBlock(nn.Module):
         return x, present_kv
 
 
+# ── MTP (Multi-Token Prediction) head ───────────────────────────────────
+
+
+class MTPHead(nn.Module):
+    """A single Multi-Token Prediction head (ARCHITECTURE.md §9.3, §11.4).
+
+    Small projection applied to the FINAL post-norm_out hidden state before
+    the WEIGHT-TIED LM head (the embedding) turns it into vocab logits. Head
+    k predicts the token at offset +(1+k) — i.e. +2, +3, ... — during
+    TRAINING only. These params are an auxiliary objective: they densify the
+    training signal (DeepSeek-V3/V4) and are DROPPABLE at deployment, since
+    inference/generation only ever uses the main +1 LM head.
+
+    Structure per §9.3: RMSNorm(dim) + Linear(dim, dim, bias=False). The
+    caller applies the tied embedding (via F.linear) to project to vocab, so
+    no separate vocab matrix lives here.
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.norm = nn.RMSNorm(dim)
+        self.proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x_final: Tensor) -> Tensor:
+        return self.proj(self.norm(x_final))
+
+
 # ── Main Model ──────────────────────────────────────────────────────────
 
 
@@ -1453,6 +1480,17 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
     def __init__(self, config: OSRTConfig) -> None:
         super().__init__(config)
         self.model = OSRTModel(config)
+
+        # Multi-Token Prediction heads (ARCHITECTURE.md §9.3, §11.4). Created
+        # ONLY when mtp_heads > 0 so the default (0) path is bit-identical:
+        # the attribute is an empty ModuleList, adds no params, and the loss
+        # block below short-circuits. Head k (0-indexed) predicts the token at
+        # offset +(2+k). These are training-time-only params — never used at
+        # inference (generate() ignores them) and droppable at deployment.
+        self.mtp_heads = nn.ModuleList(
+            [MTPHead(config.dim) for _ in range(config.mtp_heads)]
+        )
+
         # HF's post_init walks all nn.Linear and calls _init_weights on them,
         # which would overwrite any orthogonal init done in MoELayer.__init__.
         self.post_init()
@@ -1475,6 +1513,12 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # raw CE loss for predicting next-token from that loop's hidden.
         self.last_per_loop_aux_losses: list[Tensor] = []
         self.last_aux_loop_total: Tensor | None = None
+        # MTP telemetry (when mtp_heads > 0 + training + labels). last_mtp_loss
+        # is the detached weighted sum added to the training loss; None when MTP
+        # is off or the head contributed nothing. last_mtp_losses holds the
+        # detached per-head raw CE values (length == config.mtp_heads).
+        self.last_mtp_loss: Tensor | None = None
+        self.last_mtp_losses: list[Tensor] = []
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embedding
@@ -1513,6 +1557,8 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         self.last_seq_balance_loss_normalised = None
         self.last_per_loop_aux_losses = []
         self.last_aux_loop_total = None
+        self.last_mtp_loss = None
+        self.last_mtp_losses = []
 
         loss = None
         if labels is not None:
@@ -1578,6 +1624,48 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                         w = 1.0
                     aux_loop_total = aux_loop_total + w * aux_l
 
+            # Multi-Token Prediction loss (ARCHITECTURE.md §9.3, §11.4). For
+            # head k = 1..mtp_heads, predict the token at offset +(1+k) from the
+            # FINAL hidden state `hidden` (post-norm_out, the same state feeding
+            # the main +1 LM head). Each head applies its small RMSNorm+Linear
+            # projection, then the WEIGHT-TIED embedding (via F.linear) turns it
+            # into vocab logits. The targets are `labels` shifted by (1+k); the
+            # tail positions that run off the sequence end are dropped (we slice
+            # logits to [:, :T-(1+k), :] and labels to [:, (1+k):]). CE is
+            # computed in fp32 with ignore_index=-100 to match the main loss.
+            # These MTP-head params are TRAINING-TIME ONLY (droppable at
+            # deployment); the loss is added to the total only when training.
+            mtp_total = torch.tensor(0.0, device=task_loss.device)
+            per_mtp: list[Tensor] = []
+            if self.training and len(self.mtp_heads) > 0:
+                seq_len = labels.shape[-1]
+                for k, head in enumerate(self.mtp_heads):
+                    offset = k + 2  # head k (0-indexed) → future offset +(2+k)
+                    # Skip heads whose target offset runs entirely off the
+                    # end of this (short) sequence — no positions to predict.
+                    if offset >= seq_len:
+                        per_mtp.append(
+                            torch.tensor(0.0, device=task_loss.device)
+                        )
+                        continue
+                    head_hidden = head(hidden)
+                    head_logits = F.linear(
+                        head_hidden, self.model.embedding.weight,
+                    )
+                    # Logits at position i predict token at i+offset, so the
+                    # last `offset` positions have no in-range target → drop.
+                    m_shift_logits = head_logits[
+                        ..., :-offset, :self.config.real_vocab_size
+                    ].contiguous().float()
+                    m_shift_labels = labels[..., offset:].contiguous()
+                    mtp_l = F.cross_entropy(
+                        m_shift_logits.view(-1, self.config.real_vocab_size),
+                        m_shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                    per_mtp.append(mtp_l)
+                    mtp_total = mtp_total + mtp_l
+
             # Total loss: add aux losses ONLY during training. Eval loss must
             # be pure task CE so eval perplexity and held-out comparisons
             # aren't polluted by hyperparameter choices. Training loops that
@@ -1591,6 +1679,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                     + self.config.router_seq_balance_loss_coeff
                     * seq_balance_norm
                     + aux_weight * aux_loop_total
+                    + self.config.mtp_loss_weight * mtp_total
                 )
             else:
                 loss = task_loss
@@ -1599,6 +1688,16 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             self.last_per_loop_aux_losses = [l.detach() for l in per_loop_aux]
             self.last_aux_loop_total = (
                 aux_loop_total.detach() if per_loop_aux else None
+            )
+
+            # Stash MTP losses (detached) for telemetry. last_mtp_loss is the
+            # weighted sum actually added to the training loss; None when MTP is
+            # off or contributed nothing. last_mtp_losses holds the per-head raw
+            # (unweighted) CE values, one per head (length == config.mtp_heads).
+            self.last_mtp_losses = [l.detach() for l in per_mtp]
+            self.last_mtp_loss = (
+                (self.config.mtp_loss_weight * mtp_total).detach()
+                if per_mtp else None
             )
 
             # Expose components for logging — always set, regardless of mode.

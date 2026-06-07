@@ -144,6 +144,21 @@ class OSRTConfig(PretrainedConfig):
         # intermediate loops are weighted uniformly by aux_loop_loss_weight.
         per_loop_aux_weights: list[float] | None = None,
 
+        # --- Multi-Token Prediction heads (ARCHITECTURE.md §9.3, §11.4) ---
+        # TRAINING-TIME auxiliary objective. In addition to the main +1
+        # next-token prediction, mtp_heads extra heads predict tokens at
+        # further future offsets (+2, +3, ...) from the FINAL hidden state.
+        # This densifies the training signal and improves the representation;
+        # it does NOT change inference/generation (the heads are never used at
+        # decode and are droppable at deployment — see OSRTForCausalLM).
+        #   mtp_heads      — number of extra future-token heads beyond +1.
+        #                    0 = OFF (default; bit-identical to the no-MTP path).
+        #   mtp_loss_weight — §11.4 beta. The summed per-head CE is scaled by
+        #                    this before being added to the training loss.
+        # Head k = 1..mtp_heads predicts the token at offset +(1+k).
+        mtp_heads: int = 0,
+        mtp_loss_weight: float = 0.3,
+
         # --- Loop dropout (stochastic depth for recursive loops) ---
         # With probability loop_dropout_prob during training, truncate
         # the recursive loop chain to a random length in
@@ -274,6 +289,8 @@ class OSRTConfig(PretrainedConfig):
         self.router_seq_balance_loss_coeff = router_seq_balance_loss_coeff
         self.aux_loop_loss_weight = aux_loop_loss_weight
         self.per_loop_aux_weights = per_loop_aux_weights
+        self.mtp_heads = mtp_heads
+        self.mtp_loss_weight = mtp_loss_weight
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
         self.router_balance_bias_enabled = router_balance_bias_enabled
@@ -407,6 +424,14 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"router_affinity must be 'softmax' or 'sqrt_softplus', got "
                 f"{self.router_affinity!r}"
+            )
+        if self.mtp_heads < 0:
+            raise ValueError(
+                f"mtp_heads must be >= 0, got {self.mtp_heads}"
+            )
+        if self.mtp_loss_weight < 0:
+            raise ValueError(
+                f"mtp_loss_weight must be >= 0, got {self.mtp_loss_weight}"
             )
         if not 0 <= self.hash_routing_blocks <= self.num_blocks:
             raise ValueError(

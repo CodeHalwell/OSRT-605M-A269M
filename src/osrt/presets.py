@@ -42,6 +42,11 @@ OSRT_605M_A279M: dict = dict(
     attention_sink=True,       # per-head learnable softmax-denominator sink (§6.6)
     # lean-v6 training stack (all already supported by the v5 model code)
     aux_loop_loss_weight=0.05,   # on from step 1 — anti loop-collapse
+    # Multi-Token Prediction heads (§9.3, §11.4): 2 extra heads predicting +2/+3
+    # from the final hidden state. Training-time only (droppable at deploy);
+    # densifies the signal à la DeepSeek-V3/V4. beta = 0.3 per §11.4.
+    mtp_heads=2,
+    mtp_loss_weight=0.3,
     router_aux_loss_coeff=0.10,  # v5-proven balance pressure
     router_z_loss_coeff=1e-3,
     router_balance_bias_enabled=True,
