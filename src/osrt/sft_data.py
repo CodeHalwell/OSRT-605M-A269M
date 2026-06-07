@@ -1,4 +1,4 @@
-"""SFT data pipeline for NanoOSRT with native token tags.
+"""SFT data pipeline for OSRT with native token tags.
 
 Chat format:
     <|user|>{prompt}<|assistant|><|think|>{reasoning}<|/think|><|answer|>{answer}<|/answer|><|end_of_text|>

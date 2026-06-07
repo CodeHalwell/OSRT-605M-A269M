@@ -1,7 +1,7 @@
-"""MOPD teacher-rollout collector for nano-osrt distillation.
+"""MOPD teacher-rollout collector for osrt distillation.
 
 Calls Gemini 3.5 Flash with thinking enabled (search OFF) on a mixed
-prompt distribution matched to nano-osrt's target capabilities:
+prompt distribution matched to osrt's target capabilities:
 
     Math word problems        : gsm8k train
     Multi-step reasoning      : open-thoughts-114k prompts
@@ -311,7 +311,7 @@ def call_gemini(client, prompt: str, model_id: str) -> dict:
 def call_openrouter(client, prompt: str, model_id: str) -> dict:
     """Single OpenRouter call. Reasoning models (Nemotron, DeepSeek-R1)
     return separate `reasoning` + `content` fields on the message, which
-    map cleanly to nano-osrt's <|think|> / <|answer|> template."""
+    map cleanly to osrt's <|think|> / <|answer|> template."""
     response = client.chat.send(
         model=model_id,
         messages=[{"role": "user", "content": prompt}],
@@ -333,7 +333,7 @@ def call_openrouter(client, prompt: str, model_id: str) -> dict:
 def call_deepseek(client, prompt: str, model_id: str) -> dict:
     """Direct DeepSeek API call via openai-compat SDK with thinking
     enabled. Returns reasoning_content + content separately, mapping
-    cleanly to nano-osrt's <|think|>/<|answer|> template."""
+    cleanly to osrt's <|think|>/<|answer|> template."""
     response = client.chat.completions.create(
         model=model_id,
         messages=[{"role": "user", "content": prompt}],

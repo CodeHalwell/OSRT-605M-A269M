@@ -1,4 +1,4 @@
-"""Streaming data pipeline for NanoOSRT pre-training.
+"""Streaming data pipeline for OSRT pre-training.
 
 Handles:
 - Progressive seq_len (2048 → 4096 → 8192) across phases
@@ -639,7 +639,7 @@ def make_loader(
 # MOPD ROLLOUT DATASET — teacher-distillation from local JSONL
 # ═════════════════════════════════════════════════════════════════════
 # Reads a JSONL file of Gemini rollouts (one record per line with prompt /
-# thinking / response fields), tokenises into the nano-osrt chat template,
+# thinking / response fields), tokenises into the osrt chat template,
 # and yields (input_ids, labels) where labels mask the user prompt with
 # -100 so the model is trained ONLY on producing the assistant response
 # (thinking + answer), not on repeating the user message.

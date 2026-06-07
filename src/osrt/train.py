@@ -1,4 +1,4 @@
-"""Pre-training loop for NanoOSRT.
+"""Pre-training loop for OSRT.
 
 Simpler than v4_train.py because v5 removes:
   - Soft warmup / blend / routing_mode switching
@@ -38,10 +38,10 @@ try:
 except ImportError:
     wandb = None
 
-from nano_osrt.config import NanoOSRTConfig
-from nano_osrt.data import make_loader  # reused unchanged
-from nano_osrt.model import NanoOSRTForCausalLM
-from nano_osrt.train_config import PretrainConfig
+from osrt.config import OSRTConfig
+from osrt.data import make_loader  # reused unchanged
+from osrt.model import OSRTForCausalLM
+from osrt.train_config import PretrainConfig
 
 
 def get_lr(step: int, cfg: PretrainConfig) -> float:
@@ -566,7 +566,7 @@ def _average_moe_snapshots(
 
 
 def _check_early_stop_criteria(
-    step: int, summary: dict, cfg: PretrainConfig, model_cfg: NanoOSRTConfig,
+    step: int, summary: dict, cfg: PretrainConfig, model_cfg: OSRTConfig,
 ) -> list[str]:
     """Return list of failing criteria (empty means all pass)."""
     failures: list[str] = []
@@ -631,7 +631,7 @@ def _check_early_stop_criteria(
 
 
 def run_training(
-    model_config: NanoOSRTConfig,
+    model_config: OSRTConfig,
     train_cfg: PretrainConfig,
     vol,
     tokenizer_name: str,
@@ -651,14 +651,14 @@ def run_training(
     device = torch.device("cuda")
 
     print("=" * 60)
-    print("NanoOSRT — Mixtral MoE Pre-training")
+    print("OSRT — Mixtral MoE Pre-training")
     print("=" * 60)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     # Model setup
-    model = NanoOSRTForCausalLM(model_config).to(device=device)
+    model = OSRTForCausalLM(model_config).to(device=device)
     total_params = sum(p.numel() for p in model.parameters())
     n_experts = 1 + model_config.num_routed_experts  # +1 shared
     print(f"Physical parameters : {total_params:>12,}")
@@ -745,7 +745,7 @@ def run_training(
     inner_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
     if train_cfg.optimizer_name.lower() == "muon":
-        from nano_osrt.muon import (
+        from osrt.muon import (
             HybridMuonAdamW,
             Muon,
             build_param_groups,
@@ -1267,7 +1267,7 @@ def _freeze_hra_params(model: nn.Module) -> tuple[int, int]:
 
 
 def run_pretrain_extend(
-    model_config: NanoOSRTConfig,
+    model_config: OSRTConfig,
     extend_cfg,
     vol,
     tokenizer_name: str,
@@ -1296,14 +1296,14 @@ def run_pretrain_extend(
     device = torch.device("cuda")
 
     print("=" * 60)
-    print("NanoOSRT — Continued Pre-training (Extend / Mid-training)")
+    print("OSRT — Continued Pre-training (Extend / Mid-training)")
     print("=" * 60)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     # ── Build model ─────────────────────────────────────────────────
-    model = NanoOSRTForCausalLM(model_config).to(device=device)
+    model = OSRTForCausalLM(model_config).to(device=device)
     base_params = sum(p.numel() for p in model.parameters())
     print(f"Base parameters     : {base_params:>12,}")
     print(f"Resume from         : {extend_cfg.pretrained_checkpoint}")
@@ -1316,7 +1316,7 @@ def run_pretrain_extend(
 
     # ── HRA injection (BEFORE state_dict load) ─────────────────────
     if extend_cfg.hra_enabled:
-        from nano_osrt.hra import inject_hra
+        from osrt.hra import inject_hra
         print(f"Injecting HRA before load (rank={extend_cfg.hra_rank})...")
         inject_hra(
             model,
@@ -1403,7 +1403,7 @@ def run_pretrain_extend(
     # ── Optimizer ──────────────────────────────────────────────────
     inner_model = model._orig_mod if hasattr(model, "_orig_mod") else model
     if extend_cfg.optimizer_name.lower() == "muon":
-        from nano_osrt.muon import (
+        from osrt.muon import (
             HybridMuonAdamW,
             Muon,
             build_param_groups,
@@ -1522,7 +1522,7 @@ def run_pretrain_extend(
     # aux loop loss, telemetry, ckpts).
     rollout_path = getattr(extend_cfg, "rollout_dataset_path", None)
     if rollout_path:
-        from nano_osrt.data import make_rollout_loader
+        from osrt.data import make_rollout_loader
         print(f"    [MOPD] using rollout dataset: {rollout_path}")
         loader = make_rollout_loader(
             jsonl_path=rollout_path,
@@ -1608,7 +1608,7 @@ def run_pretrain_extend(
                 del loader
                 gc.collect()
                 if rollout_path:
-                    from nano_osrt.data import make_rollout_loader
+                    from osrt.data import make_rollout_loader
                     loader = make_rollout_loader(
                         jsonl_path=rollout_path,
                         seq_len=seq_len,

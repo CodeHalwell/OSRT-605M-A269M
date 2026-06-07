@@ -1,4 +1,4 @@
-"""Canonical parameter / active-param budget for nano_osrt configs.
+"""Canonical parameter / active-param budget for osrt configs.
 
 Replaces the hand-derived tables in README.md / ARCHITECTURE.md with numbers
 generated from the real model on a meta device (no memory allocated).
@@ -14,8 +14,8 @@ import argparse
 
 import torch
 
-from nano_osrt.config import NanoOSRTConfig
-from nano_osrt.model import NanoOSRTForCausalLM
+from osrt.config import OSRTConfig
+from osrt.model import OSRTForCausalLM
 
 # Map a parameter name to a budget category.
 _CATEGORIES = [
@@ -37,18 +37,18 @@ def _categorize(name: str) -> str:
     return "norms_misc"
 
 
-def budget(cfg: NanoOSRTConfig) -> dict[str, int]:
+def budget(cfg: OSRTConfig) -> dict[str, int]:
     """Return per-category physical param counts (meta device, no allocation)."""
     cfg.expert_orthogonal_init = False  # QR can't run on meta tensors
     with torch.device("meta"):
-        model = NanoOSRTForCausalLM(cfg)
+        model = OSRTForCausalLM(cfg)
     cats: dict[str, int] = {}
     for name, p in model.named_parameters():
         cats[_categorize(name)] = cats.get(_categorize(name), 0) + p.numel()
     return cats
 
 
-def active_per_token(cats: dict[str, int], cfg: NanoOSRTConfig) -> int:
+def active_per_token(cats: dict[str, int], cfg: OSRTConfig) -> int:
     """Active params per token: routed experts scaled by top_k / num_routed,
     everything else fully active (embedding counted full: LM head touches the
     whole matrix)."""
@@ -59,7 +59,7 @@ def active_per_token(cats: dict[str, int], cfg: NanoOSRTConfig) -> int:
     return active
 
 
-def report(cfg: NanoOSRTConfig) -> tuple[int, int]:
+def report(cfg: OSRTConfig) -> tuple[int, int]:
     cats = budget(cfg)
     total = sum(cats.values())
     active = active_per_token(cats, cfg)
@@ -81,11 +81,11 @@ def report(cfg: NanoOSRTConfig) -> tuple[int, int]:
     return total, active
 
 
-def solve_expert_hidden(target: int, base: NanoOSRTConfig, step: int = 128) -> int:
+def solve_expert_hidden(target: int, base: OSRTConfig, step: int = 128) -> int:
     """Smallest expert_hidden (multiple of `step`) whose total >= target."""
     h = step
     while True:
-        cfg = NanoOSRTConfig(**{**base.to_dict(), "expert_hidden": h,
+        cfg = OSRTConfig(**{**base.to_dict(), "expert_hidden": h,
                                 "expert_orthogonal_init": False})
         if sum(budget(cfg).values()) >= target:
             return h
@@ -103,7 +103,7 @@ def main() -> None:
     ap.add_argument("--rank", type=int, default=16)
     args = ap.parse_args()
 
-    base = NanoOSRTConfig(
+    base = OSRTConfig(
         vocab_size=args.vocab, real_vocab_size=args.vocab,
         num_routed_experts=args.experts, shared_expert_hidden=args.h_shared,
         expert_hidden=args.h_routed, adapter_rank=args.rank,
@@ -111,7 +111,7 @@ def main() -> None:
     if args.solve:
         h = solve_expert_hidden(int(args.solve), base)
         print(f"=> expert_hidden={h} hits target {args.solve:.0f}\n")
-        base = NanoOSRTConfig(**{**base.to_dict(), "expert_hidden": h})
+        base = OSRTConfig(**{**base.to_dict(), "expert_hidden": h})
     report(base)
 
 

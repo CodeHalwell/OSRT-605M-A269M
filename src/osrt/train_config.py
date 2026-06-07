@@ -1,4 +1,4 @@
-"""Training configurations for NanoOSRT.
+"""Training configurations for OSRT.
 
 v5 architecture: Mixtral-style MoE (8 routed × top-2, 1 shared, no dense FFN),
 Switch balance loss, orthogonal expert init, eval-time drop-free capacity.
@@ -68,7 +68,7 @@ changes.
 To reproduce aux-loss-free routing on this codebase, override the model
 config when constructing it:
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         router_aux_loss_coeff=0.0,        # disable gradient aux
         router_balance_bias_enabled=True, # keep bias controller
         router_balance_bias_update_rate=0.10,
@@ -149,7 +149,7 @@ class PretrainConfig:
 
     # Weights & Biases
     wandb_log: bool = True
-    wandb_project: str = "nano-osrt"
+    wandb_project: str = "osrt"
     # Suffix the optimizer in the W&B name so dashboard runs from
     # different optimizer configs don't visually pile up on top of the
     # historical Lion runs. Override per-run if you want a custom label.
@@ -811,7 +811,7 @@ class LoopFixV2Config(LoopFixConfig):
     hasn't run yet). 1500 steps, same compile/spawn machinery.
     """
 
-    # Loop dropout settings (passed to the model via NanoOSRTConfig).
+    # Loop dropout settings (passed to the model via OSRTConfig).
     loop_dropout_prob: float = 0.2
     loop_dropout_min_loops: int = 3
 
@@ -1034,7 +1034,7 @@ class SFTConfig:
 
     # Weights & Biases
     wandb_log: bool = True
-    wandb_project: str = "nano-osrt"
+    wandb_project: str = "osrt"
     wandb_run_name: str = "osrt-sft"
     wandb_run_id: str = ""
 
@@ -1665,7 +1665,7 @@ class GRPOConfig:
 
     # Weights & Biases
     wandb_log: bool = True
-    wandb_project: str = "nano-osrt"
+    wandb_project: str = "osrt"
     wandb_run_name: str = "osrt-grpo"
     wandb_run_id: str = ""
 

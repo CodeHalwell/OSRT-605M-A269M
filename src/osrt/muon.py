@@ -290,7 +290,7 @@ def build_param_groups(
         if param.ndim == 2:
             muon_params.append(param)
         else:
-            # ndim > 2 (e.g. conv filters). Not present in NanoOSRT
+            # ndim > 2 (e.g. conv filters). Not present in OSRT
             # but flag if a future change adds them.
             raise ValueError(
                 f"build_param_groups: parameter '{name}' has ndim "

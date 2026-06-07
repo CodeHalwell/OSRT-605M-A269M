@@ -1,83 +1,74 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg
-*.egg-info/
-dist/
-build/
-eggs/
-parts/
-var/
-sdist/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-.installed.cfg
-lib/
-lib64/
-MANIFEST
-
-# Virtual environments
-.env
-.venv
-env/
-venv/
-ENV/
-
-# uv
-.uv/
-
-# Testing
-.tox/
-.coverage
-.coverage.*
-.cache
-.pytest_cache/
-nosetests.xml
-coverage.xml
-*.cover
-htmlcov/
-
-# Deep learning / model artefacts
-runs/
-wandb/
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-
-# Data (ignore binary token files, not directory placeholders)
-data/*.bin
-data/*.npy
-
-# Tokenizer artefact — synced from Modal volume osrt-v4-tokenizer or
-# rebuilt via scripts/train_tokenizer.py. Not source.
-
-# Local pre-change backups (e.g. src_old/) shouldn't be committed.
-# git history is the right backup mechanism.
-src_old/
 
 # Checkpoints (ignore model weight files, not directory placeholders)
+# Data (ignore binary token files, not directory placeholders)
+# Deep learning / model artefacts
+# IDEs
+# Jupyter
+# Local pre-change backups (e.g. src_old/) shouldn't be committed.
+# OS
+# Python
+# Testing
+# Tokenizer artefact — synced from Modal volume osrt-v4-tokenizer or
+# Virtual environments
+# git history is the right backup mechanism.
+# rebuilt via scripts/train_tokenizer.py. Not source.
+# uv
+*$py.class
+*.ckpt
+*.cover
+*.egg
+*.egg-info/
+*.ipynb
+*.pt
+*.pth
+*.py[cod]
+*.pyc
+*.safetensors
+*.so
+*.swo
+*.swp
+.DS_Store
+.Python
+.cache
+.coverage
+.coverage.*
+.env
+.idea/
+.installed.cfg
+.ipynb_checkpoints
+.pytest_cache/
+.tox/
+.uv/
+.venv
+.vscode/
+ENV/
+MANIFEST
+Thumbs.db
+__pycache__/
+build/
+checkpoints/
+checkpoints/*.ckpt
 checkpoints/*.pt
 checkpoints/*.pth
-checkpoints/*.ckpt
 checkpoints/*.safetensors
-
-# Jupyter
-.ipynb_checkpoints
-*.ipynb
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDEs
-.idea/
-.vscode/
-*.swp
-*.swo
+coverage.xml
+data/*.bin
+data/*.npy
+dist/
+eggs/
+env/
+htmlcov/
+lib/
+lib64/
 nano-osrt-model/
-checkpoints/
+nosetests.xml
+parts/
+pip-wheel-metadata/
+runs/
+sdist/
+share/python-wheels/
+src_old/
+var/
+venv/
+wandb/
+wheels/

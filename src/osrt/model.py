@@ -1,4 +1,4 @@
-"""NanoOSRT — Mixtral-style MoE without dense FFN.
+"""OSRT — Mixtral-style MoE without dense FFN.
 
 Architecture changes from v4:
   - Dense FFN removed. Shared expert (hidden=4096) replaces it.
@@ -38,7 +38,7 @@ from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nano_osrt.config import NanoOSRTConfig
+from osrt.config import OSRTConfig
 
 # ── RoPE ────────────────────────────────────────────────────────────────
 
@@ -166,7 +166,7 @@ class MoELayer(nn.Module):
         don't down-weight the MoE output just because k > 1.
     """
 
-    def __init__(self, config: NanoOSRTConfig, moe_seed: int = 0) -> None:
+    def __init__(self, config: OSRTConfig, moe_seed: int = 0) -> None:
         super().__init__()
         self.dim = config.dim
         self.num_routed = config.num_routed_experts
@@ -691,7 +691,7 @@ class RecursiveBlock(nn.Module):
     No parallel dense path — shared expert replaces it.
     """
 
-    def __init__(self, config: NanoOSRTConfig, block_idx: int = 0) -> None:
+    def __init__(self, config: OSRTConfig, block_idx: int = 0) -> None:
         super().__init__()
         self.heads = config.heads
         self.head_dim = config.head_dim
@@ -804,10 +804,10 @@ class RecursiveBlock(nn.Module):
 # ── Main Model ──────────────────────────────────────────────────────────
 
 
-class NanoOSRTPreTrainedModel(PreTrainedModel):
-    """Base class for NanoOSRT models."""
+class OSRTPreTrainedModel(PreTrainedModel):
+    """Base class for OSRT models."""
 
-    config_class = NanoOSRTConfig
+    config_class = OSRTConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
 
@@ -826,10 +826,10 @@ class NanoOSRTPreTrainedModel(PreTrainedModel):
             )
 
 
-class NanoOSRTModel(NanoOSRTPreTrainedModel):
-    """Core NanoOSRT model (without LM head)."""
+class OSRTModel(OSRTPreTrainedModel):
+    """Core OSRT model (without LM head)."""
 
-    def __init__(self, config: NanoOSRTConfig) -> None:
+    def __init__(self, config: OSRTConfig) -> None:
         super().__init__(config)
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.dim)
@@ -868,7 +868,7 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
 
         # Side-effect storage for per-loop auxiliary LM-head losses.
         # Populated by forward() when aux_loop_loss_weight > 0 and the
-        # model is in training mode. Consumed by NanoOSRTForCausalLM
+        # model is in training mode. Consumed by OSRTForCausalLM
         # to compute the aux loss term, and by the train loop for
         # per-loop logging.
         self.last_intermediate_hiddens: list[Tensor] | None = None
@@ -1062,16 +1062,16 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
         )
 
 
-class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
-    """NanoOSRT with causal LM head. HF-compatible.
+class OSRTForCausalLM(OSRTPreTrainedModel):
+    """OSRT with causal LM head. HF-compatible.
 
     LM head is weight-tied to embeddings (via F.linear with embedding.weight).
     Saves ~50M params vs untied for 32K×1536 embedding. Matches v4.
     """
 
-    def __init__(self, config: NanoOSRTConfig) -> None:
+    def __init__(self, config: OSRTConfig) -> None:
         super().__init__(config)
-        self.model = NanoOSRTModel(config)
+        self.model = OSRTModel(config)
         # HF's post_init walks all nn.Linear and calls _init_weights on them,
         # which would overwrite any orthogonal init done in MoELayer.__init__.
         self.post_init()

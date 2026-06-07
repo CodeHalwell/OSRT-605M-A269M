@@ -1,4 +1,4 @@
-"""SFT training loop for NanoOSRT.
+"""SFT training loop for OSRT.
 
 Balanced fine-tuning: math + code + STEM + general.
 Uses native single-token tags for chat format.
@@ -18,10 +18,10 @@ try:
 except ImportError:
     wandb = None
 
-from nano_osrt.config import NanoOSRTConfig
-from nano_osrt.model import NanoOSRTForCausalLM
-from nano_osrt.sft_data import IGNORE_INDEX, make_sft_loader
-from nano_osrt.train import apply_router_balance_updates, load_model_state_or_raise
+from osrt.config import OSRTConfig
+from osrt.model import OSRTForCausalLM
+from osrt.sft_data import IGNORE_INDEX, make_sft_loader
+from osrt.train import apply_router_balance_updates, load_model_state_or_raise
 
 
 def get_sft_lr(
@@ -34,12 +34,12 @@ def get_sft_lr(
     return minimum + 0.5 * (peak - minimum) * (1 + math.cos(math.pi * progress))
 
 
-def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
+def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
     """Execute the v5 SFT training loop."""
     device = torch.device("cuda")
 
     print("=" * 60)
-    print("NanoOSRT — SFT Training (Balanced)")
+    print("OSRT — SFT Training (Balanced)")
     print("=" * 60)
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -48,7 +48,7 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     # ------------------------------------------------------------------
     # Model setup
     # ------------------------------------------------------------------
-    model = NanoOSRTForCausalLM(model_config).to(device=device)
+    model = OSRTForCausalLM(model_config).to(device=device)
     base_params = sum(p.numel() for p in model.parameters())
 
     eff_batch = sft_cfg.batch_size * sft_cfg.grad_accum_steps
@@ -63,7 +63,7 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     # HRA injection (before or after load depending on config)
     hra_params = []
     if sft_cfg.hra_enabled and getattr(sft_cfg, "hra_before_load", False):
-        from nano_osrt.hra import inject_hra
+        from osrt.hra import inject_hra
         print(f"Injecting HRA before load (rank={sft_cfg.hra_rank})...")
         hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
                                 freeze_pretrained=sft_cfg.hra_freeze_pretrained)
@@ -87,7 +87,7 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     print("  Clean load: all keys matched.")
 
     if sft_cfg.hra_enabled and not getattr(sft_cfg, "hra_before_load", False):
-        from nano_osrt.hra import inject_hra
+        from osrt.hra import inject_hra
         print(f"Injecting HRA after load (rank={sft_cfg.hra_rank})...")
         hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
                                 freeze_pretrained=sft_cfg.hra_freeze_pretrained)
@@ -125,7 +125,7 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     # Optimizer
     # ------------------------------------------------------------------
     if sft_cfg.hra_enabled and hra_params:
-        from nano_osrt.hra import get_param_groups
+        from osrt.hra import get_param_groups
         param_groups = get_param_groups(model, hra_params,
                                         base_lr=sft_cfg.peak_lr,
                                         hra_lr=sft_cfg.hra_lr,

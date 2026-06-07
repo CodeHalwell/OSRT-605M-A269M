@@ -1,15 +1,15 @@
-"""Unit tests for NanoOSRT — Mixtral-style MoE without dense FFN."""
+"""Unit tests for OSRT — Mixtral-style MoE without dense FFN."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from nano_osrt.config import NanoOSRTConfig
-from nano_osrt.model import (
+from osrt.config import OSRTConfig
+from osrt.model import (
     ExpertFFN,
     MoELayer,
-    NanoOSRTForCausalLM,
-    NanoOSRTModel,
+    OSRTForCausalLM,
+    OSRTModel,
     apply_rope,
     compute_rope_freqs,
     orthogonal_expert_init,
@@ -18,7 +18,7 @@ from nano_osrt.model import (
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 
-def tiny_config(**overrides) -> NanoOSRTConfig:
+def tiny_config(**overrides) -> OSRTConfig:
     """Small config for fast tests."""
     defaults = dict(
         dim=128, heads=4, head_dim=32,
@@ -29,14 +29,14 @@ def tiny_config(**overrides) -> NanoOSRTConfig:
         max_position_embeddings=64,
     )
     defaults.update(overrides)
-    return NanoOSRTConfig(**defaults)
+    return OSRTConfig(**defaults)
 
 
 # ── Config validation ──────────────────────────────────────────────────
 
 
 def test_config_defaults_to_top_2():
-    cfg = NanoOSRTConfig()
+    cfg = OSRTConfig()
     assert cfg.top_k_experts == 2
 
 
@@ -151,7 +151,7 @@ def test_orthogonal_init_survives_full_model_construction():
     """Orthogonal init must survive HF's post_init() in the wrapper.
 
     Regression: v1 of v5 ran orthogonal init inside MoELayer.__init__,
-    but NanoOSRTForCausalLM.__init__ then called post_init() which
+    but OSRTForCausalLM.__init__ then called post_init() which
     walked all nn.Linear and overwrote the orthogonal weights with the
     default normal init.
 
@@ -161,7 +161,7 @@ def test_orthogonal_init_survives_full_model_construction():
     or something else stomped the experts.
     """
     cfg = tiny_config(expert_orthogonal_init=True)
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
 
     # Regenerate expert (0, 0) with the same seed the model used.
     # Seed convention: block_idx * 1000 + expert_idx
@@ -190,7 +190,7 @@ def test_orthogonal_init_survives_full_model_construction():
 def test_orthogonal_init_disabled_flag_works():
     """When expert_orthogonal_init=False, experts use default normal init."""
     cfg = tiny_config(expert_orthogonal_init=False)
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     # Experts should have the default normal init std
     std = model.model.blocks[0].moe.experts[0].w_gate.weight.std().item()
     assert abs(std - cfg.initializer_range) < 0.01, \
@@ -221,7 +221,7 @@ def test_moe_gate_applies_only_to_routed():
     """
     import math
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (1, 8))
 
     raw_for_one = math.log(math.e - 1.0)  # softplus(this) == 1.0
@@ -452,7 +452,7 @@ def test_balance_bias_affects_clean_topk_selection():
 
 def test_balance_bias_persists_in_state_dict():
     cfg = tiny_config(num_routed_experts=4, top_k_experts=2)
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     bias = torch.tensor([
         [0.1, -0.2, 0.3, -0.4],
         [-0.3, 0.2, -0.1, 0.4],
@@ -463,7 +463,7 @@ def test_balance_bias_persists_in_state_dict():
     found = [k for k in state if "router_balance_bias" in k]
     assert found, "router_balance_bias not in state_dict"
 
-    model2 = NanoOSRTForCausalLM(cfg)
+    model2 = OSRTForCausalLM(cfg)
     model2.load_state_dict(state)
     assert torch.allclose(
         model2.model.blocks[0].moe.router_balance_bias,
@@ -598,7 +598,7 @@ def test_moe_per_token_entropy_vs_marginal():
 def test_gradient_flows_to_router():
     """Router weights should receive gradient from task loss."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (2, 8))
     labels = torch.randint(0, cfg.vocab_size, (2, 8))
     out = model(input_ids=x, labels=labels)
@@ -611,7 +611,7 @@ def test_gradient_flows_to_router():
 def test_gradient_flows_to_multiple_experts():
     """With top-2 and many tokens, multiple experts should receive gradient."""
     cfg = tiny_config(num_routed_experts=8, top_k_experts=2)
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (4, 32))
     labels = torch.randint(0, cfg.vocab_size, (4, 32))
     out = model(input_ids=x, labels=labels)
@@ -630,7 +630,7 @@ def test_gradient_flows_to_multiple_experts():
 
 def test_gradient_flows_to_shared_expert():
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (2, 8))
     labels = torch.randint(0, cfg.vocab_size, (2, 8))
     out = model(input_ids=x, labels=labels)
@@ -645,7 +645,7 @@ def test_gradient_flows_to_shared_expert():
 
 def test_forward_returns_expected_shapes():
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (2, 16))
     out = model(input_ids=x)
     assert out.logits.shape == (2, 16, cfg.vocab_size)
@@ -654,7 +654,7 @@ def test_forward_returns_expected_shapes():
 
 def test_loss_computed_when_labels_given():
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (2, 16))
     labels = torch.randint(0, cfg.vocab_size, (2, 16))
     out = model(input_ids=x, labels=labels)
@@ -673,7 +673,7 @@ def test_loss_components_exposed_after_forward():
         router_z_loss_coeff=0.0,
         router_seq_balance_loss_coeff=0.0,
     )
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (2, 16))
     labels = torch.randint(0, cfg.vocab_size, (2, 16))
 
@@ -708,7 +708,7 @@ def test_loss_components_exposed_after_forward():
 def test_loss_components_reset_without_labels():
     """Without labels, loss components should be None (not stale)."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (1, 8))
     labels = torch.randint(0, cfg.vocab_size, (1, 8))
     # Run once with labels to populate
@@ -726,7 +726,7 @@ def test_capacity_drops_disabled_in_eval():
     cfg = tiny_config(
         num_routed_experts=8, top_k_experts=2, router_capacity_factor=1.01,
     )
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)
     # 128 tokens — would overflow tight cap in training mode
     x = torch.randint(0, cfg.vocab_size, (4, 32))
@@ -743,7 +743,7 @@ def test_capacity_drops_active_in_training():
     cfg = tiny_config(
         num_routed_experts=8, top_k_experts=2, router_capacity_factor=1.01,
     )
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(True)
 
     # Monkey-patch first block's router to force collapse
@@ -772,7 +772,7 @@ def test_eval_loss_excludes_balance_loss():
     """Eval loss must be pure task CE — no aux contamination of perplexity."""
     # Large coeff so any contamination would be obvious in the assertion
     cfg = tiny_config(router_aux_loss_coeff=1.0)
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (2, 16))
     labels = torch.randint(0, cfg.vocab_size, (2, 16))
 
@@ -796,7 +796,7 @@ def test_train_loss_includes_balance_contribution():
         router_z_loss_coeff=0.0,
         router_seq_balance_loss_coeff=0.0,
     )
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(True)
     x = torch.randint(0, cfg.vocab_size, (2, 16))
     labels = torch.randint(0, cfg.vocab_size, (2, 16))
@@ -818,10 +818,10 @@ def test_loss_contains_balance_contribution():
     cfg_on = tiny_config(router_aux_loss_coeff=1.0)
 
     torch.manual_seed(0)
-    model_off = NanoOSRTForCausalLM(cfg_off)
+    model_off = OSRTForCausalLM(cfg_off)
     model_off.train(True)
     torch.manual_seed(0)
-    model_on = NanoOSRTForCausalLM(cfg_on)
+    model_on = OSRTForCausalLM(cfg_on)
     model_on.train(True)
 
     x = torch.randint(0, cfg_off.vocab_size, (2, 16))
@@ -838,9 +838,9 @@ def test_loss_contains_balance_contribution():
 def test_recursive_loops_produce_different_hidden():
     """Multiple loops should modify hidden state at each step."""
     cfg = tiny_config(recursive_loops=3)
-    model = NanoOSRTModel(cfg)
+    model = OSRTModel(cfg)
     x = torch.randint(0, cfg.vocab_size, (1, 8))
-    # NanoOSRTModel.forward returns (hidden, loop_rms, balance_loss,
+    # OSRTModel.forward returns (hidden, loop_rms, balance_loss,
     # z_loss, seq_balance_loss, presents). Only loop_rms is used here.
     _, loop_rms, *_ = model(x)
     rms_vals = [r.item() for r in loop_rms]
@@ -853,7 +853,7 @@ def test_recursive_loops_produce_different_hidden():
 
 def test_kv_cache_shapes():
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (1, 8))
     out = model(input_ids=x, use_cache=True)
     expected_layers = cfg.num_blocks * cfg.recursive_loops
@@ -873,7 +873,7 @@ def test_kv_cache_extend_matches_full_pass():
     training=False via .train(False) to activate the no-drop path.
     """
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)  # equivalent to .eval() but avoids naming hooks
     full = torch.randint(0, cfg.vocab_size, (1, 6))
 
@@ -906,8 +906,8 @@ def test_kv_cache_extend_matches_full_pass():
 
 def test_param_count_in_expected_range():
     """Full-config v5 should be in the 350-500M range."""
-    cfg = NanoOSRTConfig()
-    model = NanoOSRTForCausalLM(cfg)
+    cfg = OSRTConfig()
+    model = OSRTForCausalLM(cfg)
     n = sum(p.numel() for p in model.parameters())
     assert 350_000_000 < n < 500_000_000, f"Unexpected param count: {n:,}"
 
@@ -915,7 +915,7 @@ def test_param_count_in_expected_range():
 def test_no_dense_ffn_in_block():
     """v5 blocks should not have a dense FFN attribute."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     for blk in model.model.blocks:
         assert not hasattr(blk, "ffn_dense"), "v5 should have no ffn_dense"
         assert not hasattr(blk, "dense_gate"), "v5 should have no dense_gate"
@@ -924,7 +924,7 @@ def test_no_dense_ffn_in_block():
 def test_blocks_have_moe_gate():
     """MoE output should pass through a learnable scalar gate."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     for blk in model.model.blocks:
         assert hasattr(blk, "moe_gate")
         assert blk.moe_gate.requires_grad
@@ -948,7 +948,7 @@ def test_last_loss_attrs_set_under_torch_compile():
     components are present on the underlying module.
     """
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     # torch.compile is a no-op on CPU for some configs; try anyway and
     # gracefully skip if the backend rejects.
     try:
@@ -977,7 +977,7 @@ def test_last_loss_attrs_set_under_torch_compile():
 def test_generate_greedy_produces_expected_shape():
     """Greedy generate returns input_ids + max_new_tokens tokens."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)
     ctx = torch.randint(0, cfg.vocab_size, (1, 8))
     out = model.generate(
@@ -990,7 +990,7 @@ def test_generate_sampling_respects_temperature():
     """temperature>0 uses multinomial; two seeded runs with different seeds
     produce different sequences (probabilistic check)."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)
     ctx = torch.randint(0, cfg.vocab_size, (1, 6))
 
@@ -1012,7 +1012,7 @@ def test_generate_kv_cache_matches_full_forward():
     would otherwise make full vs cached paths diverge.
     """
     cfg = tiny_config(router_capacity_factor=10.0)
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)
     ctx = torch.randint(0, cfg.vocab_size, (1, 10))
     new_tok_id = 42
@@ -1038,7 +1038,7 @@ def test_generate_stops_on_eos():
     """If the first argmax token happens to equal eos_token_id, generation
     stops early with output length = input + 1."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)
     ctx = torch.randint(0, cfg.vocab_size, (1, 6))
     # Force argmax by zeroing all output logits except EOS — then greedy
@@ -1072,7 +1072,7 @@ def test_checkpoint_roundtrip_preserves_logits(tmp_path):
     import os
     cfg = tiny_config()
     torch.manual_seed(0)
-    model_a = NanoOSRTForCausalLM(cfg)
+    model_a = OSRTForCausalLM(cfg)
     model_a.train(False)
 
     x = torch.randint(0, cfg.vocab_size, (1, 16))
@@ -1085,7 +1085,7 @@ def test_checkpoint_roundtrip_preserves_logits(tmp_path):
     # Fresh model with a different seed — loading must overwrite the
     # differently-initialised weights to match model_a exactly.
     torch.manual_seed(1)
-    model_b = NanoOSRTForCausalLM(cfg)
+    model_b = OSRTForCausalLM(cfg)
     model_b.train(False)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     missing, unexpected = model_b.load_state_dict(
@@ -1107,7 +1107,7 @@ def test_balance_loss_pushes_router_weights():
     the router would stop balancing and we'd drift back toward collapse.
     """
     cfg = tiny_config(router_aux_loss_coeff=1.0)
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     # Zero router weights so the gate has nothing to work with initially;
     # balance loss gradient should still flow.
     with torch.no_grad():
@@ -1151,7 +1151,7 @@ def test_extract_numeric_answer_returns_last_number_in_answer_tag():
     3 instead of 12. The fix takes the last number, which is the model's
     final committed answer.
     """
-    from nano_osrt.rewards import extract_numeric_answer
+    from osrt.rewards import extract_numeric_answer
 
     text = (
         "<|think|>3 steps of reasoning...<|/think|>"
@@ -1162,7 +1162,7 @@ def test_extract_numeric_answer_returns_last_number_in_answer_tag():
 
 def test_extract_numeric_answer_handles_plain_number():
     """A bare number inside the answer tag should still parse correctly."""
-    from nano_osrt.rewards import extract_numeric_answer
+    from osrt.rewards import extract_numeric_answer
 
     text = "<|think|>...<|/think|><|answer|>42<|/answer|>"
     assert extract_numeric_answer(text) == "42"
@@ -1170,7 +1170,7 @@ def test_extract_numeric_answer_handles_plain_number():
 
 def test_extract_numeric_answer_strips_commas():
     """Numbers with thousand separators should be normalised."""
-    from nano_osrt.rewards import extract_numeric_answer
+    from osrt.rewards import extract_numeric_answer
 
     text = "<|answer|>The total is 1,234<|/answer|>"
     assert extract_numeric_answer(text) == "1234"
@@ -1178,7 +1178,7 @@ def test_extract_numeric_answer_strips_commas():
 
 def test_extract_numeric_answer_falls_back_to_post_think():
     """No answer tag — should pick the last number after </think>."""
-    from nano_osrt.rewards import extract_numeric_answer
+    from osrt.rewards import extract_numeric_answer
 
     text = "<think>Working it out: 10, then 20...</think> So the final is 30"
     assert extract_numeric_answer(text) == "30"
@@ -1192,7 +1192,7 @@ def test_generate_batch_safe_with_repetition_penalty():
     next_token.item() which crashed for batch>1. Fix applies rep
     penalty per row and uses an EOS mask for termination."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)
     # Two rows → ensures all per-row indexing is correct.
     ctx = torch.randint(0, cfg.vocab_size, (2, 8))
@@ -1209,7 +1209,7 @@ def test_generate_batch_safe_with_sampling():
     """Batch>1 with temperature + top_p + top_k. Guards against the
     .item() EOS check crashing for multi-row outputs."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)
     ctx = torch.randint(0, cfg.vocab_size, (3, 5))
     out = model.generate(
@@ -1232,7 +1232,7 @@ def test_generate_pads_finished_rows_until_all_done():
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(False)
     eos = 7
 
@@ -1307,7 +1307,7 @@ def test_pretrain_loader_yields_aligned_labels_not_double_shifted():
     """
     import torch
 
-    from nano_osrt.data import TokenStream
+    from osrt.data import TokenStream
 
     # A token stream that just returns one big "document" of known IDs.
     # The TokenStream then chunks it into (input_ids, labels) of seq_len.
@@ -1403,7 +1403,7 @@ def test_z_loss_contributes_to_training_loss():
         router_aux_loss_coeff=0.0,
         router_z_loss_coeff=0.5,
     )
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (2, 8))
     labels = torch.randint(0, cfg.vocab_size, (2, 8))
 
@@ -1431,7 +1431,7 @@ def test_seq_balance_loss_off_by_default_but_wired():
     default 0.0."""
     cfg = tiny_config(router_aux_loss_coeff=0.0, router_z_loss_coeff=0.0)
     assert cfg.router_seq_balance_loss_coeff == 0.0
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(True)
     x = torch.randint(0, cfg.vocab_size, (2, 8))
     labels = torch.randint(0, cfg.vocab_size, (2, 8))
@@ -1457,10 +1457,10 @@ def test_seq_balance_loss_contributes_when_enabled():
         router_seq_balance_loss_coeff=0.5,
     )
     torch.manual_seed(0)
-    m_off = NanoOSRTForCausalLM(cfg_off)
+    m_off = OSRTForCausalLM(cfg_off)
     m_off.train(True)
     torch.manual_seed(0)
-    m_on = NanoOSRTForCausalLM(cfg_on)
+    m_on = OSRTForCausalLM(cfg_on)
     m_on.train(True)
     x = torch.randint(0, cfg_off.vocab_size, (2, 8))
     labels = torch.randint(0, cfg_off.vocab_size, (2, 8))
@@ -1476,7 +1476,7 @@ def test_qk_norm_present_and_bounds_attention_logits():
     """RecursiveBlock should have norm_q and norm_k modules; running
     forward with extreme input magnitudes should not produce NaN/Inf."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     for blk in model.model.blocks:
         assert isinstance(blk.norm_q, torch.nn.RMSNorm)
         assert isinstance(blk.norm_k, torch.nn.RMSNorm)
@@ -1497,7 +1497,7 @@ def test_qk_norm_present_and_bounds_attention_logits():
 def test_moe_gate_softplus_initialises_at_one():
     """Default raw moe_gate should produce effective gate ≈ 1.0 at init."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     for blk in model.model.blocks:
         eff = blk.effective_moe_gate().item()
         assert abs(eff - 1.0) < 1e-4, (
@@ -1509,7 +1509,7 @@ def test_moe_gate_softplus_stays_positive_under_negative_raw():
     """Driving the raw parameter very negative should keep the
     effective gate strictly positive (≥ 0), not negative or zero."""
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     with torch.no_grad():
         for blk in model.model.blocks:
             blk.moe_gate.data.fill_(-50.0)
@@ -1531,7 +1531,7 @@ def test_newton_schulz_produces_near_orthogonal_columns():
     real Muon training cares about the average behaviour, not pointwise
     Gram error within 1e-3.
     """
-    from nano_osrt.muon import newton_schulz5
+    from osrt.muon import newton_schulz5
 
     torch.manual_seed(0)
     g = torch.randn(64, 32)  # tall, so cols span R^32
@@ -1550,7 +1550,7 @@ def test_newton_schulz_produces_near_orthogonal_columns():
 def test_newton_schulz_handles_fat_matrix():
     """Same orthogonality property for fat matrices (rows < cols).
     The NS routine transposes internally to keep the Gram matmul cheap."""
-    from nano_osrt.muon import newton_schulz5
+    from osrt.muon import newton_schulz5
 
     torch.manual_seed(0)
     g = torch.randn(32, 64)  # fat
@@ -1566,7 +1566,7 @@ def test_muon_rejects_non_2d_params():
     sees the misuse before the first step()."""
     import pytest as _pytest
 
-    from nano_osrt.muon import Muon
+    from osrt.muon import Muon
 
     one_d = torch.nn.Parameter(torch.zeros(8))
     with _pytest.raises(ValueError, match="2D"):
@@ -1584,7 +1584,7 @@ def test_muon_step_decreases_loss_on_simple_quadratic():
     use a Muon-scale lr (much larger than AdamW would tolerate) and
     enough steps to see clear progress.
     """
-    from nano_osrt.muon import Muon
+    from osrt.muon import Muon
 
     torch.manual_seed(0)
     target = torch.randn(16, 16)
@@ -1607,10 +1607,10 @@ def test_build_param_groups_routes_correctly_for_full_model():
     """The hybrid splitter should send all matrix weights to Muon, and
     embeddings + RMSNorm scales + scalar moe_gate to AdamW. Router and
     loop_embeddings must land in the wd=0 AdamW group."""
-    from nano_osrt.muon import build_param_groups
+    from osrt.muon import build_param_groups
 
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     muon_params, adamw_groups = build_param_groups(
         model.named_parameters(), weight_decay=0.1,
     )
@@ -1656,10 +1656,10 @@ def test_build_param_groups_routes_correctly_for_full_model():
 def test_hybrid_optimizer_step_updates_both_kinds_of_params():
     """A single HybridMuonAdamW.step() should update Muon-managed
     matrix weights AND AdamW-managed embeddings/norms in the same call."""
-    from nano_osrt.muon import HybridMuonAdamW, Muon, build_param_groups
+    from osrt.muon import HybridMuonAdamW, Muon, build_param_groups
 
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     muon_params, adamw_groups = build_param_groups(
         model.named_parameters(), weight_decay=0.0,
     )
@@ -1691,10 +1691,10 @@ def test_hybrid_optimizer_step_updates_both_kinds_of_params():
 
 def test_hybrid_optimizer_state_dict_roundtrip():
     """save/load should preserve both inner optimizers' state."""
-    from nano_osrt.muon import HybridMuonAdamW, Muon, build_param_groups
+    from osrt.muon import HybridMuonAdamW, Muon, build_param_groups
 
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     muon_params, adamw_groups = build_param_groups(
         model.named_parameters(), weight_decay=0.0,
     )
@@ -1713,7 +1713,7 @@ def test_hybrid_optimizer_state_dict_roundtrip():
     assert "muon" in state and "adamw" in state
 
     # Build a fresh hybrid and load.
-    model2 = NanoOSRTForCausalLM(cfg)
+    model2 = OSRTForCausalLM(cfg)
     muon_params2, adamw_groups2 = build_param_groups(
         model2.named_parameters(), weight_decay=0.0,
     )
@@ -1738,7 +1738,7 @@ def test_apply_rope_preserves_activation_dtype():
 def test_checkpointed_forward_does_not_double_balance_counts():
     """Checkpoint recompute should not run the balance-bias side effect twice."""
     cfg = tiny_config(num_blocks=1, recursive_loops=1)
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train(True)
     model.model.gradient_checkpointing = True
 
@@ -1756,8 +1756,8 @@ def test_checkpointed_forward_does_not_double_balance_counts():
 
 def test_health_gate_fails_on_prebias_router_collapse():
     """Clean routing can be healthy while the learned pre-bias router is not."""
-    from nano_osrt.train import _check_early_stop_criteria
-    from nano_osrt.train_config import PretrainConfig
+    from osrt.train import _check_early_stop_criteria
+    from osrt.train_config import PretrainConfig
 
     cfg = PretrainConfig()
     model_cfg = tiny_config()
@@ -1781,8 +1781,8 @@ def test_health_gate_fails_on_prebias_router_collapse():
 
 
 def test_health_gate_fails_on_bias_saturation():
-    from nano_osrt.train import _check_early_stop_criteria
-    from nano_osrt.train_config import PretrainConfig
+    from osrt.train import _check_early_stop_criteria
+    from osrt.train_config import PretrainConfig
 
     cfg = PretrainConfig()
     model_cfg = tiny_config(router_balance_bias_max=1.0)
@@ -1805,10 +1805,10 @@ def test_health_gate_fails_on_bias_saturation():
 
 
 def test_strict_model_state_loader_rejects_key_drift():
-    from nano_osrt.train import load_model_state_or_raise
+    from osrt.train import load_model_state_or_raise
 
     cfg = tiny_config()
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     state = dict(model.state_dict())
     state.pop("model.blocks.0.moe.router.weight")
 

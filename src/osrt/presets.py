@@ -1,4 +1,4 @@
-"""Canonical model presets for nano_osrt.
+"""Canonical model presets for osrt.
 
 Generated/validated by `scripts/compute_budget.py`. The headline preset
 `OSRT_605M_A279M` is the locked target for the $350 build:
@@ -11,7 +11,7 @@ Generated/validated by `scripts/compute_budget.py`. The headline preset
 
 from __future__ import annotations
 
-from nano_osrt.config import NanoOSRTConfig
+from osrt.config import OSRTConfig
 
 # Locked $350-run target. See compute_budget.py: ~607.7M physical / 278.6M active.
 OSRT_605M_A279M: dict = dict(
@@ -36,6 +36,6 @@ OSRT_605M_A279M: dict = dict(
 )
 
 
-def build_config(preset: dict = OSRT_605M_A279M, **overrides) -> NanoOSRTConfig:
-    """Build a NanoOSRTConfig from a preset, with optional overrides."""
-    return NanoOSRTConfig(**{**preset, **overrides})
+def build_config(preset: dict = OSRT_605M_A279M, **overrides) -> OSRTConfig:
+    """Build a OSRTConfig from a preset, with optional overrides."""
+    return OSRTConfig(**{**preset, **overrides})

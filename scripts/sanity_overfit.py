@@ -11,15 +11,15 @@ from __future__ import annotations
 
 import torch
 
-from nano_osrt.config import NanoOSRTConfig
-from nano_osrt.model import NanoOSRTForCausalLM
-from nano_osrt.muon import HybridMuonAdamW, Muon, build_param_groups
+from osrt.config import OSRTConfig
+from osrt.model import OSRTForCausalLM
+from osrt.muon import HybridMuonAdamW, Muon, build_param_groups
 
 
 def main() -> None:
     torch.manual_seed(0)
     # Small proxy that keeps the architecture knobs we care about.
-    cfg = NanoOSRTConfig(
+    cfg = OSRTConfig(
         dim=256, heads=4, head_dim=64,
         vocab_size=512, real_vocab_size=512,
         num_blocks=2, recursive_loops=3,
@@ -29,7 +29,7 @@ def main() -> None:
         aux_loop_loss_weight=0.05,      # the anti-collapse fix, ON
         router_balance_bias_enabled=True,
     )
-    model = NanoOSRTForCausalLM(cfg)
+    model = OSRTForCausalLM(cfg)
     model.train()
 
     # Fixed batch to overfit.

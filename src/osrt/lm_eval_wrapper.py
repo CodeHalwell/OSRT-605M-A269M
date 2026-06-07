@@ -1,8 +1,8 @@
-"""lm-evaluation-harness wrapper for NanoOSRT.
+"""lm-evaluation-harness wrapper for OSRT.
 
 Implements the `lm_eval.api.model.LM` interface so the standard
 benchmark harness (gsm8k, IFEval, MMLU, etc.) can score our custom
-NanoOSRTForCausalLM. Two methods cover the bulk of HF-style benchmarks:
+OSRTForCausalLM. Two methods cover the bulk of HF-style benchmarks:
 
   loglikelihood(requests)  — multiple-choice scoring
                               (MMLU, ARC, hellaswag, BoolQ, ...)
@@ -20,7 +20,7 @@ right place.
 
 Usage from app.py::evaluate:
 
-    wrapper = NanoOSRTLMEval(
+    wrapper = OSRTLMEval(
         ckpt_path="/vol/checkpoints/v5/osrt_v5_sft_ultralong_final.pt",
         tokenizer_path="/vol/tokenizer",
         hra_enabled=True,
@@ -45,8 +45,8 @@ if TYPE_CHECKING:
     from lm_eval.api.instance import Instance
 
 
-class NanoOSRTLMEval(LM):
-    """LM-eval-harness adapter over NanoOSRTForCausalLM.
+class OSRTLMEval(LM):
+    """LM-eval-harness adapter over OSRTForCausalLM.
 
     Loads the model + tokenizer once at construction. Subsequent
     .loglikelihood / .generate_until calls run against the same
@@ -180,14 +180,14 @@ class NanoOSRTLMEval(LM):
         # import time when this file might be parsed but not used.
         from transformers import AutoTokenizer
 
-        from nano_osrt.config import NanoOSRTConfig
-        from nano_osrt.model import NanoOSRTForCausalLM
+        from osrt.config import OSRTConfig
+        from osrt.model import OSRTForCausalLM
 
         print(f"[lm_eval] Loading tokenizer from {tokenizer_path}", flush=True)
         self._tok = AutoTokenizer.from_pretrained(tokenizer_path)
 
         print("[lm_eval] Constructing model...", flush=True)
-        cfg = NanoOSRTConfig(
+        cfg = OSRTConfig(
             vocab_size=len(self._tok),
             real_vocab_size=len(self._tok),
             bos_token_id=self._tok.bos_token_id,
@@ -196,14 +196,14 @@ class NanoOSRTLMEval(LM):
         )
         self._cfg = cfg
 
-        model = NanoOSRTForCausalLM(cfg).to(self._device)
+        model = OSRTForCausalLM(cfg).to(self._device)
 
         # Inject HRA adapters BEFORE loading the state_dict. SFT
         # checkpoints have HRA params already in their state_dict; the
         # injection adds the matching nn.Parameter slots so they fill
         # in correctly during load_state_dict.
         if hra_enabled:
-            from nano_osrt.hra import inject_hra
+            from osrt.hra import inject_hra
             print(f"[lm_eval] Injecting HRA (rank={hra_rank})", flush=True)
             inject_hra(model, rank=hra_rank)
 

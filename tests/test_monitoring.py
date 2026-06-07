@@ -2,13 +2,13 @@
 
 import torch
 
-from nano_osrt.config import NanoOSRTConfig
-from nano_osrt.model import NanoOSRTForCausalLM
-from nano_osrt.monitoring import loop_depth_probe, moe_health, summarize
+from osrt.config import OSRTConfig
+from osrt.model import OSRTForCausalLM
+from osrt.monitoring import loop_depth_probe, moe_health, summarize
 
 
 def _tiny_model(**over):
-    cfg = NanoOSRTConfig(
+    cfg = OSRTConfig(
         dim=128, heads=4, head_dim=32,
         vocab_size=256, real_vocab_size=256,
         num_blocks=2, recursive_loops=3,
@@ -18,7 +18,7 @@ def _tiny_model(**over):
         aux_loop_loss_weight=0.05,
         **over,
     )
-    return NanoOSRTForCausalLM(cfg)
+    return OSRTForCausalLM(cfg)
 
 
 def test_moe_health_shapes_and_keys():

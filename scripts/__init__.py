@@ -1,1 +1,1 @@
-"""Entry-point script for training nano-osrt-100m."""
+"""Entry-point script for training osrt-100m."""

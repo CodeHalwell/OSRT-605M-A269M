@@ -1,4 +1,4 @@
-"""Configuration for NanoOSRT — Mixtral-style MoE without dense FFN.
+"""Configuration for OSRT — Mixtral-style MoE without dense FFN.
 
 3 physical blocks × 6 loops = 18 effective layers.
 MoE only (1 shared + 8 routed experts, top-2 routing).
@@ -16,8 +16,8 @@ Architecture: ~363M physical params, ~192M active per token (52.9%),
 from transformers import PretrainedConfig
 
 
-class NanoOSRTConfig(PretrainedConfig):
-    """HuggingFace-compatible config for NanoOSRT.
+class OSRTConfig(PretrainedConfig):
+    """HuggingFace-compatible config for OSRT.
 
     Design lessons from v4:
       - Dense FFN made MoE optional → removed
@@ -29,7 +29,7 @@ class NanoOSRTConfig(PretrainedConfig):
         (Mixtral uses top-2 of 8 successfully with Switch balance + no dense FFN)
     """
 
-    model_type = "nano-osrt"
+    model_type = "osrt"
 
     def __init__(
         self,

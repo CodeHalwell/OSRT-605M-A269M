@@ -1,4 +1,4 @@
-"""Curated system prompts for nano-osrt training (MOPD + GRPO).
+"""Curated system prompts for osrt training (MOPD + GRPO).
 
 Design principles:
   1. Varied in length, style, and few-shot count (the model must learn
@@ -11,7 +11,7 @@ Design principles:
      persona varies but the format is always the same.
 
 Use:
-  from nano_osrt.system_prompts import SYSTEM_PROMPTS, sample_system_prompt
+  from osrt.system_prompts import SYSTEM_PROMPTS, sample_system_prompt
   sys = sample_system_prompt(rng)  # uniform random
 """
 from __future__ import annotations

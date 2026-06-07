@@ -1,4 +1,4 @@
-"""NanoOSRT — Modal deployment entrypoint.
+"""OSRT — Modal deployment entrypoint.
 
 ~363M physical params (32K vocab + 1536 dim), ~192M active/token (top-2 of 8
 routed experts + shared expert), ~1.15B effective via recursive weight sharing.
@@ -21,7 +21,7 @@ import modal
 # MODAL INFRASTRUCTURE
 # =============================================================================
 
-app = modal.App("nano-osrt")
+app = modal.App("osrt")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -63,7 +63,7 @@ image = (
         # named 'langdetect'" before the model even runs.
         "lm-eval[ifeval]",
     )
-    .add_local_dir("src/nano_osrt", remote_path="/root/nano_osrt")
+    .add_local_dir("src/osrt", remote_path="/root/osrt")
     .add_local_dir("scripts", remote_path="/root/scripts")
 )
 
@@ -123,9 +123,9 @@ def pretrain():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_training
-    from nano_osrt.train_config import PretrainConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_training
+    from osrt.train_config import PretrainConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -142,7 +142,7 @@ def pretrain():
         print(f"WARNING: Expected {expected_vocab} vocab but got {len(tok)}!")
         print("  Retrain tokenizer: modal run app_v4.py --stage tokenizer")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -205,9 +205,9 @@ def pretrain_extend():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import PretrainExtendConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import PretrainExtendConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -219,7 +219,7 @@ def pretrain_extend():
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -276,9 +276,9 @@ def pretrain_extend2():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import PretrainExtend2Config
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import PretrainExtend2Config
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -290,7 +290,7 @@ def pretrain_extend2():
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -337,7 +337,7 @@ def pretrain_extend2():
 def loop_fix():
     """Per-loop aux-loss continuation from extend2_final.
 
-    The aux_loop_loss_weight on NanoOSRTConfig (model config) is the
+    The aux_loop_loss_weight on OSRTConfig (model config) is the
     real switch — without it the model forward is unchanged. We thread
     it through here from the training config (LoopFixConfig).
     """
@@ -346,9 +346,9 @@ def loop_fix():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import LoopFixConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import LoopFixConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -372,7 +372,7 @@ def loop_fix():
     # Critical: pass aux_loop_loss_weight to the MODEL config so the
     # model's forward actually computes the aux losses. Without this,
     # the training config's aux_loop_loss_weight is a no-op.
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -398,9 +398,9 @@ def loop_fix_sanity_inner():
     import os
     import modal as _modal
     from transformers import AutoTokenizer
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import LoopFixConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import LoopFixConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -421,7 +421,7 @@ def loop_fix_sanity_inner():
     sanity_cfg.phases["extend"]["end"] = 50
     sanity_cfg.phases["extend"]["batch_size"] = 4
     sanity_cfg.phases["extend"]["grad_accum_steps"] = 16
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -480,9 +480,9 @@ def loop_fix_v2():
     import os
     import modal as _modal
     from transformers import AutoTokenizer
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import LoopFixV2Config
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import LoopFixV2Config
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -499,7 +499,7 @@ def loop_fix_v2():
     # running loop_fix to completion.
     cfg.pretrained_checkpoint = "/vol/checkpoints/v5/osrt_v5_loopfix_step_400.pt"
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -541,9 +541,9 @@ def loop_fix_v2_sanity():
     import os
     import modal as _modal
     from transformers import AutoTokenizer
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import LoopFixV2Config
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import LoopFixV2Config
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -569,7 +569,7 @@ def loop_fix_v2_sanity():
     cfg.phases["extend"]["end"] = 50
     cfg.phases["extend"]["batch_size"] = 4
     cfg.phases["extend"]["grad_accum_steps"] = 16
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -622,9 +622,9 @@ def pretrain_extend3():
     import os
     import modal as _modal
     from transformers import AutoTokenizer
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import PretrainExtend3Config
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import PretrainExtend3Config
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -635,7 +635,7 @@ def pretrain_extend3():
     cfg.phases["extend"]["batch_size"] = 4
     cfg.phases["extend"]["grad_accum_steps"] = 16
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -676,9 +676,9 @@ def pretrain_extend3_sanity():
     import os
     import modal as _modal
     from transformers import AutoTokenizer
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import PretrainExtend3Config
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import PretrainExtend3Config
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -700,7 +700,7 @@ def pretrain_extend3_sanity():
     cfg.phases["extend"]["end"] = 50
     cfg.phases["extend"]["batch_size"] = 4
     cfg.phases["extend"]["grad_accum_steps"] = 16
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -751,9 +751,9 @@ def mopd():
     import os
     import modal as _modal
     from transformers import AutoTokenizer
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import MOPDConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import MOPDConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -767,7 +767,7 @@ def mopd():
     # 2048 is mostly wasted padding. Cuts compute ~50% per step.
     cfg.phases["extend"]["seq_len"] = 1024
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -812,9 +812,9 @@ def mopd_sanity():
     import os
     import modal as _modal
     from transformers import AutoTokenizer
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import MOPDConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import MOPDConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -840,7 +840,7 @@ def mopd_sanity():
     cfg.phases["extend"]["batch_size"] = 4
     cfg.phases["extend"]["grad_accum_steps"] = 16
     cfg.phases["extend"]["seq_len"] = 1024
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -919,9 +919,9 @@ def _run_system_sft(sanity: bool = False) -> None:
     import os
     import modal as _modal
     from transformers import AutoTokenizer
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import SystemSFTConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import SystemSFTConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -947,7 +947,7 @@ def _run_system_sft(sanity: bool = False) -> None:
     # to fit system+user+assistant comfortably.
     cfg.phases["extend"]["seq_len"] = 1536
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -1002,9 +1002,9 @@ def pretrain_extend2_sanity():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_pretrain_extend
-    from nano_osrt.train_config import PretrainExtend2Config
+    from osrt.config import OSRTConfig
+    from osrt.train import run_pretrain_extend
+    from osrt.train_config import PretrainExtend2Config
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -1014,7 +1014,7 @@ def pretrain_extend2_sanity():
     print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -1105,9 +1105,9 @@ def sanity():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_training
-    from nano_osrt.train_config import PretrainConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_training
+    from osrt.train_config import PretrainConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -1117,7 +1117,7 @@ def sanity():
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -1209,9 +1209,9 @@ def sweep():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_training
-    from nano_osrt.train_config import PretrainConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_training
+    from osrt.train_config import PretrainConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -1262,7 +1262,7 @@ def sweep():
               f"tau={sc['tau_init']}→0 over {sc['anneal_steps']}")
         print("=" * 60)
 
-        model_config = NanoOSRTConfig(
+        model_config = OSRTConfig(
             router_aux_loss_coeff=sc["aux_coeff"],
             **model_config_kwargs,
         )
@@ -1340,9 +1340,9 @@ def ablate():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.train import run_training
-    from nano_osrt.train_config import PretrainConfig
+    from osrt.config import OSRTConfig
+    from osrt.train import run_training
+    from osrt.train_config import PretrainConfig
 
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
@@ -1420,7 +1420,7 @@ def ablate():
         # session: Z-loss on, seq-balance off, QK-Norm always-on,
         # softplus moe_gate, bias controller on. Only optimizer + aux
         # coefficient vary across cells.
-        model_config = NanoOSRTConfig(
+        model_config = OSRTConfig(
             router_aux_loss_coeff=cell["aux_coeff"],
             router_balance_bias_enabled=True,
             **model_config_kwargs,
@@ -1486,13 +1486,13 @@ def sft():
     """
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.sft_train import run_sft
-    from nano_osrt.train_config import SFTConfig
+    from osrt.config import OSRTConfig
+    from osrt.sft_train import run_sft
+    from osrt.train_config import SFTConfig
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -1533,13 +1533,13 @@ def sft_long():
     """
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.sft_train import run_sft
-    from nano_osrt.train_config import SFTLongConfig
+    from osrt.config import OSRTConfig
+    from osrt.sft_train import run_sft
+    from osrt.train_config import SFTLongConfig
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -1579,13 +1579,13 @@ def sft_ultralong():
     """
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.sft_train import run_sft
-    from nano_osrt.train_config import SFTUltraLongConfig
+    from osrt.config import OSRTConfig
+    from osrt.sft_train import run_sft
+    from osrt.train_config import SFTUltraLongConfig
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -1637,13 +1637,13 @@ def sft_refresh():
     """
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.sft_train import run_sft
-    from nano_osrt.train_config import SFTRefreshConfig
+    from osrt.config import OSRTConfig
+    from osrt.sft_train import run_sft
+    from osrt.train_config import SFTRefreshConfig
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -1696,13 +1696,13 @@ def sft_math():
     """
     from transformers import AutoTokenizer
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.sft_train import run_sft
-    from nano_osrt.train_config import SFTMathConfig
+    from osrt.config import OSRTConfig
+    from osrt.sft_train import run_sft
+    from osrt.train_config import SFTMathConfig
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -1787,7 +1787,7 @@ def evaluate(
 
     from lm_eval import simple_evaluate
 
-    from nano_osrt.lm_eval_wrapper import NanoOSRTLMEval
+    from osrt.lm_eval_wrapper import OSRTLMEval
 
     ckpt_path = f"/vol/checkpoints/v5/{ckpt_name}"
     if not os.path.exists(ckpt_path):
@@ -1797,14 +1797,14 @@ def evaluate(
         )
 
     print("=" * 60)
-    print(f"NanoOSRT — lm-eval-harness ({tag})")
+    print(f"OSRT — lm-eval-harness ({tag})")
     print("=" * 60)
     print(f"Checkpoint     : {ckpt_path}")
     print(f"Tasks          : {tasks}")
     print(f"Per-task limit : {limit or 'full'}")
     print()
 
-    wrapper = NanoOSRTLMEval(
+    wrapper = OSRTLMEval(
         ckpt_path=ckpt_path,
         tokenizer_path="/vol/tokenizer",
         hra_enabled=True,
@@ -1817,7 +1817,7 @@ def evaluate(
 
     if wandb is not None:
         wandb.init(
-            project="nano-osrt",
+            project="osrt",
             name=f"osrt-eval-{tag}",
             config={
                 "stage": "evaluate",
@@ -1926,12 +1926,12 @@ def grpo():
     except ImportError:
         wandb = None
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.hra import get_param_groups, inject_hra
-    from nano_osrt.model import NanoOSRTForCausalLM
-    from nano_osrt.rewards import compute_group_advantages, compute_reward
-    from nano_osrt.train import apply_router_balance_updates, load_model_state_or_raise
-    from nano_osrt.train_config import GRPOConfig
+    from osrt.config import OSRTConfig
+    from osrt.hra import get_param_groups, inject_hra
+    from osrt.model import OSRTForCausalLM
+    from osrt.rewards import compute_group_advantages, compute_reward
+    from osrt.train import apply_router_balance_updates, load_model_state_or_raise
+    from osrt.train_config import GRPOConfig
 
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1941,10 +1941,10 @@ def grpo():
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
     print("=" * 60)
-    print("NanoOSRT — GRPO Training")
+    print("OSRT — GRPO Training")
     print("=" * 60)
 
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -1952,7 +1952,7 @@ def grpo():
         pad_token_id=tok.pad_token_id,
     )
 
-    model = NanoOSRTForCausalLM(model_config).to(device)
+    model = OSRTForCausalLM(model_config).to(device)
 
     # Inject HRA before loading SFT checkpoint
     hra_params = []
@@ -2147,7 +2147,7 @@ def grpo():
             # every step — O(N^2) per token and sequential across the
             # group. Replicating the prompt group_size times and calling
             # generate() once uses the per-effective-layer KV cache
-            # built into NanoOSRTForCausalLM.generate(), decoding all
+            # built into OSRTForCausalLM.generate(), decoding all
             # group_size samples in parallel at O(1) attention cost
             # per step.
             prompt_batch = prompt_tensor.expand(
@@ -2395,18 +2395,18 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     except ImportError:
         wandb = None
 
-    from nano_osrt.config import NanoOSRTConfig
-    from nano_osrt.hra import get_param_groups, inject_hra
-    from nano_osrt.model import NanoOSRTForCausalLM
-    from nano_osrt.rewards import (
+    from osrt.config import OSRTConfig
+    from osrt.hra import get_param_groups, inject_hra
+    from osrt.model import OSRTForCausalLM
+    from osrt.rewards import (
         RewardEMA,
         compose_template_rewards,
         compute_group_advantages,
         ifeval_constraint_reward,
         mbpp_test_reward,
     )
-    from nano_osrt.train import apply_router_balance_updates, load_model_state_or_raise
-    from nano_osrt.train_config import MultiEnvGRPOConfig
+    from osrt.train import apply_router_balance_updates, load_model_state_or_raise
+    from osrt.train_config import MultiEnvGRPOConfig
 
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -2426,7 +2426,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
     print("=" * 60)
-    print(f"NanoOSRT — Multi-env GRPO {'(SANITY)' if sanity else ''}")
+    print(f"OSRT — Multi-env GRPO {'(SANITY)' if sanity else ''}")
     print("=" * 60)
     print(f"  Envs: {dict(zip(cfg.env_names, cfg.env_weights))}")
     print(f"  Resume: {cfg.pretrained_checkpoint}")
@@ -2435,7 +2435,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     print(f"  Stop token ids: {cfg.stop_token_ids}")
 
     # Model with architecture-fix knobs
-    model_config = NanoOSRTConfig(
+    model_config = OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -2446,7 +2446,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         loop_dropout_min_loops=cfg.loop_dropout_min_loops,
         per_loop_aux_weights=cfg.per_loop_aux_weights,
     )
-    model = NanoOSRTForCausalLM(model_config).to(device)
+    model = OSRTForCausalLM(model_config).to(device)
 
     hra_params = []
     if cfg.hra_enabled:
@@ -2813,7 +2813,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
 
     # Import the extractor lazily inside the probe but resolve it here
     # so we get a clear error if rewards.py is missing the symbol.
-    from nano_osrt.rewards import extract_answer_text  # noqa: E402
+    from osrt.rewards import extract_answer_text  # noqa: E402
 
     # ── Troubleshoot-gen runner ──
     # Prints a single completion at the TRAINING temperature every N

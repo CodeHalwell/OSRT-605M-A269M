@@ -10,7 +10,7 @@ a no-op when the underlying disk is already persistent.
 Usage (Lightning Studio, EC2, or local with a CUDA GPU):
 
     # Required env: WANDB_API_KEY, HF_TOKEN
-    python -m nano_osrt.train_main \\
+    python -m osrt.train_main \\
         --tokenizer-path ./tokenizer \\
         --ckpt-dir ./checkpoints/v5
 
@@ -31,9 +31,9 @@ import sys
 
 import torch
 
-from nano_osrt.config import NanoOSRTConfig
-from nano_osrt.train import run_training
-from nano_osrt.train_config import PretrainConfig
+from osrt.config import OSRTConfig
+from osrt.train import run_training
+from osrt.train_config import PretrainConfig
 
 try:
     from dotenv import load_dotenv
@@ -56,7 +56,7 @@ class _LocalVol:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pretrain NanoOSRT v5 outside Modal (Lightning, on-prem, etc.)",
+        description="Pretrain OSRT v5 outside Modal (Lightning, on-prem, etc.)",
     )
     p.add_argument(
         "--tokenizer-path",
@@ -95,7 +95,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _build_model_config(tokenizer_path: str) -> NanoOSRTConfig:
+def _build_model_config(tokenizer_path: str) -> OSRTConfig:
     """Load the tokenizer once to seed vocab/special-token IDs into the
     model config. Mirrors the same construction used by `app.py::pretrain`."""
     from transformers import AutoTokenizer
@@ -118,7 +118,7 @@ def _build_model_config(tokenizer_path: str) -> NanoOSRTConfig:
             flush=True,
         )
 
-    return NanoOSRTConfig(
+    return OSRTConfig(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,

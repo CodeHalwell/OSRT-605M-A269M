@@ -9,7 +9,7 @@ Unlike LoRA (rank 4-64), HRA uses rank 128-512 to add substantial learning
 capacity rather than parameter-efficient fine-tuning.
 
 Usage:
-    model = RecursiveNanoOSRT(cfg).to(device)
+    model = RecursiveOSRT(cfg).to(device)
     load_pretrained(model, checkpoint_path, device)
     hra_params = inject_hra(model, rank=256)
 

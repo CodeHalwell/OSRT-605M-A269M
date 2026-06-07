@@ -36,7 +36,7 @@ def _entropy(p: torch.Tensor) -> float:
 
 
 def _base(model):
-    """Return the inner NanoOSRTModel regardless of wrapper."""
+    """Return the inner OSRTModel regardless of wrapper."""
     return model.model if hasattr(model, "model") else model
 
 
