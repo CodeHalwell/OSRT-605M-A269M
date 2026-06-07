@@ -168,10 +168,34 @@ class OSRTConfig(PretrainedConfig):
         router_balance_bias_ema_rate: float = 0.05,
         router_balance_bias_max: float = 1.5,
 
+        # --- Router affinity transform (ARCHITECTURE.md §7.4, §16.3) ---
+        # How per-expert router logits become routing affinities:
+        #   "softmax"       — Mixtral/v5 behavior: softmax over logits gives
+        #                     gating weights and the balance-bias is added to
+        #                     the logits BEFORE softmax. (default; bit-identical
+        #                     to the historical path).
+        #   "sqrt_softplus" — DeepSeek-V4 affinity = sqrt(softplus(logits)),
+        #                     always non-negative. The balance-bias is added to
+        #                     the AFFINITY (not the logits); top-k selection and
+        #                     the renormalised gating weights both operate on
+        #                     that balanced affinity. Telemetry/balance-loss use
+        #                     an affinity-normalised probability view.
+        router_affinity: str = "softmax",
+
         # Training-time noisy top-k. The training loop anneals this buffer;
         # default stays 0.0 so unit tests and standalone/eval forwards are
         # deterministic unless the trainer explicitly enables exploration.
         router_gumbel_tau_init: float = 0.0,
+
+        # --- Hash routing for early blocks (ARCHITECTURE.md §7.5) ---
+        # Physical blocks with block_idx < hash_routing_blocks use deterministic
+        # HASH routing instead of the learned router: top-1 selection with
+        #   expert_id = (token_id + loop_idx) % num_routed_experts
+        # (loop-indexed hash, hard switch — a block either fully hash-routes or
+        # fully learned-routes). Stabilises early training before the learned
+        # router has warmed up. Default 0 = off (every block uses the learned
+        # router); the standard path is unchanged.
+        hash_routing_blocks: int = 0,
 
         # Capacity factor: expert_capacity = capacity_factor * N / num_experts
         # 2.0 is loose enough that router preferences actually drive routing.
@@ -247,7 +271,9 @@ class OSRTConfig(PretrainedConfig):
         self.router_balance_bias_update_rate = router_balance_bias_update_rate
         self.router_balance_bias_ema_rate = router_balance_bias_ema_rate
         self.router_balance_bias_max = router_balance_bias_max
+        self.router_affinity = router_affinity
         self.router_gumbel_tau_init = router_gumbel_tau_init
+        self.hash_routing_blocks = hash_routing_blocks
         self.router_capacity_factor = router_capacity_factor
         self.expert_orthogonal_init = expert_orthogonal_init
         self.loop_embedding_init_std = loop_embedding_init_std
@@ -367,4 +393,14 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"router_gumbel_tau_init must be >= 0, got "
                 f"{self.router_gumbel_tau_init}"
+            )
+        if self.router_affinity not in ("softmax", "sqrt_softplus"):
+            raise ValueError(
+                f"router_affinity must be 'softmax' or 'sqrt_softplus', got "
+                f"{self.router_affinity!r}"
+            )
+        if not 0 <= self.hash_routing_blocks <= self.num_blocks:
+            raise ValueError(
+                f"hash_routing_blocks must be in [0, num_blocks="
+                f"{self.num_blocks}], got {self.hash_routing_blocks}"
             )

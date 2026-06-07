@@ -13,6 +13,7 @@
   "fim_middle_id": 5,
   "fim_prefix_id": 4,
   "fim_suffix_id": 6,
+  "hash_routing_blocks": 0,
   "head_dim": 64,
   "heads": 24,
   "initializer_range": 0.02,
@@ -35,6 +36,7 @@
     "rope_type": "default"
   },
   "rope_theta": 10000.0,
+  "router_affinity": "sqrt_softplus",
   "router_aux_loss_coeff": 0.1,
   "router_balance_bias_ema_rate": 0.05,
   "router_balance_bias_enabled": true,

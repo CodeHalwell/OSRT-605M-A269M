@@ -39,6 +39,11 @@ OSRT_605M_A279M: dict = dict(
     router_aux_loss_coeff=0.10,  # v5-proven balance pressure
     router_z_loss_coeff=1e-3,
     router_balance_bias_enabled=True,
+    # sqrt(softplus) routing affinity (ARCHITECTURE.md §7.4, §16.3): the
+    # balance bias steers TOP-K selection on the non-negative affinity, gating
+    # weights renormalise the selected balanced affinities. Hash routing stays
+    # off (hash_routing_blocks default 0) — reserved for later A/B testing.
+    router_affinity="sqrt_softplus",
     max_position_embeddings=4096,
 )
 

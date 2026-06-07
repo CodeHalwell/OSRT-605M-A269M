@@ -206,6 +206,9 @@ class MoELayer(nn.Module):
         self.loop_embeddings = nn.Embedding(config.recursive_loops, config.dim)
         self.loop_embeddings._osrt_init_std = config.loop_embedding_init_std
         self.router = nn.Linear(config.dim, self.num_routed, bias=False)
+        # Affinity transform: "softmax" (historical) or "sqrt_softplus"
+        # (DeepSeek-V4). See forward() for how each maps logits -> routing.
+        self.router_affinity = config.router_affinity
         self.register_buffer(
             "gumbel_tau",
             torch.tensor(config.router_gumbel_tau_init, dtype=torch.float32),
@@ -391,31 +394,86 @@ class MoELayer(nn.Module):
         loop_emb = self.loop_embeddings.weight[loop_idx].view(1, 1, D)
         router_input = x + loop_emb
         router_logits = self.router(router_input.reshape(N, D))  # (N, E)
-        raw_router_probs = F.softmax(router_logits, dim=-1)
-        if self.bias_enabled:
-            loop_bias = self.router_balance_bias[loop_idx].view(1, -1)
-            clean_logits = router_logits + loop_bias
+
+        # The routing math below operates on a per-expert "probability-like"
+        # view of three router states — raw (pre-bias, no Gumbel), clean (bias,
+        # no Gumbel) and the noisy selection path (bias + Gumbel). Two affinity
+        # transforms are supported and produce these three views differently:
+        #
+        #   "softmax"       — historical Mixtral/v5 path. The balance bias is
+        #                     added to the LOGITS pre-softmax; each view is a
+        #                     softmax over its logits. Bit-identical to before.
+        #   "sqrt_softplus" — DeepSeek-V4. affinity = sqrt(softplus(logits)) is
+        #                     always non-negative; the balance bias is added to
+        #                     the AFFINITY (not the logits); top-k selection and
+        #                     the renormalised gating weights operate on that
+        #                     balanced affinity. Telemetry and the Switch balance
+        #                     loss consume an affinity-normalised probability
+        #                     view (affinity / affinity.sum) so every downstream
+        #                     entropy/fraction/z-loss stays well-defined.
+        affinity_mode = self.router_affinity
+        if affinity_mode == "sqrt_softplus":
+            # Non-negative per-expert affinity. softplus keeps it smooth and
+            # strictly positive; sqrt compresses the tail (DeepSeek-V4).
+            affinity = torch.sqrt(F.softplus(router_logits))  # (N, E)
+            raw_router_probs = affinity / affinity.sum(
+                dim=-1, keepdim=True,
+            ).clamp_min(1e-9)
+            if self.bias_enabled:
+                loop_bias = self.router_balance_bias[loop_idx].view(1, -1)
+                clean_affinity = affinity + loop_bias
+            else:
+                clean_affinity = affinity
+            # The aux-loss-free balance bias can push an affinity negative;
+            # clamp at 0 so the normalised view and the gating weights stay
+            # non-negative (the bias still steers top-k selection via ordering).
+            clean_affinity = clean_affinity.clamp_min(0.0)
+            clean_probs = clean_affinity / clean_affinity.sum(
+                dim=-1, keepdim=True,
+            ).clamp_min(1e-9)
+
+            # Training-time noisy exploration: Gumbel is added to the balanced
+            # AFFINITY (not logits) so cold experts still get explored under the
+            # affinity transform. Annealed to 0 by the trainer before eval.
+            selection_affinity = clean_affinity
+            if self.training:
+                u = torch.rand_like(clean_affinity).clamp_(1e-6, 1.0 - 1e-6)
+                gumbel = -torch.log(-torch.log(u))
+                tau = cast(Tensor, self.gumbel_tau).to(
+                    dtype=clean_affinity.dtype,
+                )
+                selection_affinity = (clean_affinity + tau * gumbel).clamp_min(
+                    0.0,
+                )
+            probs = selection_affinity / selection_affinity.sum(
+                dim=-1, keepdim=True,
+            ).clamp_min(1e-9)
         else:
-            clean_logits = router_logits
+            raw_router_probs = F.softmax(router_logits, dim=-1)
+            if self.bias_enabled:
+                loop_bias = self.router_balance_bias[loop_idx].view(1, -1)
+                clean_logits = router_logits + loop_bias
+            else:
+                clean_logits = router_logits
 
-        # "Clean" means deterministic deployed routing: bias applied, no
-        # Gumbel. Raw un-biased logits are diagnostic only once the controller
-        # is enabled.
-        clean_probs = F.softmax(clean_logits, dim=-1)  # (N, E)
+            # "Clean" means deterministic deployed routing: bias applied, no
+            # Gumbel. Raw un-biased logits are diagnostic only once the
+            # controller is enabled.
+            clean_probs = F.softmax(clean_logits, dim=-1)  # (N, E)
 
-        # Training-time noisy top-k exploration. This prevents experts that
-        # lose the first few router updates from going permanently cold. The
-        # trainer anneals gumbel_tau to zero before the 5k health gate, so the
-        # final pass is evaluated on the clean router.
-        selection_logits = clean_logits
-        if self.training:
-            u = torch.rand_like(clean_logits).clamp_(1e-6, 1.0 - 1e-6)
-            gumbel = -torch.log(-torch.log(u))
-            tau = cast(Tensor, self.gumbel_tau).to(dtype=clean_logits.dtype)
-            selection_logits = clean_logits + tau * gumbel
+            # Training-time noisy top-k exploration. This prevents experts that
+            # lose the first few router updates from going permanently cold. The
+            # trainer anneals gumbel_tau to zero before the 5k health gate, so
+            # the final pass is evaluated on the clean router.
+            selection_logits = clean_logits
+            if self.training:
+                u = torch.rand_like(clean_logits).clamp_(1e-6, 1.0 - 1e-6)
+                gumbel = -torch.log(-torch.log(u))
+                tau = cast(Tensor, self.gumbel_tau).to(dtype=clean_logits.dtype)
+                selection_logits = clean_logits + tau * gumbel
 
-        # Softmax probabilities
-        probs = F.softmax(selection_logits, dim=-1)  # (N, E)
+            # Softmax probabilities
+            probs = F.softmax(selection_logits, dim=-1)  # (N, E)
 
         # Top-k selection (raw probs, before renormalisation)
         raw_top_probs, top_idx = probs.topk(self.top_k, dim=-1)  # (N, K)
