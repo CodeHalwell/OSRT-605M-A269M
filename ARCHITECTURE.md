@@ -38,18 +38,21 @@ ARCHITECTURE.md alone.
 
 ## 1. One-sentence overview
 
-OSRT-600M is a **recursive Mixtral-style sparse MoE transformer** with
-**3 physical decoder blocks applied 6 times via depth recurrence**
-(giving 18 effective layers), using **HRA adapters**, **GQA attention**,
-**manifold-constrained hyper-connections**, **Muon-optimized weights**,
-and **MLA-style KV cache compression** — totaling ~599M physical
-params, ~232M active per token (canonical, see §2.1 for full
-breakdown), ~2.5B FLOPs equivalent per token.
+**OSRT** = **Optimized Sparse Recursive Transformer**. OSRT-600M is a
+recursive Mixtral-style sparse MoE transformer with **3 physical
+decoder blocks applied 6 times via depth recurrence** (giving 18
+effective layers), using **HRA adapters**, **GQA attention**,
+**manifold-constrained hyper-connections**, **Muon-optimized
+weights**, and **MLA-style KV cache compression** — totaling
+**605M physical params, 269M active per token** (44.4% active
+fraction; see §2.1 for full breakdown), ~2.5B FLOPs equivalent per
+token. "600M" in the name rounds the physical count.
 
-> ⚠ **ACCOUNTING NOT YET CODE-GENERATED.** All param/FLOP/memory
-> numbers in this doc are hand-derived. A `compute_budget.py` script
-> (Phase 1 of remediation per `review/SYNTHESIS.md`) will replace these
-> with generated values. Treat current numbers as approximate until then.
+> ⚠ **ACCOUNTING NOT YET CODE-GENERATED.** §2.1 numbers are
+> hand-derived but now arithmetically consistent (corrected
+> 2026-06-07). A `compute_budget.py` script (Phase 1 of remediation
+> per `review/SYNTHESIS.md`) will replace them with generated values
+> from canonical config. Treat current numbers as approximate ±2%.
 
 > 🔧 **"GATED SHORT CONVOLUTIONS" REMOVED.** The original overview
 > claimed a hybrid conv + GQA architecture, but no conv sub-block is
@@ -60,49 +63,65 @@ breakdown), ~2.5B FLOPs equivalent per token.
 
 ## 2. Parameter budget
 
-### 2.1 Exact accounting
+### 2.1 Exact accounting (corrected 2026-06-07)
+
+> ⚠ **HAND-DERIVED — to be superseded by `compute_budget.py`** (Phase 1
+> of `review/SYNTHESIS.md` remediation). The earlier version of this
+> table had three offsetting math errors that produced an
+> approximately correct ~599M total via cancellation rather than
+> rigour. Numbers below are recomputed from first principles using
+> the §6.2 attention spec (V-from-K) and the §5.4 HRA injection
+> enumeration (4 attn + 3 shared + 36 routed + 1 router = 44 per
+> block × 3 blocks = 132). See §2.4 for the HRA enumeration table.
 
 ```
 COMPONENT                                          PHYSICAL          ACTIVE PER TOKEN
 ─────────────────────────────────────────────────────────────────────────────────────
-Embedding (65,536 × 1,536, tied with LM head)      100,663,296       ≈ same
+Embedding (65,536 × 1,536, tied with LM head)      100,663,296       100,663,296
   -- one row used per token at embedding lookup
   -- full matrix touched at LM head computation
 
-Attention × 3 physical blocks                       28,311,552       28,311,552
-  -- per block: 4 × (1,536²) = 9,437,184
-  -- W_Q, W_K_DOWN, W_V_DOWN, W_O projections
-  -- (W_K, W_V are partial — see §6 MLA-style design)
+Attention × 3 physical blocks (per §6.2)            17,303,040        17,303,040
+  -- per block: W_Q (2.36M) + W_K_DOWN (0.79M)
+                + W_V_FROM_K (0.26M) + b_V (512)
+                + W_O (2.36M) = 5,767,680
 
-Shared experts × 3 (SwiGLU, h=4,608)                63,700,992       63,700,992
+Shared experts × 3 (SwiGLU, h=4,608)                63,700,992        63,700,992
   -- per block: 3 × 1,536 × 4,608 = 21,233,664
   -- always active on every token
 
-Routed experts: 3 × 12 × (SwiGLU, h=1,920)         318,504,960       53,084,160 (top-2 of 12)
+Routed experts: 3 × 12 × (SwiGLU, h=1,920)         318,504,960        53,084,160
   -- per expert: 3 × 1,536 × 1,920 = 8,847,360
-  -- 12 experts per physical block, top-2 active
+  -- top-2 of 12 active per token → 2/12 fraction
 
-HRA adapters (rank 256, 87 injection points)        86,114,304       86,114,304
+HRA adapters (rank 256, 132 injection points)      103,809,024        33,030,144
   -- adapter_a (1,536 × 256) + adapter_b (256 × 1,536)
   -- per injection: 786,432 params
-  -- trainable during all stages
+  -- 132 injection points = 44/block × 3 blocks (see §2.4)
+  -- ACTIVE: 9.44M (attn) + 7.08M (shared) + 14.16M (routed top-2)
+             + 2.36M (router) = 33.03M
+     [routed-expert HRA is sparse-active at top_k/n_routed fraction]
 
-mHC residual transforms (n_hc = 4)                    ~720,000        ~720,000
+mHC residual transforms (per §8.4)                     884,736           884,736
+  -- per injection: W_pre (24.6K) + W_res (98.3K) + W_post (24.6K)
+                     = 147,456
+  -- 6 injection points (3 blocks × 2 sub-blocks attn+ffn)
+  -- SHARED across loop iterations
 
-Router projections (per block, sigmoid(W·x))           ~55,000          ~55,000
+Router projections (per block, sqrt(softplus(W·x)))     55,296            55,296
+  -- per block: 1,536 × 12 = 18,432
 
-Loop embeddings (6, 1,536)                              9,216           9,216
+LayerNorms (sandwich, pre + post per sub-block)         18,432            18,432
+  -- per block: 2 norms × 2 sub-blocks × 1,536 = 6,144
 
-LayerNorms (sandwich, pre + post per block × 6)         9,000           9,000
+Loop embeddings (6, 1,536)                               9,216             9,216
 
-V-from-K transformations (per attention block × 6)     ~98,000         ~98,000
-
-Attention sink logits (24 query heads, learnable)         576              576
+Attention sink logits (24 query heads × 3 blocks)           72                72
 
 ─────────────────────────────────────────────────────────────────────────────────────
-TOTAL PHYSICAL                                    ~598,800,000
-TOTAL ACTIVE PER TOKEN                                              ~232,500,000
-ACTIVE FRACTION                                                      ≈ 38.8%
+TOTAL PHYSICAL                                    604,949,064  →  ~605M
+TOTAL ACTIVE PER TOKEN                                              268,749,384  →  ~269M
+ACTIVE FRACTION                                                      ≈ 44.4%
 ```
 
 ### 2.2 At-a-glance
@@ -114,6 +133,7 @@ ACTIVE FRACTION                                                      ≈ 38.8%
 - **Attention**: GQA 24 query heads / 8 KV heads / head_dim 64
 - **MoE**: 1 shared expert (h=4,608) + 12 routed (h=1,920), top-2
 - **HRA adapter rank**: 256
+- **HRA injection points**: 132 (44/block × 3 blocks, see §2.4)
 - **mHC expansion**: 4× residual stream width
 - **Position encoding**: Partial RoPE (last 64 dims of Q and K)
 - **Activation**: SwiGLU (FFN), Sqrt(Softplus) (routing affinity)
@@ -137,8 +157,46 @@ TOTAL: ~810M FLOPs per token (forward)
 With backward: ~2.4 BFLOPs per token
 
 (Numbers are approximate; FLOP definitions vary across sources.
-Use these as ratios, not absolutes.)
+Use these as ratios, not absolutes. Recomputed line items in §2.1
+do not yet feed back into this FLOP estimate — `compute_budget.py`
+will reconcile.)
 ```
+
+### 2.4 HRA injection enumeration
+
+The 132 injection points per the §5.4 placement rule, enumerated:
+
+| location | count per block | reasoning |
+|---|---|---|
+| Attention `W_Q` | 1 | Q projection (§6.2) |
+| Attention `W_K_DOWN` | 1 | latent K projection (§6.2) |
+| Attention `W_V_FROM_K` | 1 | V-from-K transformation (§6.2) |
+| Attention `W_O` | 1 | output projection (§6.2) |
+| Shared expert gate | 1 | shared SwiGLU gate (§7.2) |
+| Shared expert up | 1 | shared SwiGLU up (§7.2) |
+| Shared expert down | 1 | shared SwiGLU down (§7.2) |
+| Routed experts (12 × gate/up/down) | 36 | one HRA pair per routed expert per projection (§7.3) |
+| Router projection | 1 | `W_route` (§7.4) |
+| **per-block total** | **44** | |
+| × 3 physical blocks | **132** | |
+
+Total HRA params: 132 × (2 × 1,536 × 256) = 132 × 786,432 = 103,809,024
+
+Active per token (HRA contributions):
+- Always-active: attn (4) + shared (3) + router (1) = 8/block, × 3 blocks = 24 × 786,432 = **18,874,368**
+- Sparse-active routed: 36 inj × (top_k / n_routed) = 36 × 2/12 = 6/block, × 3 blocks = 18 × 786,432 = **14,155,776**
+- **Active HRA total: 33,030,144** (≈ 33M of the 269M active per token)
+
+### 2.5 Why "OSRT-600M" (name vs physical count)
+
+`OSRT` = **Optimized Sparse Recursive Transformer**:
+- **O**ptimized — Muon optimizer + AlphaQ + TurboQuant deployment stack
+- **S**parse — MoE (top-2 of 12 routed + 1 shared per block)
+- **R**ecursive — 3 physical blocks × 6 loops = 18 effective layers
+- **T**ransformer — standard pre-norm decoder backbone
+
+`600M` rounds the **physical** parameter count of 604,949,064. Active
+per token is 269M (44.4%).
 
 ---
 

@@ -1,5 +1,8 @@
 # OSRT-600M — "If we started again" design doc
 
+**OSRT** = **Optimized Sparse Recursive Transformer**
+(Muon-optimized · MoE-sparse · depth-recursive · transformer backbone)
+
 **Author:** post-mortem of nano-osrt-100M (363M params, ~12 months of iteration)
 **Date:** 2026-06-07
 **Status:** design proposal — codifies every lesson from v5 + 2025-2026 SLM research frontier
@@ -80,7 +83,7 @@ Effective compute per token (× 6 loops)        : ~2.5 B FLOPs-equivalent
 | FFN family | Dense SwiGLU h=6912 | 1 shared (h=4608) + 12 routed top-2 (h=1920) MoE |
 | Attention | GQA 24q/8kv head=64 | GQA 24q/8kv head=64 ✓ |
 | FLOPs per token | ~1.4B | ~2.5B (6× loop multiplier) |
-| Active params per token | 700M | 206M (sparse MoE) |
+| Active params per token | 700M | **269M** (sparse MoE; see ARCHITECTURE.md §2.1) |
 
 **Why these specific choices:**
 - **65K vocab + 1536 hidden** matches LFM2-700M exactly. Gives us
@@ -104,9 +107,10 @@ Effective compute per token (× 6 loops)        : ~2.5 B FLOPs-equivalent
 | Vocab | 32K | **65,536** (matched to LFM2) | English + 6 multilingual + code (FIM/structured); proven by LFM2 family |
 | Loops | 6 | **6** (kept) | Ouro found R4 sweet spot; v5 worked at R6; do NOT chase higher (Ouro reports instability at high recursion) |
 
-The 625M total / 210M active is in the **same compute class as Phi-3-mini
-(3.8B dense)** thanks to the 6× recurrence multiplier — so we punch
-heavier than the dense-equivalent baseline.
+The **605M physical / 269M active** (per ARCHITECTURE.md §2.1, corrected
+2026-06-07) is in the **same compute class as Phi-3-mini (3.8B dense)**
+thanks to the 6× recurrence multiplier — so we punch heavier than the
+dense-equivalent baseline.
 
 ### 1.3 Stability fixes for the recursive + MoE + Muon stack
 
@@ -391,7 +395,7 @@ failure mode the entire "tighter knobs" debate in v5 was unable to fix
 (because the knobs were the wrong tool — we needed to STOP TRAINING THE
 BASE).
 
-**OSRT-600M GRPO:** freeze the 540M base weights, train only the 86M HRA
+**OSRT-600M GRPO:** freeze the 501M base weights, train only the 104M HRA
 adapters. Standard LoRA-only RL pattern (DPO/PPO/GRPO papers all do
 this). Benefits:
 
@@ -602,7 +606,7 @@ Three recent papers add to the OSRT-600M deployment story:
 - Result: ~5× memory reduction vs BF16, ~3× faster generation on CPU,
   near-lossless quality
 
-For our ~599M total model, this deploys in **~200 MB RAM at usable
+For our ~605M total model, this deploys in **~200 MB RAM at usable
 speed on phones / Raspberry Pi 5**.
 
 ## 10b. DeepSeek-V4 (Nov/Dec 2025) integrations
