@@ -1795,6 +1795,8 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         stop_token_ids: list[int] | None = None,
         repetition_penalty: float = 1.0,
         num_loops: int | None = None,
+        speculative: bool = False,
+        spec_draft_tokens: int = 4,
         **kwargs,
     ) -> Tensor:
         """Autoregressive generation with KV cache.
@@ -1825,9 +1827,33 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         the MLA cache (num_blocks * K latents per token) stays index-consistent
         across the whole call — mixing loop counts mid-generation would
         misalign the per-effective-layer cache and is therefore not allowed.
+
+        speculative (ARCHITECTURE.md §12.3) gates a greedy speculative-decode
+        fast path: draft spec_draft_tokens tokens cheaply at
+        config.spec_draft_loops loops, then verify them in ONE forward at the
+        full loop count, committing the longest matching greedy prefix plus the
+        verifier's correction. Default False keeps the standard decode loop
+        below bit-identical. The verifier loop count is the full
+        config.recursive_loops (or `num_loops` when set, which also caps the
+        draft loops). See _generate_speculative for the (documented,
+        NOT distribution-preserving) acceptance rule.
         """
         if eos_token_id is None:
             eos_token_id = self.config.eos_token_id
+
+        # Speculative decoding (§12.3) is a separate, self-contained decode
+        # loop. It is a GREEDY throughput optimization, so it only makes sense
+        # at temperature 0 (or very low temp); we route to it only when asked.
+        if speculative:
+            return self._generate_speculative(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_token_id,
+                stop_token_ids=stop_token_ids,
+                repetition_penalty=repetition_penalty,
+                num_loops=num_loops,
+                spec_draft_tokens=spec_draft_tokens,
+            )
 
         # Prefill over the prompt, keeping KV cache for decode.
         # HF's CausalLMOutputWithPast types past_key_values as
@@ -1963,3 +1989,271 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                 break
 
         return generated
+
+    @torch.no_grad()
+    def _generate_speculative(
+        self,
+        input_ids: Tensor,
+        max_new_tokens: int,
+        eos_token_id: int | None,
+        stop_token_ids: list[int] | None,
+        repetition_penalty: float,
+        num_loops: int | None,
+        spec_draft_tokens: int,
+    ) -> Tensor:
+        """Greedy speculative decoding via a low-loop draft (§12.3).
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ GREEDY-ONLY / NOT DISTRIBUTION-PRESERVING.                         │
+        │                                                                    │
+        │ Real speculative *sampling* (Leviathan et al. 2023, Chen et al.    │
+        │ 2023) accepts/rejects each drafted token with a probabilistic      │
+        │ correction so the emitted sequence is distributed EXACTLY as       │
+        │ sampling from the verifier alone. This routine instead accepts the │
+        │ longest GREEDY-matching prefix and emits the verifier's greedy     │
+        │ argmax on the first mismatch. That is provably identical to plain  │
+        │ greedy (temperature 0) decoding from the verifier, but it is NOT a │
+        │ valid sampler for temperature > 0 — it is a throughput trick for   │
+        │ greedy / very-low-temperature generation only. generate() routes   │
+        │ here only when the caller passes speculative=True.                 │
+        └──────────────────────────────────────────────────────────────────┘
+
+        Mechanism. The verifier runs the full loop count (num_loops or
+        config.recursive_loops); the drafter runs config.spec_draft_loops
+        loops, which the aux per-loop LM-head training (§9.2) makes predictive.
+        Each round:
+          1. DRAFT — autoregressively greedy-decode `D = spec_draft_tokens`
+             tokens one at a time at the cheap draft loop count, advancing a
+             draft-side MLA cache.
+          2. VERIFY — run ONE full-loop forward over the D drafted tokens to
+             get the verifier's greedy prediction at each drafted position in
+             parallel.
+          3. COMMIT — accept a draft while it equals the verifier's greedy
+             token. On the first mismatch emit the verifier's token and stop;
+             if all D match, additionally emit the verifier's bonus token for
+             the position after the block (a free extra token — the hallmark
+             speculative speed-up).
+
+        Cache handling. Two independent MLA caches are kept because the cache
+        is loop-count-specific (num_blocks * loops latents per token): a draft
+        cache at the draft loop count and a verify cache at the full loop
+        count. Each is a list of (B, seq, kv_dim) latent tensors, so it can be
+        TRUNCATED along the sequence axis. The verifier forward over the draft
+        block advances the verify cache by D tokens; the accepted-prefix
+        latents are exactly correct (an accepted draft equals the verifier's
+        prediction, i.e. the actually-committed token), so we keep them and
+        slice off the stale tail past the acceptance point. MoE capacity drops
+        are disabled in eval (MoELayer.forward), so the one-shot parallel
+        verify reproduces what a token-by-token decode would have produced and
+        the acceptance check is exact.
+        """
+        PastKV = list[Tensor | None]
+
+        def _trunc(past: "PastKV | None", length: int) -> "PastKV | None":
+            """Slice every per-layer latent to the first `length` positions
+            along the sequence axis (dim=1). The MLA cache is plain tensors,
+            so a stale speculative tail is just a view away from being dropped."""
+            if past is None or length <= 0:
+                return None
+            return [
+                None if p is None else p[:, :length, :] for p in past
+            ]
+
+        # The drafter may not exceed the verifier's loop count. When the caller
+        # caps the verifier via num_loops, the draft loop count is min(draft,
+        # cap) so the draft never runs MORE compute than the verifier.
+        full_loops = self.model._resolve_num_loops(num_loops)
+        draft_loops = min(self.config.spec_draft_loops, full_loops)
+
+        context = input_ids[:, -self.config.max_position_embeddings:]
+        batch_size = context.shape[0]
+        device = context.device
+        D = spec_draft_tokens
+
+        def _greedy(logits_row: Tensor, gen: Tensor) -> Tensor:
+            """Greedy next-token from a (B, vocab) logit row, with the same
+            optional repetition penalty math as generate() so the two paths
+            agree token-for-token at temperature 0."""
+            logits_last = logits_row[:, :self.config.real_vocab_size].float()
+            if repetition_penalty != 1.0:
+                vocab = logits_last.shape[-1]
+                gen_clamped = gen.clamp(max=vocab - 1)
+                in_vocab = (gen < vocab)
+                score = torch.gather(logits_last, 1, gen_clamped)
+                penalised = torch.where(
+                    score > 0,
+                    score / repetition_penalty,
+                    score * repetition_penalty,
+                )
+                penalised = torch.where(in_vocab, penalised, score)
+                logits_last = logits_last.clone()
+                logits_last.scatter_(1, gen_clamped, penalised)
+            return logits_last.argmax(dim=-1, keepdim=True)  # (B, 1)
+
+        # CACHE INVARIANT (matches the standard decode loop above):
+        #   at the TOP of every round, verify_past / draft_past each cover the
+        #   first `cache_len` positions of `generated`, where
+        #       cache_len == generated.shape[1] - 1
+        #   i.e. the cache holds every committed token EXCEPT the most recent
+        #   one, which is the pending input for the round. We prefill over
+        #   context[:, :-1] and keep the final prompt token uncached to
+        #   establish that invariant.
+        prompt_len = context.shape[1]
+        generated = context.clone()
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        if prompt_len > 1:
+            seed = context[:, :-1]
+            v_out = self.forward(seed, use_cache=True, num_loops=full_loops)
+            verify_past = cast("PastKV | None", v_out.past_key_values)
+            d_out = self.forward(seed, use_cache=True, num_loops=draft_loops)
+            draft_past = cast("PastKV | None", d_out.past_key_values)
+            cache_len = prompt_len - 1
+        else:
+            # A length-1 prompt has nothing to pre-cache; both caches start
+            # empty and the single token is the first pending input.
+            verify_past = None
+            draft_past = None
+            cache_len = 0
+
+        produced = 0
+        while produced < max_new_tokens:
+            pending = generated[:, -1:]  # the one uncached committed token
+
+            # ── 1. DRAFT D tokens at the cheap loop count ──
+            # Each draft forward feeds one token + the draft cache. After the
+            # block, draft_past covers cache_len + D positions: the pending
+            # token plus drafts 0..D-2 (drafts[D-1] is the last OUTPUT, not yet
+            # an input).
+            draft_input = pending
+            running = generated
+            draft_tokens: list[Tensor] = []
+            for _ in range(D):
+                dd = self.forward(
+                    draft_input, past_key_values=draft_past,
+                    use_cache=True, num_loops=draft_loops,
+                )
+                draft_past = cast("PastKV | None", dd.past_key_values)
+                dtok = _greedy(cast(Tensor, dd.logits)[:, -1, :], running)
+                draft_tokens.append(dtok)
+                running = torch.cat([running, dtok], dim=1)
+                draft_input = dtok
+            drafts = torch.cat(draft_tokens, dim=1)  # (B, D)
+
+            # ── 2. VERIFY all D drafts in ONE full-loop forward ──
+            # Input is [pending, draft_0, ..., draft_{D-1}] (D + 1 tokens). The
+            # verifier's logits at input position i predict the token that
+            # follows the i-th input, so:
+            #   v_logits[:, i]   for i in 0..D-1  → the verifier's greedy
+            #                    proposal for the SAME slot drafts[:, i] fills.
+            #   v_logits[:, D]   (fed draft_{D-1}) → the BONUS token that
+            #                    follows the whole accepted block.
+            # The forward grows verify_past by D + 1 positions; we keep only the
+            # accepted prefix's latents (drop the speculative tail).
+            verify_input = torch.cat([pending, drafts], dim=1)  # (B, D+1)
+            vv = self.forward(
+                verify_input, past_key_values=verify_past,
+                use_cache=True, num_loops=full_loops,
+            )
+            verify_past_full = cast("PastKV | None", vv.past_key_values)
+            v_logits = cast(Tensor, vv.logits)  # (B, D+1, vocab)
+
+            # verify_preds[:, i] verifies drafts[:, i]; bonus is the D-th.
+            verify_preds_list = []
+            running = generated
+            for i in range(D + 1):
+                vt = _greedy(v_logits[:, i, :], running)
+                verify_preds_list.append(vt)
+                running = torch.cat([running, vt], dim=1)
+            verify_preds = torch.cat(verify_preds_list, dim=1)  # (B, D+1)
+
+            # ── 3. COMMIT longest greedy-matching prefix + 1 correction ──
+            # accept = number of leading positions where the draft matches the
+            # verifier across ALL rows (conservative but correct for B > 1).
+            all_match = (drafts == verify_preds[:, :D]).all(dim=0)  # (D,)
+            accept = 0
+            for i in range(D):
+                if bool(all_match[i]):
+                    accept += 1
+                else:
+                    break
+
+            new_cols: list[Tensor] = [drafts[:, i:i + 1] for i in range(accept)]
+            # On a mismatch emit the verifier's correction at slot `accept`; on
+            # a full accept emit the verifier's bonus token at slot D. Both come
+            # straight from verify_preds (which has D + 1 columns).
+            new_cols.append(verify_preds[:, accept:accept + 1])
+
+            # Mask finished rows so they keep emitting EOS (rectangular tensor).
+            if eos_token_id is not None and bool(finished.any()):
+                for j, col in enumerate(new_cols):
+                    new_cols[j] = torch.where(
+                        finished.unsqueeze(-1),
+                        torch.full_like(col, eos_token_id),
+                        col,
+                    )
+
+            # Re-establish the cache invariant by truncation alone (no extra
+            # forward needed). Both forwards fed inputs through sequence
+            # position cache_len + D (verify) / cache_len + D - 1 (draft); an
+            # accepted draft equals the verifier's prediction, so the latents
+            # the forwards produced for the pending token and drafts 0..accept-1
+            # are exactly the committed-token latents. We keep cache positions
+            # 0 .. cache_len + accept (length cache_len + accept + 1) and drop
+            # the stale speculative tail. The final emitted token (correction or
+            # bonus) is deliberately left OUT of the cache — it becomes the next
+            # round's pending input. The verify path fed D + 1 inputs (it
+            # includes draft_{D-1}), so even a full-accept round has the last
+            # accepted draft's latent already cached; the draft path fed only D
+            # inputs, so on a full accept its last accepted latent is missing
+            # and a single extend re-adds it (rare path).
+            keep = cache_len + accept + 1
+            verify_past = _trunc(verify_past_full, keep)
+            draft_past = _trunc(draft_past, min(keep, cache_len + D))
+
+            # Append committed tokens, advance counters / finished mask, and
+            # respect the budget (a full-accept round emits D + 1 tokens).
+            stop_round = False
+            for col in new_cols:
+                generated = torch.cat([generated, col], dim=1)
+                produced += 1
+                t = col.squeeze(-1)
+                if eos_token_id is not None:
+                    finished = finished | (t == eos_token_id)
+                if stop_token_ids:
+                    for sid in stop_token_ids:
+                        finished = finished | (t == sid)
+                if produced >= max_new_tokens:
+                    stop_round = True
+                    break
+
+            # The verify cache is now correct up to `keep`. Bring the draft
+            # cache to the same length when a full accept left it one short
+            # (draft_{D-1} was never fed as a draft input). cache_len becomes
+            # the number of cached positions = keep.
+            if draft_past is not None:
+                d_have = draft_past[0].shape[1] if draft_past[0] is not None else 0
+            else:
+                d_have = 0
+            if d_have < keep:
+                ext_toks = generated[:, d_have:keep]
+                de = self.forward(
+                    ext_toks, past_key_values=draft_past,
+                    use_cache=True, num_loops=draft_loops,
+                )
+                draft_past = cast("PastKV | None", de.past_key_values)
+            cache_len = keep
+
+            if stop_round:
+                break
+            if (
+                (eos_token_id is not None or stop_token_ids)
+                and bool(finished.all())
+            ):
+                break
+
+        # An all-accept round can overshoot the budget by one (the bonus
+        # token); trim to exactly context + max_new_tokens.
+        max_len = context.shape[1] + max_new_tokens
+        return generated[:, :max_len]
+

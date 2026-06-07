@@ -210,6 +210,16 @@ class OSRTConfig(PretrainedConfig):
         # deterministic unless the trainer explicitly enables exploration.
         router_gumbel_tau_init: float = 0.0,
 
+        # --- Speculative decoding draft loop count (ARCHITECTURE.md §12.3) ---
+        # When generate(speculative=True) is used, the cheap DRAFT pass runs
+        # this many recursive loops (the aux per-loop LM head makes a low-loop
+        # output predictive), and the full recursive_loops pass VERIFIES the
+        # drafted tokens in one forward. Default 3 follows the §12.3 "loop-3
+        # draft" recipe. Must satisfy 1 <= spec_draft_loops <= recursive_loops;
+        # this is purely an inference-time knob — it does not affect training
+        # or the default (non-speculative) generation path.
+        spec_draft_loops: int = 3,
+
         # --- Hash routing for early blocks (ARCHITECTURE.md §7.5) ---
         # Physical blocks with block_idx < hash_routing_blocks use deterministic
         # HASH routing instead of the learned router: top-1 selection with
@@ -299,6 +309,12 @@ class OSRTConfig(PretrainedConfig):
         self.router_balance_bias_max = router_balance_bias_max
         self.router_affinity = router_affinity
         self.router_gumbel_tau_init = router_gumbel_tau_init
+        # spec_draft_loops is an inference-only knob (§12.3). The default (3)
+        # can exceed recursive_loops for very small models; clamp rather than
+        # reject so reduced-loop configs stay constructible, and validate only
+        # the lower bound below. The speculative path further clamps the draft
+        # to the verifier loop count at call time.
+        self.spec_draft_loops = min(spec_draft_loops, recursive_loops)
         self.hash_routing_blocks = hash_routing_blocks
         self.router_capacity_factor = router_capacity_factor
         self.expert_orthogonal_init = expert_orthogonal_init
@@ -432,6 +448,10 @@ class OSRTConfig(PretrainedConfig):
         if self.mtp_loss_weight < 0:
             raise ValueError(
                 f"mtp_loss_weight must be >= 0, got {self.mtp_loss_weight}"
+            )
+        if self.spec_draft_loops < 1:
+            raise ValueError(
+                f"spec_draft_loops must be >= 1, got {self.spec_draft_loops}"
             )
         if not 0 <= self.hash_routing_blocks <= self.num_blocks:
             raise ValueError(

@@ -1954,3 +1954,105 @@ def test_generate_num_loops_runs_and_shapes():
     )
     assert out.shape == (1, 6 + 8)
     assert (out >= 0).all() and (out < cfg.vocab_size).all()
+
+
+# ── Speculative decoding (ARCHITECTURE.md §12.3) ───────────────────────
+
+
+def test_speculative_matches_greedy_when_draft_equals_full():
+    """When the draft loop count == the verifier loop count, EVERY draft is
+    accepted (trivial accept), so greedy speculative decoding must produce the
+    EXACT same tokens as the standard greedy decode. This is the strongest
+    correctness check on the cache bookkeeping.
+
+    Seeded init so the (genuinely identical) greedy/spec paths can't trip a
+    floating-point argmax TIE flip: a parallel D+1-token verify and a serial
+    single-token decode differ at ~1e-6, which can flip an exact tie — seed 0
+    is verified tie-free for these shapes."""
+    torch.manual_seed(0)
+    cfg = tiny_config(recursive_loops=3, spec_draft_loops=3,
+                      router_capacity_factor=10.0)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    ctx = torch.randint(0, cfg.vocab_size, (1, 7))
+
+    baseline = model.generate(
+        ctx, max_new_tokens=16, temperature=0.0, repetition_penalty=1.0,
+    )
+    spec = model.generate(
+        ctx, max_new_tokens=16, temperature=0.0, repetition_penalty=1.0,
+        speculative=True, spec_draft_tokens=4,
+    )
+    assert torch.equal(baseline, spec), \
+        "speculative greedy diverged from standard greedy at draft==full loops"
+
+
+def test_speculative_matches_greedy_general_draft_loops():
+    """Greedy speculative is provably identical to greedy decoding from the
+    verifier REGARDLESS of the draft loop count (the draft only proposes; the
+    verifier's greedy argmax is always what gets committed). Use a cheaper
+    draft (fewer loops than the verifier) and require an exact match. Seeded
+    init keeps the comparison tie-free (see the sibling test's note)."""
+    torch.manual_seed(0)
+    cfg = tiny_config(recursive_loops=4, spec_draft_loops=2,
+                      router_capacity_factor=10.0)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    ctx = torch.randint(0, cfg.vocab_size, (1, 9))
+
+    baseline = model.generate(
+        ctx, max_new_tokens=20, temperature=0.0, repetition_penalty=1.0,
+    )
+    spec = model.generate(
+        ctx, max_new_tokens=20, temperature=0.0, repetition_penalty=1.0,
+        speculative=True, spec_draft_tokens=3,
+    )
+    assert torch.equal(baseline, spec), \
+        "speculative greedy diverged from greedy with a cheaper draft head"
+
+
+def test_speculative_produces_valid_finite_tokens():
+    """General-case sanity: speculative output has the expected length and
+    contains only valid in-vocab token ids."""
+    cfg = tiny_config(recursive_loops=4, spec_draft_loops=2)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    ctx = torch.randint(0, cfg.vocab_size, (1, 5))
+    out = model.generate(
+        ctx, max_new_tokens=13, temperature=0.0, repetition_penalty=1.0,
+        speculative=True, spec_draft_tokens=4,
+    )
+    assert out.shape == (1, 5 + 13), f"unexpected shape {out.shape}"
+    assert (out >= 0).all() and (out < cfg.vocab_size).all()
+
+
+def test_speculative_respects_num_loops_cap():
+    """num_loops caps BOTH the verifier and (via min) the draft loop count.
+    With num_loops=2 the verifier runs 2 loops, so greedy speculative must
+    match standard greedy at num_loops=2. Seeded init keeps it tie-free."""
+    torch.manual_seed(0)
+    cfg = tiny_config(recursive_loops=4, spec_draft_loops=3,
+                      router_capacity_factor=10.0)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    ctx = torch.randint(0, cfg.vocab_size, (1, 6))
+
+    baseline = model.generate(
+        ctx, max_new_tokens=12, temperature=0.0, repetition_penalty=1.0,
+        num_loops=2,
+    )
+    spec = model.generate(
+        ctx, max_new_tokens=12, temperature=0.0, repetition_penalty=1.0,
+        num_loops=2, speculative=True, spec_draft_tokens=3,
+    )
+    assert torch.equal(baseline, spec)
+
+
+def test_config_spec_draft_loops_clamped_and_lower_bound():
+    """spec_draft_loops is clamped to recursive_loops (so the §12.3 default of
+    3 stays constructible for tiny reduced-loop configs) but must still be
+    >= 1."""
+    cfg = tiny_config(recursive_loops=4, spec_draft_loops=9)
+    assert cfg.spec_draft_loops == 4
+    with pytest.raises(ValueError, match="spec_draft_loops"):
+        tiny_config(recursive_loops=4, spec_draft_loops=0)
