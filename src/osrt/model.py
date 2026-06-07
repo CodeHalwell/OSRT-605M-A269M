@@ -177,7 +177,9 @@ class MoELayer(nn.Module):
         don't down-weight the MoE output just because k > 1.
     """
 
-    def __init__(self, config: OSRTConfig, moe_seed: int = 0) -> None:
+    def __init__(
+        self, config: OSRTConfig, moe_seed: int = 0, block_idx: int = 0,
+    ) -> None:
         super().__init__()
         self.dim = config.dim
         self.num_routed = config.num_routed_experts
@@ -188,6 +190,11 @@ class MoELayer(nn.Module):
         # Save seed for deferred orthogonal init (applied after post_init).
         self._moe_seed = moe_seed
         self._orthogonal_init_requested = config.expert_orthogonal_init
+        # Hash routing (ARCHITECTURE.md §7.5): this physical block uses
+        # deterministic top-1 hash routing instead of the learned router iff
+        # block_idx < hash_routing_blocks. Hard switch, decided at construction.
+        self.block_idx = block_idx
+        self.use_hash_routing = block_idx < config.hash_routing_blocks
 
         # Shared expert: always active, larger hidden than routed experts.
         # Replaces v4's parallel dense FFN.
@@ -367,12 +374,104 @@ class MoELayer(nn.Module):
         self.balance_count_accum.zero_()
         self.balance_total_accum.zero_()
 
-    def forward(self, x: Tensor, loop_idx: int) -> tuple[Tensor, Tensor]:
+    def _hash_route(
+        self,
+        x: Tensor,
+        x_flat: Tensor,
+        shared_out: Tensor,
+        token_ids: Tensor,
+        loop_idx: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Deterministic top-1 hash routing (ARCHITECTURE.md §7.5).
+
+        Each token is sent to exactly one expert,
+            expert_id = (token_id + loop_idx) % num_routed_experts
+        with gating weight 1.0. The shared expert is unaffected; we return the
+        same (shared_out, routed_out) contract as the learned path so the Block
+        is oblivious to the routing mode. Routing is deterministic, so there is
+        no balance/z/seq aux loss to learn — those are set to zero tensors (kept
+        non-None so the model's accumulation stays well-defined), and the
+        telemetry attributes are populated from the hard hash histogram (never
+        left stale from a previous forward, so the collapse monitor stays sane).
+        """
+        B, S, D = x.shape
+        N = B * S
+        E = self.num_routed
+        device = x.device
+
+        # Loop-indexed hash assignment, one expert per token.
+        assign = (token_ids.reshape(N) + loop_idx) % E  # (N,), long
+
+        # Dispatch: gather every token routed to each expert, run it, scatter
+        # back at gate weight 1.0. No capacity cap — top-1 hashing is balanced
+        # in expectation and dropping tokens here would only add noise.
+        moe_out = torch.zeros_like(x_flat)
+        for ei, expert in enumerate(self.experts):
+            token_indices = (assign == ei).nonzero(as_tuple=True)[0]
+            if token_indices.numel() == 0:
+                continue
+            moe_out.index_add_(0, token_indices, expert(x_flat[token_indices]))
+        moe_out = moe_out.view(B, S, D)
+
+        # Aux losses: deterministic routing has nothing to balance. Keep them as
+        # zero tensors (not None) so OSRTModel.forward's `is not None` checks and
+        # the wrapper's normalisation see a valid contribution.
+        zero = torch.zeros((), device=device)
+        self.balance_loss = zero
+        self.z_loss = zero
+        self.seq_balance_loss = zero
+
+        # Telemetry from the hard hash assignment. f_i = fraction of tokens on
+        # expert i (top-1, so it sums to 1). Entropy of f is the only meaningful
+        # signal here; per-token entropy is 0 (a one-hot assignment) and the
+        # "router confidence" metrics are 1.0 by construction.
+        with torch.no_grad():
+            counts = torch.bincount(assign, minlength=E).float()
+            f = counts / counts.sum().clamp_min(1.0)
+            f_list = f.tolist()
+            f_log = torch.log(f.clamp_min(1e-10))
+            assign_ent = -(f * f_log).sum().item()
+
+            self.last_per_token_entropy[loop_idx] = 0.0
+            self.last_marginal_entropy[loop_idx] = assign_ent
+            self.last_assignment_entropy[loop_idx] = assign_ent
+            self.last_expert_fraction[loop_idx] = f_list
+            self.last_drop_rate[loop_idx] = 0.0
+            self.last_raw_max_prob[loop_idx] = 1.0
+            self.last_top_margin[loop_idx] = 1.0
+            # Mirror onto the prebias and clean diagnostic families so the
+            # collapse monitor (which reads last_clean_*) sees the deterministic
+            # assignment rather than stale learned-router values.
+            self.last_prebias_per_token_entropy[loop_idx] = 0.0
+            self.last_prebias_marginal_entropy[loop_idx] = assign_ent
+            self.last_prebias_assignment_entropy[loop_idx] = assign_ent
+            self.last_prebias_expert_fraction[loop_idx] = f_list
+            self.last_prebias_raw_max_prob[loop_idx] = 1.0
+            self.last_prebias_top_margin[loop_idx] = 1.0
+            self.last_clean_per_token_entropy[loop_idx] = 0.0
+            self.last_clean_marginal_entropy[loop_idx] = assign_ent
+            self.last_clean_assignment_entropy[loop_idx] = assign_ent
+            self.last_clean_expert_fraction[loop_idx] = f_list
+            self.last_clean_raw_max_prob[loop_idx] = 1.0
+            self.last_clean_top_margin[loop_idx] = 1.0
+
+        return shared_out, moe_out
+
+    def forward(
+        self,
+        x: Tensor,
+        loop_idx: int,
+        token_ids: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """Forward pass through MoE.
 
         Args:
             x: Hidden states (B, S, dim).
             loop_idx: Current recursive loop index.
+            token_ids: Optional (B, S) input token ids. Only consumed when this
+                block hash-routes (block_idx < hash_routing_blocks); the learned
+                router never looks at them. Defaults to None so the standard
+                path and signature stay backward-compatible.
 
         Returns:
             (shared_out, routed_out): both (B, S, dim). Caller applies
@@ -389,6 +488,18 @@ class MoELayer(nn.Module):
 
         # Shared expert (always active, not gated by caller's moe_gate)
         shared_out = self.shared_expert(x)
+
+        # ── Hash routing (ARCHITECTURE.md §7.5) ──
+        # Deterministic top-1 dispatch: expert_id = (token_id + loop_idx) % E,
+        # a loop-indexed hash. No learned router, no balance loss/z-loss/Gumbel.
+        # Used to stabilise early blocks before the learned router warms up.
+        if self.use_hash_routing:
+            if token_ids is None:
+                raise ValueError(
+                    "hash routing requires token_ids at the MoE layer; "
+                    "OSRTModel.forward must thread input_ids through the block."
+                )
+            return self._hash_route(x, x_flat, shared_out, token_ids, loop_idx)
 
         # Router: add loop embedding, project to expert scores
         loop_emb = self.loop_embeddings.weight[loop_idx].view(1, 1, D)
@@ -796,7 +907,7 @@ class RecursiveBlock(nn.Module):
 
         # MoE (shared + routed), pre-norm
         self.norm_moe = nn.RMSNorm(config.dim)
-        self.moe = MoELayer(config, moe_seed=block_idx)
+        self.moe = MoELayer(config, moe_seed=block_idx, block_idx=block_idx)
 
         # Gate on the MoE (routed) branch. Reparameterised through
         # softplus so the EFFECTIVE gate is always > 0:
@@ -898,9 +1009,16 @@ class RecursiveBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
         return self.out_proj(attn_out) + adapter_out, present_kv
 
-    def _moe(self, x_in: Tensor, loop_idx: int) -> Tensor:
-        """MoE sub-block contribution (pre-residual): shared + gated routed."""
-        h_shared, h_routed = self.moe(self.norm_moe(x_in), loop_idx)
+    def _moe(
+        self, x_in: Tensor, loop_idx: int, token_ids: Tensor | None = None,
+    ) -> Tensor:
+        """MoE sub-block contribution (pre-residual): shared + gated routed.
+
+        token_ids (B, S) is forwarded to the MoE layer; it is only consumed when
+        this block hash-routes, otherwise ignored."""
+        h_shared, h_routed = self.moe(
+            self.norm_moe(x_in), loop_idx, token_ids=token_ids,
+        )
         return h_shared + self.effective_moe_gate() * h_routed
 
     def forward(
@@ -914,9 +1032,13 @@ class RecursiveBlock(nn.Module):
         loop_idx: int,
         past_key_value: Tensor | None = None,
         use_cache: bool = False,
+        token_ids: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         """Run attention then MoE. `x` is (B, S, D) for the standard residual
-        path, or (B, S, n_hc, D) when mHC is enabled."""
+        path, or (B, S, n_hc, D) when mHC is enabled.
+
+        token_ids (B, S) is the optional input-token tensor used only by
+        hash-routing blocks; it defaults to None and is otherwise ignored."""
         if self.use_mhc:
             # ── mHC path: residual stream carries n_hc channels ──
             a, b_mat, c_out = self.mhc_attn.generate(x)
@@ -929,7 +1051,7 @@ class RecursiveBlock(nn.Module):
 
             a2, b2, c2 = self.mhc_ffn.generate(x)
             x_in2 = self.mhc_ffn.input_view(x, a2)
-            f_moe = self._moe(x_in2, loop_idx)
+            f_moe = self._moe(x_in2, loop_idx, token_ids=token_ids)
             x = self.mhc_ffn.update(x, b2, c2, f_moe)
             return x, present_kv
 
@@ -939,7 +1061,7 @@ class RecursiveBlock(nn.Module):
             rope_cos, rope_sin, past_key_value, use_cache,
         )
         x = x + f_attn
-        x = x + self._moe(x, loop_idx)
+        x = x + self._moe(x, loop_idx, token_ids=token_ids)
         return x, present_kv
 
 
@@ -1159,8 +1281,15 @@ class OSRTModel(OSRTPreTrainedModel):
                     def _block_fn(
                         _x, _a, _b, _cos, _sin,
                         _block=block, _scale=self.adapter_scale, _loop=loop,
+                        _tok=input_ids,
                     ):
-                        return _block(_x, _a, _b, _scale, _cos, _sin, _loop)[0]
+                        # token_ids is captured (closure default), not a
+                        # checkpoint input — it carries no gradient and only
+                        # hash-routing blocks read it.
+                        return _block(
+                            _x, _a, _b, _scale, _cos, _sin, _loop,
+                            token_ids=_tok,
+                        )[0]
 
                     def _context_fn(_block=block):
                         return (
@@ -1179,6 +1308,7 @@ class OSRTModel(OSRTPreTrainedModel):
                         loop_idx=loop,
                         past_key_value=layer_past,
                         use_cache=use_cache,
+                        token_ids=input_ids,
                     )
                     if presents is not None:
                         presents.append(present_kv)

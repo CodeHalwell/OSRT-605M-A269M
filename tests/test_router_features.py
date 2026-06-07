@@ -127,7 +127,7 @@ def test_hash_routing_dispatches_deterministically():
     # hard-assignment fractions sum to 1 and match the deterministic hash).
     for block_idx in (0, 1):
         moe = model.model.blocks[block_idx].moe
-        for loop in range(cfg.recursive_loops if False else 3):
+        for loop in range(cfg.recursive_loops):
             assigned = (ids.reshape(-1) + loop) % E
             expected = torch.bincount(assigned, minlength=E).float()
             expected = expected / expected.sum()
