@@ -1857,3 +1857,100 @@ def test_strict_model_state_loader_rejects_key_drift():
 
     with pytest.raises(RuntimeError, match="key mismatch"):
         load_model_state_or_raise(model, state, context="test checkpoint")
+
+
+# ── Variable loop count (ARCHITECTURE.md §12.2) ────────────────────────
+
+
+def test_num_loops_none_equals_recursive_loops():
+    """num_loops=None must be bit-identical to num_loops=recursive_loops.
+
+    None is the default historical path; explicitly passing the full count
+    must run the exact same loop chain and produce identical logits.
+    """
+    cfg = tiny_config(recursive_loops=4)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    x = torch.randint(0, cfg.vocab_size, (1, 8))
+    with torch.no_grad():
+        out_default = model(input_ids=x)
+        out_full = model(input_ids=x, num_loops=cfg.recursive_loops)
+    assert torch.equal(out_default.logits, out_full.logits), \
+        "num_loops=recursive_loops diverged from the default None path"
+
+
+def test_num_loops_reduced_produces_finite_logits_right_shape():
+    """A reduced loop count K runs the first K loops and yields finite
+    logits of the full (B, S, vocab) shape — the §12.2 compute knob."""
+    cfg = tiny_config(recursive_loops=4)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    x = torch.randint(0, cfg.vocab_size, (2, 7))
+    for k in (1, 2, 3, 4):
+        with torch.no_grad():
+            out = model(input_ids=x, num_loops=k)
+        assert out.logits.shape == (2, 7, cfg.vocab_size)
+        assert torch.isfinite(out.logits).all(), \
+            f"non-finite logits at num_loops={k}"
+
+
+def test_num_loops_changes_output():
+    """Fewer loops should generally change the prediction — the loops are
+    genuinely different representations (sanity that K actually truncates)."""
+    cfg = tiny_config(recursive_loops=4)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    x = torch.randint(0, cfg.vocab_size, (1, 8))
+    with torch.no_grad():
+        out_full = model(input_ids=x, num_loops=4)
+        out_short = model(input_ids=x, num_loops=2)
+    assert not torch.equal(out_full.logits, out_short.logits), \
+        "num_loops=2 produced identical logits to num_loops=4"
+
+
+def test_num_loops_out_of_range_raises():
+    """K must satisfy 1 <= K <= recursive_loops; anything else raises."""
+    cfg = tiny_config(recursive_loops=4)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    x = torch.randint(0, cfg.vocab_size, (1, 5))
+    for bad in (0, -1, 5, 100):
+        with pytest.raises(ValueError, match="num_loops"):
+            model(input_ids=x, num_loops=bad)
+
+
+def test_num_loops_reduced_kv_cache_consistent_decode():
+    """With a reduced K, prefill+decode must use K layers and stay
+    index-consistent: cached decode matches a single full forward at K."""
+    cfg = tiny_config(recursive_loops=4, router_capacity_factor=10.0)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    k = 2
+    full = torch.randint(0, cfg.vocab_size, (1, 7))
+    with torch.no_grad():
+        out_pre = model(full[:, :6], use_cache=True, num_loops=k)
+        # The cache holds exactly num_blocks * K latents, not the full count.
+        assert len(out_pre.past_key_values) == cfg.num_blocks * k
+        out_dec = model(
+            full[:, 6:7], past_key_values=out_pre.past_key_values,
+            use_cache=True, num_loops=k,
+        )
+        out_full = model(full, use_cache=False, num_loops=k)
+    assert torch.allclose(
+        out_dec.logits[:, -1], out_full.logits[:, -1], atol=1e-4,
+    ), "reduced-loop cached decode diverged from the full forward"
+
+
+def test_generate_num_loops_runs_and_shapes():
+    """generate(num_loops=K) threads K through prefill+decode and returns
+    a valid sequence of the expected length."""
+    cfg = tiny_config(recursive_loops=4)
+    model = OSRTForCausalLM(cfg)
+    model.train(False)
+    ctx = torch.randint(0, cfg.vocab_size, (1, 6))
+    out = model.generate(
+        ctx, max_new_tokens=8, temperature=0.0,
+        repetition_penalty=1.0, num_loops=2,
+    )
+    assert out.shape == (1, 6 + 8)
+    assert (out >= 0).all() and (out < cfg.vocab_size).all()

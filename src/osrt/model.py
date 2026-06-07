@@ -1266,11 +1266,31 @@ class OSRTModel(OSRTPreTrainedModel):
         dedicated learnable collapse head. X: (B, S, n_hc, D) -> (B, S, D)."""
         return torch.einsum("c,bscd->bsd", self.mhc_collapse, X)
 
+    def _resolve_num_loops(self, num_loops: int | None) -> int:
+        """Validate and resolve the variable loop count (ARCHITECTURE.md §12.2).
+
+        The inference-compute knob: run only the first K of the trained
+        recursive_loops. None → recursive_loops (the trained/default count,
+        bit-identical to the historical path). Otherwise K must satisfy
+        1 <= K <= recursive_loops; the aux-per-loop-LM-head training (§9.2)
+        makes those reduced-loop outputs usable. Raises on out-of-range K so a
+        caller can't silently run a malformed loop count.
+        """
+        if num_loops is None:
+            return self.config.recursive_loops
+        if not (1 <= num_loops <= self.config.recursive_loops):
+            raise ValueError(
+                f"num_loops must be in [1, recursive_loops="
+                f"{self.config.recursive_loops}], got {num_loops}"
+            )
+        return num_loops
+
     def forward(
         self,
         input_ids: Tensor,
         past_key_values: list[Tensor] | None = None,
         use_cache: bool = False,
+        num_loops: int | None = None,
         **kwargs,
     ) -> tuple[
         Tensor, list[Tensor], Tensor, Tensor, Tensor,
@@ -1278,18 +1298,43 @@ class OSRTModel(OSRTPreTrainedModel):
     ]:
         """Forward pass.
 
+        Args:
+            input_ids: (B, S) token ids.
+            past_key_values: per-effective-layer cached latents, or None.
+            use_cache: return the per-layer present latents for decode.
+            num_loops: optional variable loop count (ARCHITECTURE.md §12.2).
+                None → config.recursive_loops (bit-identical to before). When
+                set to K (1 <= K <= recursive_loops) only the first K recursive
+                loops run before collapse/norm_out + the LM head — the
+                controllable inference-compute knob (fewer loops = faster,
+                slightly lower quality). Validated by _resolve_num_loops.
+                NOTE: when use_cache is on, the cache is built per effective
+                layer = num_blocks * loop; a reduced K writes/reads only the
+                first K*num_blocks layers, so a multi-call decode (prefill +
+                steps) MUST use the same K throughout or the layer indices stop
+                lining up. generate() enforces that by threading one num_loops
+                through the whole call.
+
         Returns:
             (hidden, loop_rms, balance_loss, z_loss, seq_balance_loss, presents)
-        Each loss is the SUM across all (num_blocks * recursive_loops) MoE
+        Each loss is the SUM across all (num_blocks * loops_run) MoE
         applications. The wrapper normalises by that count.
         """
+        # Resolve the variable loop count (§12.2). When None this is exactly
+        # recursive_loops, so every downstream count/index is unchanged.
+        n_loops_to_run = self._resolve_num_loops(num_loops)
+
         x = self.embedding(input_ids)
         if self.use_mhc:
             # Expand to the n_hc-channel residual stream. .repeat (not
             # .expand) so the channels are independent storage — §10 Bug 1.
             x = x.unsqueeze(2).repeat(1, 1, self.config.n_hc, 1)
         S = input_ids.shape[1]
-        expected_past_layers = self.config.num_blocks * self.config.recursive_loops
+        # The KV cache holds one latent per effective layer that actually ran.
+        # With a reduced loop count K only the first K*num_blocks layers exist,
+        # so the cache contract is keyed off the loops we are about to run (==
+        # recursive_loops in the default path, so this is unchanged there).
+        expected_past_layers = self.config.num_blocks * n_loops_to_run
 
         past_length = 0
         if past_key_values is not None:
@@ -1358,20 +1403,27 @@ class OSRTModel(OSRTPreTrainedModel):
 
         # Loop dropout (stochastic depth). With probability
         # loop_dropout_prob in training, truncate the loop chain to a
-        # random length in [min_loops, recursive_loops]. The main task
+        # random length in [min_loops, n_loops_to_run]. The main task
         # loss then flows from a shorter chain's final output, forcing
         # the truncation point loop to be standalone-useful. Complements
         # the aux loss — aux pushes intermediate loops to predict in
         # parallel, dropout makes their predictions become the actual
         # model output some fraction of the time.
-        n_loops_to_run = self.config.recursive_loops
+        #
+        # NOTE: the ceiling here is the ALREADY-resolved n_loops_to_run
+        # (== recursive_loops in the default num_loops=None path, so this
+        # is bit-identical to before). The §12.2 inference knob and loop
+        # dropout compose cleanly: an explicit num_loops=K caps the chain
+        # at K, and dropout may only shorten it further. Dropout is
+        # training-only, so an inference forward (model.eval()) always runs
+        # exactly the resolved n_loops_to_run.
         if (
             self.training
             and getattr(self.config, "loop_dropout_prob", 0.0) > 0.0
             and random.random() < self.config.loop_dropout_prob
         ):
             min_loops = max(2, getattr(self.config, "loop_dropout_min_loops", 3))
-            max_loops = self.config.recursive_loops
+            max_loops = n_loops_to_run
             if max_loops > min_loops:
                 n_loops_to_run = random.randint(min_loops, max_loops)
 
@@ -1532,8 +1584,20 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         labels: Tensor | None = None,
         past_key_values: list[Tensor | None] | None = None,
         use_cache: bool = False,
+        num_loops: int | None = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        """Causal-LM forward.
+
+        num_loops (ARCHITECTURE.md §12.2) is the optional variable-loop
+        inference knob: None → config.recursive_loops (bit-identical to the
+        historical path); K in [1, recursive_loops] runs only the first K
+        recursive loops before norm_out + the (tied) LM head. The aux per-loop
+        LM-head training (§9.2) is what makes a reduced K still predictive.
+        It is threaded straight into OSRTModel.forward, which validates it and
+        keys the KV-cache layer count (num_blocks * K) off it — see the note
+        there about keeping K consistent across a cached decode.
+        """
         (
             hidden, loop_rms,
             balance_loss, z_loss, seq_balance_loss,
@@ -1542,6 +1606,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             input_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            num_loops=num_loops,
         )
 
         # Weight-tied LM head
@@ -1729,6 +1794,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         eos_token_id: int | None = None,
         stop_token_ids: list[int] | None = None,
         repetition_penalty: float = 1.0,
+        num_loops: int | None = None,
         **kwargs,
     ) -> Tensor:
         """Autoregressive generation with KV cache.
@@ -1750,6 +1816,15 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         KV drops disabled at the MoE layer — the training vs inference
         switch happens in MoELayer.forward via self.training, which
         .train(False) toggles.
+
+        num_loops (ARCHITECTURE.md §12.2) selects the variable inference
+        loop count: None → config.recursive_loops (full quality, default,
+        bit-identical to before); K in [1, recursive_loops] runs only the
+        first K loops at every step for a speed/quality trade-off. The SAME
+        K is threaded through both the prefill and every decode forward, so
+        the MLA cache (num_blocks * K latents per token) stays index-consistent
+        across the whole call — mixing loop counts mid-generation would
+        misalign the per-effective-layer cache and is therefore not allowed.
         """
         if eos_token_id is None:
             eos_token_id = self.config.eos_token_id
@@ -1760,7 +1835,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # per-layer latent tensors. Cast locally so ty/mypy line up.
         PastKV = list[Tensor | None]
         context = input_ids[:, -self.config.max_position_embeddings:]
-        out = self.forward(context, use_cache=True)
+        out = self.forward(context, use_cache=True, num_loops=num_loops)
         past_key_values = cast("PastKV | None", out.past_key_values)
 
         # Per-row finished mask. A row is "finished" once it has ever
@@ -1799,6 +1874,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                     new_tok,
                     past_key_values=past_key_values,
                     use_cache=True,
+                    num_loops=num_loops,
                 )
                 past_key_values = cast("PastKV | None", out.past_key_values)
                 logits_tensor = cast(Tensor, out.logits)
