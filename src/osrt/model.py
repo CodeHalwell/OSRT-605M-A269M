@@ -39,6 +39,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from osrt.config import OSRTConfig
+from osrt.mhc import ManifoldHyperConnection
 
 # ── RoPE ────────────────────────────────────────────────────────────────
 
@@ -740,28 +741,41 @@ class RecursiveBlock(nn.Module):
         # at use sites) to get the actual gate value.
         self.moe_gate = nn.Parameter(torch.tensor(math.log(math.e - 1.0)))
 
+        # Manifold-Constrained Hyper-Connections (one per sub-block, shared
+        # across loop iterations). None when mHC is disabled — the block then
+        # uses the proven standard single-stream residual.
+        self.use_mhc = config.use_mhc
+        if config.use_mhc:
+            self.mhc_attn = ManifoldHyperConnection(
+                config.dim, config.n_hc, config.mhc_sinkhorn_iters,
+            )
+            self.mhc_ffn = ManifoldHyperConnection(
+                config.dim, config.n_hc, config.mhc_sinkhorn_iters,
+            )
+
     def effective_moe_gate(self) -> Tensor:
         return F.softplus(self.moe_gate)
 
-    def forward(
+    def _attention(
         self,
-        x: Tensor,
+        x_in: Tensor,
         adapter_a: Tensor,
         adapter_b: Tensor,
         adapter_scale: float,
         rope_cos: Tensor,
         rope_sin: Tensor,
-        loop_idx: int,
-        past_key_value: Tensor | None = None,
-        use_cache: bool = False,
+        past_key_value: Tensor | None,
+        use_cache: bool,
     ) -> tuple[Tensor, Tensor | None]:
-        B, S, D = x.shape
+        """Attention sub-block contribution (pre-residual): GQA + MLA latent.
 
-        # Per-pass residual adapter (unchanged from v4)
-        adapter_out = adapter_scale * (x @ adapter_a @ adapter_b)
+        Returns (out_proj(attn) + adapter, present_latent). The caller adds it
+        into the residual (standard) or mixes it via mHC.
+        """
+        B, S, D = x_in.shape
+        adapter_out = adapter_scale * (x_in @ adapter_a @ adapter_b)
 
-        # ── Attention: GQA + MLA-style compressed K/V latent ──
-        h = self.norm_attn(x)
+        h = self.norm_attn(x_in)
         q = self.q_proj(h).view(B, S, self.heads, self.head_dim)
         c_kv_new = self.kv_down(h)            # (B, S, kv_dim) — un-rotated latent
 
@@ -811,16 +825,50 @@ class RecursiveBlock(nn.Module):
                 q, k, v, is_causal=(S > 1), enable_gqa=gqa,
             )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
-        x = x + self.out_proj(attn_out) + adapter_out
+        return self.out_proj(attn_out) + adapter_out, present_kv
 
-        # ── MoE FFN: shared (always full weight) + routed (gated) ──
-        # moe_gate controls ONLY the routed-experts contribution, not the
-        # shared expert. Shared expert replaces v4's dense FFN and should
-        # carry its weight at all times; routed experts blend in as the
-        # router learns useful specialisation.
-        h_shared, h_routed = self.moe(self.norm_moe(x), loop_idx)
-        x = x + h_shared + self.effective_moe_gate() * h_routed
+    def _moe(self, x_in: Tensor, loop_idx: int) -> Tensor:
+        """MoE sub-block contribution (pre-residual): shared + gated routed."""
+        h_shared, h_routed = self.moe(self.norm_moe(x_in), loop_idx)
+        return h_shared + self.effective_moe_gate() * h_routed
 
+    def forward(
+        self,
+        x: Tensor,
+        adapter_a: Tensor,
+        adapter_b: Tensor,
+        adapter_scale: float,
+        rope_cos: Tensor,
+        rope_sin: Tensor,
+        loop_idx: int,
+        past_key_value: Tensor | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Run attention then MoE. `x` is (B, S, D) for the standard residual
+        path, or (B, S, n_hc, D) when mHC is enabled."""
+        if self.use_mhc:
+            # ── mHC path: residual stream carries n_hc channels ──
+            a, b_mat, c_out = self.mhc_attn.generate(x)
+            x_in = self.mhc_attn.input_view(x, a)
+            f_attn, present_kv = self._attention(
+                x_in, adapter_a, adapter_b, adapter_scale,
+                rope_cos, rope_sin, past_key_value, use_cache,
+            )
+            x = self.mhc_attn.update(x, b_mat, c_out, f_attn)
+
+            a2, b2, c2 = self.mhc_ffn.generate(x)
+            x_in2 = self.mhc_ffn.input_view(x, a2)
+            f_moe = self._moe(x_in2, loop_idx)
+            x = self.mhc_ffn.update(x, b2, c2, f_moe)
+            return x, present_kv
+
+        # ── Standard residual path ──
+        f_attn, present_kv = self._attention(
+            x, adapter_a, adapter_b, adapter_scale,
+            rope_cos, rope_sin, past_key_value, use_cache,
+        )
+        x = x + f_attn
+        x = x + self._moe(x, loop_idx)
         return x, present_kv
 
 
@@ -887,6 +935,16 @@ class OSRTModel(OSRTPreTrainedModel):
         self.norm_loop = nn.RMSNorm(config.dim)
         self.norm_out = nn.RMSNorm(config.dim)
 
+        # mHC: dedicated learnable collapse head mixing the n_hc residual
+        # channels back to a single d_model vector for the LM head and for
+        # every per-loop aux-head capture (resolves ARCHITECTURE.md §10 Bug 3,
+        # the stale-A_l collapse). Initialized to a uniform channel average.
+        self.use_mhc = config.use_mhc
+        if config.use_mhc:
+            self.mhc_collapse = nn.Parameter(
+                torch.full((config.n_hc,), 1.0 / config.n_hc)
+            )
+
         self.gradient_checkpointing = False
 
         # Side-effect storage for per-loop auxiliary LM-head losses.
@@ -895,6 +953,11 @@ class OSRTModel(OSRTPreTrainedModel):
         # to compute the aux loss term, and by the train loop for
         # per-loop logging.
         self.last_intermediate_hiddens: list[Tensor] | None = None
+
+    def _collapse(self, X: Tensor) -> Tensor:
+        """mHC: mix the n_hc residual channels into one d_model vector via the
+        dedicated learnable collapse head. X: (B, S, n_hc, D) -> (B, S, D)."""
+        return torch.einsum("c,bscd->bsd", self.mhc_collapse, X)
 
     def forward(
         self,
@@ -914,6 +977,10 @@ class OSRTModel(OSRTPreTrainedModel):
         applications. The wrapper normalises by that count.
         """
         x = self.embedding(input_ids)
+        if self.use_mhc:
+            # Expand to the n_hc-channel residual stream. .repeat (not
+            # .expand) so the channels are independent storage — §10 Bug 1.
+            x = x.unsqueeze(2).repeat(1, 1, self.config.n_hc, 1)
         S = input_ids.shape[1]
         expected_past_layers = self.config.num_blocks * self.config.recursive_loops
 
@@ -1064,12 +1131,16 @@ class OSRTModel(OSRTPreTrainedModel):
             # hidden state at position n_loops_to_run - 1 will feed
             # the main LM head, so no aux for it.
             if capture_aux and loop < n_loops_to_run - 1:
-                intermediate_hiddens.append(x)
+                # Collapse the mHC stream to a single vector for the aux head
+                # (dedicated learnable collapse — never a stale dynamic A_l).
+                intermediate_hiddens.append(self._collapse(x) if self.use_mhc else x)
 
             loop_rms.append(x.float().pow(2).mean().sqrt())
             if loop < n_loops_to_run - 1:
                 x = self.norm_loop(x)
 
+        if self.use_mhc:
+            x = self._collapse(x)
         x = self.norm_out(x)
         # Expose intermediate hiddens to the CausalLM wrapper. Set to
         # None when not capturing so downstream code can do a cheap

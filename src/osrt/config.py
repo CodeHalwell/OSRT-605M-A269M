@@ -52,6 +52,14 @@ class OSRTConfig(PretrainedConfig):
         adapter_rank: int = 16,
         adapter_alpha: float = 16.0,
 
+        # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8). When
+        # enabled the residual stream carries n_hc channels mixed per-token by
+        # a doubly-stochastic (Birkhoff/Sinkhorn) matrix. use_mhc=False keeps
+        # the proven standard single-stream residual.
+        use_mhc: bool = False,
+        n_hc: int = 4,
+        mhc_sinkhorn_iters: int = 20,
+
         # --- MoE (v5 architecture) ---
         # No dense FFN. Shared expert replaces it at larger hidden size.
         # 8 routed experts × hidden 2048, top-2 (Mixtral-style).
@@ -214,6 +222,9 @@ class OSRTConfig(PretrainedConfig):
         self.recursive_loops = recursive_loops
         self.adapter_rank = adapter_rank
         self.adapter_alpha = adapter_alpha
+        self.use_mhc = use_mhc
+        self.n_hc = n_hc
+        self.mhc_sinkhorn_iters = mhc_sinkhorn_iters
 
         self.num_routed_experts = num_routed_experts
         self.top_k_experts = top_k_experts

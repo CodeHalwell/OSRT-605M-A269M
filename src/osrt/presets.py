@@ -28,6 +28,11 @@ OSRT_605M_A279M: dict = dict(
     expert_hidden=3968,        # routed experts (widened)
     shared_expert_hidden=2816,  # shared expert (shrunk; shifts capacity to sparse path)
     adapter_rank=16,
+    # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8): 4-channel
+    # residual stream, Birkhoff/Sinkhorn doubly-stochastic mixing.
+    use_mhc=True,
+    n_hc=4,
+    mhc_sinkhorn_iters=20,
     # lean-v6 training stack (all already supported by the v5 model code)
     aux_loop_loss_weight=0.05,   # on from step 1 — anti loop-collapse
     router_aux_loss_coeff=0.10,  # v5-proven balance pressure
