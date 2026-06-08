@@ -247,6 +247,20 @@ def run_seq8192_check():
 
 
 @app.local_entrypoint()
+def run_seq8192_flash_check():
+    """Same as run_seq8192_check but attention_sink=False (flash SDPA). The sink
+    OOMs at seq 8192 (the (B,H,S,S) score recompute in backward); flash never
+    materialises scores, so this confirms whether dropping the sink fixes the
+    long-context fit. If it does, the preset goes attention_sink=False."""
+    call = pretrain_sanity.spawn(
+        compile_on=False, steps=12, grouped=True, seq_len=8192, batch=2,
+        attention_sink=False,
+    )
+    print(f"Spawned seq-8192 FLASH mem-check — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
 def run_pretrain():
     """Spawn the full v6 pretraining run (fire-and-forget)."""
     call = pretrain.spawn()
