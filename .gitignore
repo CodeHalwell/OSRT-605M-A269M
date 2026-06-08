@@ -76,4 +76,4 @@ wheels/
 .claude/
 .junie/
 .ruff_cache/
-.son-of-anton/
+.son-of-anton/v6_tokenizer_export/
