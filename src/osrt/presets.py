@@ -44,7 +44,14 @@ OSRT_605M_A288M: dict = dict(
     n_hc=4,
     mhc_sinkhorn_iters=20,
     swiglu_clamp=10.0,         # DeepSeek-style SwiGLU stability clamp (§7.8)
-    attention_sink=True,       # per-head learnable softmax-denominator sink (§6.6)
+    # Attention sink DROPPED (was True). The manual sink path materialises a
+    # (B,H,S,S) score matrix; at the seq-8192 instruction phase that is ~12GB
+    # recomputed in the checkpointed backward — measured OOM (>85GB) at batch 2.
+    # attention_sink=False routes through F.scaled_dot_product_attention (flash),
+    # which never builds the score matrix: the SAME footprint fits at 35.9GB.
+    # v5's proven path; scales to every phase. The sink had no demonstrated
+    # benefit (kept only because it happened to fit at seq 2048).
+    attention_sink=False,
     # B4: grouped-GEMM MoE dispatch. Removes the per-expert .nonzero() — the
     # only torch.compile graph break — so the model compiles fullgraph.
     # Validated on H100: loss tracks the loop path, dropless, ~9-12% faster

@@ -366,7 +366,7 @@ def pretrain():
 def pretrain_sanity(
     compile_on: bool = False,
     steps: int = 30,
-    attention_sink: bool = True,
+    attention_sink: bool = False,  # matches the preset (sink dropped; flash)
     grad_ckpt: bool = True,
     grouped: bool = False,
     seq_len: int = 0,
