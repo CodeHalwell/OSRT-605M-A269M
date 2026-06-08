@@ -69,3 +69,48 @@ def test_detects_dead_experts_when_router_forced():
     model(ids)
     h = moe_health(model)
     assert h.collapsing, "monitor failed to flag a forced single-expert collapse"
+
+
+def test_balance_loss_normalises_by_actual_loops_under_dropout():
+    """Regression for the loop-dropout normalization bug.
+
+    When loop_dropout_prob fires and shortens the loop chain, the router
+    balance / z / seq-balance losses must be divided by the ACTUAL number
+    of loops run, not the configured depth. Otherwise the regularizer is
+    under-weighted exactly on the stochastic-depth batches that need it
+    most.
+
+    Uses the default recursive_loops=3, num_blocks=2. With dropout=1.0 and
+    min_loops=2, loops_run is sampled from {2, 3}; the actual MoE-layer
+    count is therefore in {4, 6}. The buggy denominator was always 6.
+    """
+    import random
+
+    model = _tiny_model(
+        loop_dropout_prob=1.0,
+        loop_dropout_min_loops=2,
+    )
+    model.train()  # dropout only fires in train mode
+    ids = torch.randint(0, 256, (2, 16))
+    labels = ids.clone()
+
+    # Across many seeded runs, the normalization ratio must sometimes
+    # be 4 (loops_run=2). If only 6 ever appears, the denominator is
+    # still bolted to the configured depth and the bug is back.
+    ratios = set()
+    for seed in range(20):
+        random.seed(seed)
+        torch.manual_seed(seed)
+        model(input_ids=ids, labels=labels)
+        raw = model.last_balance_loss
+        norm = model.last_balance_loss_normalised
+        assert raw is not None and norm is not None
+        ratios.add(round(float(raw) / float(norm), 1))
+
+    assert ratios.issubset({4.0, 6.0}), (
+        f"ratios outside expected {{4.0, 6.0}}: {sorted(ratios)}"
+    )
+    assert 4.0 in ratios, (
+        f"no run produced ratio 4.0 (loops_run=2) — denominator not "
+        f"adapting to shortened loops. Saw ratios: {sorted(ratios)}"
+    )

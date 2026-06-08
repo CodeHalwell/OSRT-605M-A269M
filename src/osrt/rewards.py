@@ -989,8 +989,31 @@ def mbpp_test_reward(
     fence = re.search(r"```python\s*\n(.*?)```", answer, re.DOTALL)
     code = fence.group(1) if fence else answer
 
-    # Build a test program: model code + all assertions
-    test_program = code + "\n\n" + "\n".join(test_list)
+    # Build a test program that runs each assertion INDEPENDENTLY and
+    # prints the pass count. The previous implementation concatenated
+    # all assertions into one script body; Python exits non-zero on the
+    # FIRST failing assertion, so a 3-of-4-pass completion scored the
+    # same as a 0-pass completion. This silently destroyed partial
+    # reward signal in GRPO (per review/deep-dive 2026-06-08 P2).
+    #
+    # Each test runs inside `try/exec/except` in the SAME interpreter
+    # so the code's defined functions are visible via globals().
+    # Sandboxing (env strip, tempdir cwd, timeout, group-kill) is
+    # unchanged — the outer subprocess still runs everything once.
+    _tests_repr = repr(list(test_list))
+    test_program = (
+        code
+        + "\n\n"
+        + "__mbpp_tests = " + _tests_repr + "\n"
+        + "__mbpp_passed = 0\n"
+        + "for __mbpp_t in __mbpp_tests:\n"
+        + "    try:\n"
+        + "        exec(__mbpp_t)\n"
+        + "        __mbpp_passed += 1\n"
+        + "    except Exception:\n"
+        + "        pass\n"
+        + "print(f'__MBPP_PASSED__{__mbpp_passed}', flush=True)\n"
+    )
 
     # ── sandboxed exec ──
     import os
@@ -1045,7 +1068,14 @@ def mbpp_test_reward(
         _stdout = stdout_bytes[:65536]
         _stderr = stderr_bytes[:65536]
         del stdout_bytes, stderr_bytes  # release memory
-        passed = len(test_list) if rc == 0 else 0
+        # Parse the per-test pass count emitted by the wrapped script.
+        # Marker is bytes-literal so it survives a non-UTF8 stdout.
+        # A missing marker means the script crashed before reaching the
+        # final print (e.g. model code raised at import or the sandbox
+        # was killed) — that's an honest all-fail, NOT all-pass on rc==0.
+        _marker_re = re.compile(rb"__MBPP_PASSED__(\d+)")
+        _m = _marker_re.search(_stdout)
+        passed = int(_m.group(1)) if _m else 0
     except Exception as e:  # noqa: BLE001
         return penalty_fail, {"verdict": f"exec_error:{type(e).__name__}"}
     finally:
@@ -1056,12 +1086,21 @@ def mbpp_test_reward(
         except Exception:
             pass
 
-    if passed == len(test_list):
-        return reward_pass, {"verdict": "all_pass", "passed": passed}
+    total = len(test_list)
+    if passed == total:
+        return reward_pass, {
+            "verdict": "all_pass", "passed": passed, "total": total,
+        }
+    if passed > 0:
+        # Partial credit. Linear in pass rate so 1-of-4 and 3-of-4 give
+        # meaningfully different rewards — restores the per-test
+        # gradient signal that GRPO needs to escape uniform-reward
+        # groups (LEARNINGS.md "uniform reward groups" failure mode).
+        return reward_partial * (passed / total), {
+            "verdict": "partial", "passed": passed, "total": total,
+        }
     return penalty_fail, {
-        "verdict": "all_fail",
-        "passed": 0,
-        "total": len(test_list),
+        "verdict": "all_fail", "passed": 0, "total": total,
     }
 
 

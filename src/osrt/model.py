@@ -1637,7 +1637,16 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             )
             # Normalise each aux loss by num MoE applications so the
             # coefficient matches per-layer weight (not per-whole-model sum).
-            n_moe_layers = self.config.num_blocks * self.config.recursive_loops
+            #
+            # Use ACTUAL loops run (len(loop_rms)) rather than the configured
+            # depth (self.config.recursive_loops). Under loop_dropout_prob > 0
+            # the model truncates the loop chain to a random length and only
+            # accumulates per-block losses from the loops that executed —
+            # dividing by the configured full depth halves the regularizer
+            # exactly on the stochastic-depth batches that need it most. The
+            # OSRTModel returns loop_rms whose length always equals the number
+            # of loops actually run.
+            n_moe_layers = self.config.num_blocks * max(1, len(loop_rms))
             balance_norm = balance_loss / n_moe_layers
             z_norm = z_loss / n_moe_layers
             seq_balance_norm = seq_balance_loss / n_moe_layers
