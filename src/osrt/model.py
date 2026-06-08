@@ -39,6 +39,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from osrt.config import OSRTConfig
+from osrt.fused_ce import fused_linear_cross_entropy
 from osrt.mhc import ManifoldHyperConnection
 
 # ── RoPE ────────────────────────────────────────────────────────────────
@@ -1288,7 +1289,12 @@ class OSRTModel(OSRTPreTrainedModel):
                 torch.full((config.n_hc,), 1.0 / config.n_hc)
             )
 
-        self.gradient_checkpointing = False
+        # Activation checkpointing for the recursive blocks (training-only;
+        # the forward guards it with `self.training and not use_cache`).
+        # Driven by config so a training run can opt in via the preset.
+        self.gradient_checkpointing = getattr(
+            config, "gradient_checkpointing", False,
+        )
 
         # Side-effect storage for per-loop auxiliary LM-head losses.
         # Populated by forward() when aux_loop_loss_weight > 0 and the
@@ -1725,6 +1731,13 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             per_loop_weights = getattr(
                 self.config, "per_loop_aux_weights", None,
             )
+            # Fused chunked linear-CE (memory). 0 = off (bit-identical to the
+            # F.linear+CE path below); > 0 routes the aux/MTP head losses
+            # through osrt.fused_ce so only ~1/chunks of the (N, vocab) logits
+            # live at once. Same loss + gradients — tests/test_fused_ce.py.
+            fused_ce_chunks = getattr(
+                self.config, "fused_cross_entropy_chunks", 0,
+            )
             if (
                 self.training
                 and aux_weight > 0.0
@@ -1732,15 +1745,27 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             ):
                 for i, h_loop in enumerate(intermediate_hiddens):
                     h_norm = self.model.norm_out(h_loop)
-                    h_logits = F.linear(h_norm, self.model.embedding.weight)
-                    h_shift = h_logits[
-                        ..., :-1, :self.config.real_vocab_size
-                    ].contiguous().float()
-                    aux_l = F.cross_entropy(
-                        h_shift.view(-1, self.config.real_vocab_size),
-                        shift_labels.view(-1),
-                        ignore_index=-100,
-                    )
+                    if fused_ce_chunks > 0:
+                        aux_l = fused_linear_cross_entropy(
+                            h_norm[:, :-1, :].reshape(-1, h_norm.shape[-1]),
+                            self.model.embedding.weight,
+                            shift_labels.reshape(-1),
+                            real_vocab_size=self.config.real_vocab_size,
+                            ignore_index=-100,
+                            n_chunks=fused_ce_chunks,
+                        )
+                    else:
+                        h_logits = F.linear(
+                            h_norm, self.model.embedding.weight,
+                        )
+                        h_shift = h_logits[
+                            ..., :-1, :self.config.real_vocab_size
+                        ].contiguous().float()
+                        aux_l = F.cross_entropy(
+                            h_shift.view(-1, self.config.real_vocab_size),
+                            shift_labels.view(-1),
+                            ignore_index=-100,
+                        )
                     per_loop_aux.append(aux_l)
                     # Per-loop scaling. When per_loop_weights is set,
                     # use it (must be at least as long as the captured
@@ -1780,20 +1805,35 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                         )
                         continue
                     head_hidden = head(hidden)
-                    head_logits = F.linear(
-                        head_hidden, self.model.embedding.weight,
-                    )
-                    # Logits at position i predict token at i+offset, so the
-                    # last `offset` positions have no in-range target → drop.
-                    m_shift_logits = head_logits[
-                        ..., :-offset, :self.config.real_vocab_size
-                    ].contiguous().float()
-                    m_shift_labels = labels[..., offset:].contiguous()
-                    mtp_l = F.cross_entropy(
-                        m_shift_logits.view(-1, self.config.real_vocab_size),
-                        m_shift_labels.view(-1),
-                        ignore_index=-100,
-                    )
+                    if fused_ce_chunks > 0:
+                        # Fused chunked linear-CE (memory): same loss/grads.
+                        # Logits at position i predict token at i+offset, so the
+                        # last `offset` positions have no in-range target → drop.
+                        mtp_l = fused_linear_cross_entropy(
+                            head_hidden[:, :-offset, :].reshape(
+                                -1, head_hidden.shape[-1],
+                            ),
+                            self.model.embedding.weight,
+                            labels[..., offset:].reshape(-1),
+                            real_vocab_size=self.config.real_vocab_size,
+                            ignore_index=-100,
+                            n_chunks=fused_ce_chunks,
+                        )
+                    else:
+                        head_logits = F.linear(
+                            head_hidden, self.model.embedding.weight,
+                        )
+                        # Logits at position i predict token at i+offset, so the
+                        # last `offset` positions have no in-range target → drop.
+                        m_shift_logits = head_logits[
+                            ..., :-offset, :self.config.real_vocab_size
+                        ].contiguous().float()
+                        m_shift_labels = labels[..., offset:].contiguous()
+                        mtp_l = F.cross_entropy(
+                            m_shift_logits.view(-1, self.config.real_vocab_size),
+                            m_shift_labels.view(-1),
+                            ignore_index=-100,
+                        )
                     per_mtp.append(mtp_l)
                     mtp_total = mtp_total + mtp_l
 

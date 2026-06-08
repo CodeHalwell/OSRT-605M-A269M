@@ -222,13 +222,20 @@ def pretrain():
         bos_token_id=tok.bos_token_id,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
+        # Memory: the 8 full-vocab fp32 logit tensors (1 main + 5 aux + 2 MTP)
+        # + the mHC 4× residual stream OOM an 80GB H100 at batch 8 / seq 2048
+        # without these. fused CE routes the 7 aux/MTP head losses through a
+        # chunked, gradient-checkpointed linear-CE; gradient checkpointing
+        # recomputes the (weight-shared) recursive blocks in backward.
+        fused_cross_entropy_chunks=8,
+        gradient_checkpointing=True,
     )
 
     train_cfg = PretrainConfig()
 
-    # Target budget (see compute_budget.py): ~604M physical / ~269M active per
-    # token; ~3.6B FLOPs-equivalent via the 6 recursive loops.
-    print("Target budget: ~604M physical / ~269M active per token.")
+    # Target budget (see compute_budget.py): ~601M physical / ~278M active per
+    # token; ~2.5B FLOPs-equivalent via the 6 recursive loops.
+    print("Target budget: ~601M physical / ~278M active per token.")
 
     run_training(model_config, train_cfg, vol, tokenizer_name)
 
@@ -273,49 +280,53 @@ def pretrain_sanity():
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
+    # FULL-FOOTPRINT memory validation: the model config now enables the two
+    # memory fixes (fused linear-CE on the 7 aux/MTP heads + gradient
+    # checkpointing on the recursive blocks). With these on, the REAL batch 8 /
+    # seq 2048 should fit an 80GB H100 — which is the whole point of this run.
+    # An earlier sanity had to shrink to batch 1 / seq 1024 to dodge the OOM;
+    # if this run survives 30 steps at full batch/seq, blocker #2 is cleared.
+    # Force vocab=65536 (the real v6 size) even though the mounted tokenizer is
+    # still the 32K v4 artifact: the logit tensors scale with vocab, so testing
+    # memory at 32K would understate the real footprint by ~2×. The 32K
+    # tokenizer emits token IDs < 32768 < 65536, so they're valid targets for a
+    # 65K-vocab model — only the embedding has unused rows. This makes the
+    # mem-check measure the TRUE footprint without waiting for the v6 tokenizer.
     from osrt.presets import build_config
     model_config = build_config(
-        vocab_size=len(tok),
-        real_vocab_size=len(tok),
+        vocab_size=65536,
+        real_vocab_size=65536,
         bos_token_id=tok.bos_token_id,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
+        gradient_checkpointing=True,
     )
 
-    # Subclass so the real PretrainConfig is untouched. ckpt/eval pushed
-    # past total_steps so neither fires; warmup short enough to exit and
-    # see a cosine LR before the run ends; compile + wandb off.
-    #
-    # Footprint reduced (batch 8→1, seq 2048→1024) so the smoke test fits
-    # comfortably on one H100 in EAGER mode. The full PretrainConfig
-    # (batch 8, seq 2048) OOMs in eager because the 8 full-vocab fp32
-    # logit tensors (1 main + 5 aux-loop + 2 MTP) plus the mHC 4× residual
-    # stream dominate activation memory — that's the known activation-
-    # memory item the architecture-optimization review flags (fused
-    # linear-CE / gradient checkpointing are the fixes, GPU-phase work).
-    # A smoke test only needs to prove the stack LEARNS, which a small
-    # batch does fine.
+    # Subclass so the real PretrainConfig is untouched. Real batch_size/seq
+    # (8 / 2048 foundation). ckpt/eval/early-stop pushed past total_steps;
+    # eager (compile off) so steps appear immediately and we isolate "does it
+    # fit + learn" from compile; wandb off.
     class SanityCfg(PretrainConfig):
-        total_steps = 100
-        warmup_steps = 20
-        batch_size = 1
-        grad_accum_steps = 2
-        log_interval = 5
+        total_steps = 30
+        warmup_steps = 5
+        grad_accum_steps = 2  # fewer micro-batches → quicker steps; peak mem
+                              # is per-micro-batch so this doesn't change the
+                              # memory test (still batch_size=8 at seq 2048)
+        log_interval = 2
         ckpt_interval = 999_999
         eval_interval = 999_999
         early_stop_check_step = 999_999
         compile_enabled = False
         wandb_log = False
-        wandb_run_name = "osrt-pretrain-sanity"
+        wandb_run_name = "osrt-pretrain-memcheck"
 
     sanity_cfg = SanityCfg()
-    # Shrink the foundation-phase sequence length for the smoke test.
-    sanity_cfg.phases["foundation"]["seq_len"] = 1024
-    sanity_cfg.phases["foundation"]["grad_accum_steps"] = 2
 
     print(
-        "pretrain SANITY: 100 steps, eager, batch=1 seq=1024, "
-        "no ckpts/eval/wandb — validating the full v6 stack trains."
+        "pretrain MEM-CHECK: 30 steps, eager, FULL batch=8 seq=2048 with "
+        "fused-CE + gradient checkpointing — verifying the real footprint "
+        "fits an 80GB H100 and still trains."
     )
     run_training(model_config, sanity_cfg, vol, tokenizer_name)
 

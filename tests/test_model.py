@@ -2100,3 +2100,73 @@ def test_bf16_autocast_hash_routing():
         out = model(ids, labels=labels)
     assert torch.isfinite(out.loss)
     out.loss.backward()
+
+
+# ── Memory-optimization wiring (fused CE + gradient checkpointing) ──────
+
+
+def test_fused_ce_model_loss_parity():
+    """Model loss with fused_cross_entropy_chunks>0 must match the plain
+    path within fp tolerance — guards the aux/MTP wiring, not just the
+    fused_ce function in isolation."""
+    cfg_kw = dict(mtp_heads=2, aux_loop_loss_weight=0.05)
+    ids = torch.randint(0, 512, (2, 24))
+    labels = ids.clone()
+
+    torch.manual_seed(0)
+    m_plain = OSRTForCausalLM(tiny_config(fused_cross_entropy_chunks=0, **cfg_kw))
+    m_plain.train()
+    loss_plain = m_plain(ids, labels=labels).loss
+
+    torch.manual_seed(0)
+    m_fused = OSRTForCausalLM(tiny_config(fused_cross_entropy_chunks=4, **cfg_kw))
+    m_fused.train()
+    loss_fused = m_fused(ids, labels=labels).loss
+
+    assert torch.allclose(loss_plain, loss_fused, atol=1e-4, rtol=1e-4), (
+        f"fused-CE loss {loss_fused.item()} != plain {loss_plain.item()}"
+    )
+
+
+def test_gradient_checkpointing_loss_and_grad_parity():
+    """gradient_checkpointing=True must produce the same loss + grads as
+    off (it only changes when activations are recomputed, not the math)."""
+    cfg_kw = dict(mtp_heads=2, aux_loop_loss_weight=0.05)
+    ids = torch.randint(0, 512, (2, 24))
+    labels = ids.clone()
+
+    torch.manual_seed(0)
+    m_off = OSRTForCausalLM(tiny_config(gradient_checkpointing=False, **cfg_kw))
+    m_off.train()
+    loss_off = m_off(ids, labels=labels).loss
+    loss_off.backward()
+    g_off = next(p.grad.clone() for p in m_off.parameters() if p.grad is not None)
+
+    torch.manual_seed(0)
+    m_on = OSRTForCausalLM(tiny_config(gradient_checkpointing=True, **cfg_kw))
+    m_on.train()
+    assert m_on.model.gradient_checkpointing is True  # wired from config
+    loss_on = m_on(ids, labels=labels).loss
+    loss_on.backward()
+    g_on = next(p.grad.clone() for p in m_on.parameters() if p.grad is not None)
+
+    assert torch.allclose(loss_off, loss_on, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(g_off, g_on, atol=1e-3, rtol=1e-3)
+
+
+def test_fused_ce_plus_checkpointing_bf16():
+    """Both memory opts on, under bf16 autocast — the real training config.
+    Must run forward+backward without error and produce a finite loss."""
+    cfg = tiny_config(
+        mtp_heads=2, aux_loop_loss_weight=0.05,
+        fused_cross_entropy_chunks=4, gradient_checkpointing=True,
+    )
+    m = OSRTForCausalLM(cfg)
+    m.train()
+    ids = torch.randint(0, 512, (2, 24))
+    labels = ids.clone()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss = m(ids, labels=labels).loss
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(p.grad is not None for p in m.parameters())

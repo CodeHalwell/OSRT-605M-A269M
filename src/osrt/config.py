@@ -159,6 +159,29 @@ class OSRTConfig(PretrainedConfig):
         mtp_heads: int = 0,
         mtp_loss_weight: float = 0.3,
 
+        # --- Memory: fused (chunked) linear-cross-entropy for aux/MTP heads ---
+        # The per-loop aux heads and MTP heads each project the hidden state to
+        # the full vocab and upcast to fp32 for CE. At the training batch/seq
+        # those (B, S, vocab) fp32 logit tensors dominate activation memory
+        # (1 main + up to 5 aux + 2 MTP = up to 8 of them). When
+        # fused_cross_entropy_chunks > 0 the aux/MTP head losses route through
+        # osrt.fused_ce.fused_linear_cross_entropy, which materialises only
+        # ~1/n_chunks of the (N, vocab) logits at a time (gradient-checkpointed)
+        # — same loss + gradients (tests/test_fused_ce.py), much lower peak
+        # memory. 0 = OFF (bit-identical to the plain F.linear+CE path). The
+        # main +1 head is unaffected (its logits are returned in the output).
+        fused_cross_entropy_chunks: int = 0,
+
+        # --- Memory: gradient (activation) checkpointing ---
+        # When True, the recursive blocks recompute their activations in the
+        # backward pass instead of retaining them. Especially cheap here: the
+        # model reuses the SAME 3 physical blocks across 6 loops, so the
+        # recompute is of already-shared weights. Training-only — the forward
+        # guards it with `self.training and not use_cache`, so inference/decode
+        # is unaffected. Trades ~30% extra compute for a large activation-memory
+        # cut (the mHC 4× residual stream is the main beneficiary).
+        gradient_checkpointing: bool = False,
+
         # --- Loop dropout (stochastic depth for recursive loops) ---
         # With probability loop_dropout_prob during training, truncate
         # the recursive loop chain to a random length in
@@ -301,6 +324,8 @@ class OSRTConfig(PretrainedConfig):
         self.per_loop_aux_weights = per_loop_aux_weights
         self.mtp_heads = mtp_heads
         self.mtp_loss_weight = mtp_loss_weight
+        self.fused_cross_entropy_chunks = fused_cross_entropy_chunks
+        self.gradient_checkpointing = gradient_checkpointing
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
         self.router_balance_bias_enabled = router_balance_bias_enabled
@@ -448,6 +473,11 @@ class OSRTConfig(PretrainedConfig):
         if self.mtp_loss_weight < 0:
             raise ValueError(
                 f"mtp_loss_weight must be >= 0, got {self.mtp_loss_weight}"
+            )
+        if self.fused_cross_entropy_chunks < 0:
+            raise ValueError(
+                "fused_cross_entropy_chunks must be >= 0 (0 = off), got "
+                f"{self.fused_cross_entropy_chunks}"
             )
         if self.spec_draft_loops < 1:
             raise ValueError(
