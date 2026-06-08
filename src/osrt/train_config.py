@@ -125,6 +125,10 @@ class PretrainConfig:
     # no rescue ckpt) when the wallet hits zero. 500-step intervals
     # bound progress loss to ~30 min on H100 at this throughput.
     ckpt_interval: int = 500
+    # Write osrt_v5_final.pt at the end of a completed run. Real runs leave
+    # this True; sanity/mem/compile checks set it False so they don't clobber
+    # a real run's final checkpoint on the shared volume with throwaway weights.
+    save_final_checkpoint: bool = True
     # Default optimizer is Muon hybrid (Muon for 2D matrix weights,
     # AdamW for embeddings/norms/scalars/router/loop_embeddings). The
     # 1200-step ablation (A/B/C to completion; D stopped at step 600)

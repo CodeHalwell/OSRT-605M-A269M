@@ -1334,16 +1334,25 @@ def run_training(
 
     # Final checkpoint (full run completed or early stopped)
     if not early_stop_triggered:
-        final_path = f"{ckpt_dir}/osrt_v5_final.pt"
-        save_checkpoint(model, optimizer, step, final_path)
-        vol.commit()
         elapsed_total = time.time() - start_time
         print(
             f"\nPretrain complete. {step:,} steps in "
             f"{elapsed_total / 3600:.1f}h",
             flush=True,
         )
-        print(f"Final checkpoint: {final_path}", flush=True)
+        # Gate the final save: sanity/mem/compile checks set
+        # save_final_checkpoint=False so they don't write a throwaway
+        # osrt_v5_final.pt that would clobber a real run's final on the volume.
+        if getattr(train_cfg, "save_final_checkpoint", True):
+            final_path = f"{ckpt_dir}/osrt_v5_final.pt"
+            save_checkpoint(model, optimizer, step, final_path)
+            vol.commit()
+            print(f"Final checkpoint: {final_path}", flush=True)
+        else:
+            print(
+                "Final checkpoint save skipped (save_final_checkpoint=False).",
+                flush=True,
+            )
     if use_wandb:
         wandb.finish()
 

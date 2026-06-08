@@ -443,6 +443,7 @@ def pretrain_sanity(
         ckpt_interval = 999_999
         eval_interval = 999_999
         early_stop_check_step = 999_999
+        save_final_checkpoint = False  # don't clobber a real final with throwaway
         compile_enabled = compile_on
         wandb_log = False
         wandb_run_name = (

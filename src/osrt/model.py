@@ -35,7 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
-from transformers import PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from osrt.config import OSRTConfig
@@ -362,6 +362,12 @@ class MoELayer(nn.Module):
     def apply_orthogonal_init(self) -> None:
         """Apply orthogonal per-expert init. MUST be called after HF post_init()."""
         if not self._orthogonal_init_requested:
+            return
+        # Skip on the meta device: HF from_pretrained builds the skeleton on
+        # meta (torch.Generator(device=meta) would raise), then loads the real
+        # weights — which overwrite this init anyway. Only fresh construction on
+        # a real device needs the orthogonal init.
+        if self.experts[0].w_gate.weight.is_meta:
             return
         # nn.ModuleList iterates as Module (generic); we know ours contains
         # ExpertFFN instances because we just constructed them.
@@ -1335,7 +1341,14 @@ class OSRTPreTrainedModel(PreTrainedModel):
 
     config_class = OSRTConfig
     base_model_prefix = "model"
-    supports_gradient_checkpointing = True
+    # Gradient checkpointing is managed internally via the private
+    # OSRTModel._osrt_grad_ckpt gate (set by the trainer), NOT HF's mechanism —
+    # HF's gradient_checkpointing_enable() is not wired to it. Advertise False
+    # so HF doesn't attempt its own (which trips post_init and isn't what runs).
+    supports_gradient_checkpointing = False
+    # Keep each recursive block intact under device_map="auto" sharding.
+    _no_split_modules = ["RecursiveBlock"]
+    _skip_keys_device_placement = "past_key_values"
 
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
@@ -1366,8 +1379,15 @@ class OSRTModel(OSRTPreTrainedModel):
             config.rope_theta,
             scaling=config.rope_scaling,
         )
-        self.register_buffer("rope_cos", cos, persistent=False)
-        self.register_buffer("rope_sin", sin, persistent=False)
+        # persistent=True so the rope tables are saved in the checkpoint and
+        # restored by from_pretrained. They're derived from config, but HF's
+        # from_pretrained builds the skeleton on the meta device and would
+        # otherwise materialise these non-loaded buffers as uninitialised
+        # garbage (corrupting RoPE on every reloaded model). ~2MB at the real
+        # config — negligible. The on-the-fly recompute path still handles
+        # seq_len beyond the cached range.
+        self.register_buffer("rope_cos", cos, persistent=True)
+        self.register_buffer("rope_sin", sin, persistent=True)
 
         # Physical blocks with distinct block-idx seeds so experts differ
         # across blocks too (not just within a block).
@@ -2534,4 +2554,24 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # token); trim to exactly context + max_new_tokens.
         max_len = context.shape[1] + max_new_tokens
         return generated[:, :max_len]
+
+
+# ── HF auto-class registration ───────────────────────────────────────────
+# Lets AutoConfig / AutoModelForCausalLM recognise model_type "osrt" whenever
+# the osrt package is imported, so `AutoModelForCausalLM.from_pretrained(dir)`
+# and `.from_config(cfg)` work without naming the class. register_for_auto_class
+# additionally makes save_pretrained write the auto_map into config.json (the
+# hook trust_remote_code loading reads). Full trust_remote_code loading WITHOUT
+# the package installed also needs self-contained modeling/config files in the
+# repo (osrt's cross-module imports — fused_ce, hra, muon — aren't auto-copied);
+# that consolidation is a separate follow-up. With the package installed, the
+# Auto* path here is fully functional.
+try:
+    AutoConfig.register("osrt", OSRTConfig)
+    AutoModelForCausalLM.register(OSRTConfig, OSRTForCausalLM)
+except ValueError:
+    pass  # already registered (module re-imported)
+
+OSRTConfig.register_for_auto_class()
+OSRTForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 
