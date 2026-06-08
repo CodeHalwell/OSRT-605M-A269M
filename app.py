@@ -97,6 +97,75 @@ rollouts_vol = modal.Volume.from_name(
     "osrt-rollouts", create_if_missing=True,
 )
 
+# v6 tokenizer volume — the 65K / 21-token contract tokenizer. Kept
+# SEPARATE from the v4 32K tokenizer (osrt-v4-tokenizer) so retraining
+# doesn't clobber the archived v4/v5 artifact. Pretrain switches to this
+# once the tokenizer is verified.
+v6_tokenizer_vol = modal.Volume.from_name(
+    "osrt-v6-tokenizer", create_if_missing=True,
+)
+
+
+# =============================================================================
+# TOKENIZER (v6 — 65K / 21-token contract)
+# =============================================================================
+
+
+@app.function(
+    gpu="T4",
+    cpu=8.0,
+    memory=32768,
+    image=image,
+    volumes={
+        "/vol/tokenizer_out": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=6 * 3600,
+)
+def tokenizer(vocab_size: int = 65536, sample_size: int = 3_000_000_000):
+    """Train the v6 65K BPE tokenizer (21-token contract + reserved band)
+    and write it to the osrt-v6-tokenizer volume.
+
+    Runs on a cheap T4 box (~$0.59/h). The HF byte-level BPE trainer is
+    CPU-bound — the T4 mostly idles — but it's the lowest-cost Modal GPU
+    tier and keeps this off the H100 pool. Streams ~3GB of FineWeb-Edu +
+    CodeParrot + Wikipedia from HF (with retry), trains, verifies, and
+    commits the volume. ~1-3 h. See scripts/train_tokenizer.py for the
+    special-token contract.
+    """
+    import sys
+
+    sys.path.insert(0, "/root/scripts")
+    import train_tokenizer as tt
+
+    out_dir = "/vol/tokenizer_out"
+    print(
+        f"v6 tokenizer: vocab={vocab_size:,}, "
+        f"sample={sample_size:,} chars (~{sample_size / 1e9:.1f} GB)"
+    )
+    data_path = tt.sample_training_data(sample_size)
+    tt.train_with_hf_tokenizers(data_path, vocab_size, out_dir)
+
+    v6_tokenizer_vol.commit()
+    print(f"\nv6 tokenizer committed to osrt-v6-tokenizer volume ({out_dir}).")
+
+
+@app.local_entrypoint()
+def run_tokenizer(vocab_size: int = 65536, sample_size: int = 3_000_000_000):
+    """Spawn the v6 tokenizer training (fire-and-forget).
+
+    Launch with: modal run --detach app.py::run_tokenizer
+    spawn() submits the job and returns a handle immediately; the call
+    runs to completion on Modal independent of this local client (the
+    right pattern for long stages — see project memory). Poll progress
+    with: modal app logs <app-id>.
+    """
+    call = tokenizer.spawn(vocab_size=vocab_size, sample_size=sample_size)
+    print(f"Spawned v6 tokenizer training — call_id={call.object_id}")
+    print("Runs on a T4 independent of this client. Tail logs with:")
+    print("  modal app logs <app-id>   (app id shown above)")
+
 
 # =============================================================================
 # PRE-TRAINING

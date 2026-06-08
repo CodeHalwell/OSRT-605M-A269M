@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Train a custom 32K BPE tokenizer for OSRT.
+"""Train the custom 65K BPE tokenizer for OSRT-605M (v6 contract).
+
+v6 change vs the v4 32K tokenizer: vocab 32768 → 65536, and the special
+set is the full 21-token contract (ARCHITECTURE.md §3.2) — adds
+<|end_turn|>, tool_call/result, image, audio (IDs 14-20) that the v4
+tokenizer lacked — plus an 11-slot reserved band (21-31) so real BPE
+vocab starts at id 32. The model's vocab is frozen into the embedding at
+step 0, so this MUST be right before pretraining.
+
 
 Default uses HuggingFace byte-level BPE. Optionally falls through to
 SuperBPE (COLM 2025) if the 'superbpe' package is installed for the
@@ -236,22 +244,35 @@ def train_with_hf_tokenizers(data_path: str, vocab_size: int, output_dir: str) -
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
 
-    # Special tokens
+    # Special tokens — the full v6 21-token contract (ARCHITECTURE.md §3.2),
+    # plus an 11-slot reserved band so real BPE vocab begins at id 32 and
+    # future special tokens can be slotted in WITHOUT shifting trained IDs
+    # (the v4 tokenizer only had IDs 0-13 and started real vocab at 14,
+    # which left no room for tool/vision/audio without a re-embed).
     special_tokens = [
-        "<|padding|>",        # 0: pad
-        "<|begin_of_text|>",  # 1: bos
-        "<|end_of_text|>",    # 2: eos
-        "<|unknown|>",        # 3: unk
-        "<|fim_prefix|>",     # 4: fill-in-middle (code)
-        "<|fim_middle|>",     # 5: fill-in-middle
-        "<|fim_suffix|>",     # 6: fill-in-middle
-        "<|think|>",          # 7: reasoning open
-        "<|/think|>",         # 8: reasoning close
-        "<|answer|>",         # 9: answer open
-        "<|/answer|>",        # 10: answer close
-        "<|user|>",           # 11: user turn
-        "<|assistant|>",      # 12: assistant turn
-        "<|system|>",         # 13: system prompt
+        "<|padding|>",          # 0: pad
+        "<|begin_of_text|>",    # 1: bos
+        "<|end_of_text|>",      # 2: eos
+        "<|unknown|>",          # 3: unk
+        "<|fim_prefix|>",       # 4: fill-in-middle (code)
+        "<|fim_middle|>",       # 5: fill-in-middle
+        "<|fim_suffix|>",       # 6: fill-in-middle
+        "<|think|>",            # 7: reasoning open
+        "<|/think|>",           # 8: reasoning close
+        "<|answer|>",           # 9: answer open
+        "<|/answer|>",          # 10: answer close
+        "<|user|>",             # 11: user turn
+        "<|assistant|>",        # 12: assistant turn
+        "<|system|>",           # 13: system prompt
+        "<|end_turn|>",         # 14: turn separator (ChatML-style)
+        "<|tool_call|>",        # 15: tool invocation open
+        "<|/tool_call|>",       # 16: tool invocation close
+        "<|tool_result|>",      # 17: tool result open
+        "<|/tool_result|>",     # 18: tool result close
+        "<|image|>",            # 19: vision retrofit placeholder
+        "<|audio|>",            # 20: audio placeholder
+        # 21-31: reserved expansion band → real vocab begins at id 32.
+        *[f"<|reserved_{i}|>" for i in range(21, 32)],
     ]
 
     trainer = trainers.BpeTrainer(
@@ -423,19 +444,20 @@ def _verify_tokenizer(output_dir: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train custom 64K tokenizer for OSRT"
+        description="Train the v6 65K tokenizer for OSRT-605M"
     )
     parser.add_argument(
         "--vocab-size",
         type=int,
-        default=32768,
-        help="Target vocabulary size (32K default, TC-aligned)",
+        default=65536,
+        help="Target vocabulary size (65K default — v6 OSRT-605M contract)",
     )
     parser.add_argument(
         "--sample-size",
         type=int,
-        default=2_000_000_000,
-        help="Training text size in chars (~2GB default - sweet spot for 32K BPE)",
+        default=3_000_000_000,
+        help="Training text size in chars (~3GB default — more merge data "
+             "for the larger 65K vocab than the 2GB used for 32K)",
     )
     parser.add_argument(
         "--output",
