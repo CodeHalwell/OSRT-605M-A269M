@@ -233,7 +233,6 @@ def pretrain():
         # chunked, gradient-checkpointed linear-CE; gradient checkpointing
         # recomputes the (weight-shared) recursive blocks in backward.
         fused_cross_entropy_chunks=8,
-        gradient_checkpointing=True,
     )
 
     train_cfg = PretrainConfig()
@@ -301,7 +300,6 @@ def pretrain_sanity():
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         fused_cross_entropy_chunks=8,
-        gradient_checkpointing=True,
     )
 
     # Subclass so the real PretrainConfig is untouched. Real batch_size/seq

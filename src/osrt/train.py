@@ -671,14 +671,14 @@ def run_training(
     # touches) OR the model config, and set model.model.gradient_checkpointing
     # authoritatively here. This is the override that makes the recursive blocks
     # recompute in backward, which is what makes the full batch/seq fit.
-    gc_on = bool(
-        getattr(train_cfg, "gradient_checkpointing", False)
-        or getattr(model_config, "gradient_checkpointing", False)
-    )
-    model.model.gradient_checkpointing = gc_on
+    # Driven ONLY by the train config — gradient_checkpointing is never put on
+    # the model config (it's an HF-managed name that breaks post_init). Set OUR
+    # private gate, which model.py's use_ckpt reads.
+    gc_on = bool(getattr(train_cfg, "gradient_checkpointing", False))
+    model.model._osrt_grad_ckpt = gc_on
     print(
         f"Gradient checkpointing: {'ENABLED' if gc_on else 'disabled'} "
-        f"(model.gradient_checkpointing={model.model.gradient_checkpointing})"
+        f"(model._osrt_grad_ckpt={model.model._osrt_grad_ckpt})"
     )
     fce = getattr(model_config, "fused_cross_entropy_chunks", 0)
     print(f"Fused linear-CE chunks: {fce} ({'on' if fce > 0 else 'off'})")

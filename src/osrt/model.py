@@ -1291,10 +1291,16 @@ class OSRTModel(OSRTPreTrainedModel):
 
         # Activation checkpointing for the recursive blocks (training-only;
         # the forward guards it with `self.training and not use_cache`).
-        # Driven by config so a training run can opt in via the preset.
-        self.gradient_checkpointing = getattr(
-            config, "gradient_checkpointing", False,
-        )
+        #
+        # IMPORTANT: gate on our OWN private attribute, NOT the HF-managed
+        # `gradient_checkpointing` name. OSRTModel subclasses PreTrainedModel,
+        # which manages `gradient_checkpointing` via gradient_checkpointing_
+        # enable()/post_init — setting config.gradient_checkpointing=True makes
+        # post_init try to enable it and raise (our model doesn't implement
+        # HF's hook) or silently no-op (version-dependent). So checkpointing is
+        # OFF at construction and the trainer flips this private gate at
+        # runtime (run_training). HF never touches `_osrt_grad_ckpt`.
+        self._osrt_grad_ckpt = False
 
         # Side-effect storage for per-loop auxiliary LM-head losses.
         # Populated by forward() when aux_loop_loss_weight > 0 and the
@@ -1469,7 +1475,7 @@ class OSRTModel(OSRTPreTrainedModel):
             if max_loops > min_loops:
                 n_loops_to_run = random.randint(min_loops, max_loops)
 
-        use_ckpt = self.gradient_checkpointing and self.training
+        use_ckpt = self._osrt_grad_ckpt and self.training
         if use_ckpt and (use_cache or past_key_values is not None):
             raise ValueError(
                 "KV caching is incompatible with gradient checkpointing."

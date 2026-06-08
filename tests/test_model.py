@@ -1783,7 +1783,7 @@ def test_checkpointed_forward_does_not_double_balance_counts():
     cfg = tiny_config(num_blocks=1, recursive_loops=1)
     model = OSRTForCausalLM(cfg)
     model.train(True)
-    model.model.gradient_checkpointing = True
+    model.model._osrt_grad_ckpt = True
 
     x = torch.randint(0, cfg.vocab_size, (2, 8))
     labels = torch.randint(0, cfg.vocab_size, (2, 8))
@@ -2135,17 +2135,21 @@ def test_gradient_checkpointing_loss_and_grad_parity():
     ids = torch.randint(0, 512, (2, 24))
     labels = ids.clone()
 
+    # Checkpointing is enabled via the private runtime gate (as run_training
+    # does), NOT via config — config.gradient_checkpointing is the HF-managed
+    # name and would trip HF's post_init enable/raise machinery.
     torch.manual_seed(0)
-    m_off = OSRTForCausalLM(tiny_config(gradient_checkpointing=False, **cfg_kw))
+    m_off = OSRTForCausalLM(tiny_config(**cfg_kw))
+    m_off.model._osrt_grad_ckpt = False
     m_off.train()
     loss_off = m_off(ids, labels=labels).loss
     loss_off.backward()
     g_off = next(p.grad.clone() for p in m_off.parameters() if p.grad is not None)
 
     torch.manual_seed(0)
-    m_on = OSRTForCausalLM(tiny_config(gradient_checkpointing=True, **cfg_kw))
+    m_on = OSRTForCausalLM(tiny_config(**cfg_kw))
+    m_on.model._osrt_grad_ckpt = True
     m_on.train()
-    assert m_on.model.gradient_checkpointing is True  # wired from config
     loss_on = m_on(ids, labels=labels).loss
     loss_on.backward()
     g_on = next(p.grad.clone() for p in m_on.parameters() if p.grad is not None)
@@ -2159,9 +2163,10 @@ def test_fused_ce_plus_checkpointing_bf16():
     Must run forward+backward without error and produce a finite loss."""
     cfg = tiny_config(
         mtp_heads=2, aux_loop_loss_weight=0.05,
-        fused_cross_entropy_chunks=4, gradient_checkpointing=True,
+        fused_cross_entropy_chunks=4,
     )
     m = OSRTForCausalLM(cfg)
+    m.model._osrt_grad_ckpt = True  # runtime gate, like run_training
     m.train()
     ids = torch.randint(0, 512, (2, 24))
     labels = ids.clone()
@@ -2170,3 +2175,53 @@ def test_fused_ce_plus_checkpointing_bf16():
     assert torch.isfinite(loss)
     loss.backward()
     assert any(p.grad is not None for p in m.parameters())
+
+
+def test_gradient_checkpointing_actually_takes_the_branch(monkeypatch):
+    """Guard that gc=True actually routes through _checkpoint_block — the
+    loss-parity test alone passes whether or not checkpointing engages
+    (the else branch gives identical loss). This asserts the IF branch is
+    taken, so the HF-managed-name regression (flag True but forward uses
+    the non-checkpointed path) can't come back silently."""
+    import osrt.model as M
+
+    calls = {"n": 0}
+    real = M._checkpoint_block
+
+    def _spy(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(M, "_checkpoint_block", _spy)
+
+    cfg = tiny_config(aux_loop_loss_weight=0.05)
+    model = OSRTForCausalLM(cfg)
+    model.model._osrt_grad_ckpt = True  # runtime gate, like run_training
+    model.train()
+    assert model.model._osrt_grad_ckpt is True  # private gate, HF-immune
+    ids = torch.randint(0, cfg.vocab_size, (2, 16))
+    model(ids, labels=ids.clone()).loss.backward()
+    # n_blocks (2) × recursive_loops (2) = 4 checkpointed block calls
+    assert calls["n"] == cfg.num_blocks * cfg.recursive_loops, (
+        f"_checkpoint_block called {calls['n']}x, expected "
+        f"{cfg.num_blocks * cfg.recursive_loops} — checkpointing did NOT engage"
+    )
+
+
+def test_gradient_checkpointing_off_skips_the_branch(monkeypatch):
+    """Mirror: gc=False must NOT call _checkpoint_block."""
+    import osrt.model as M
+
+    calls = {"n": 0}
+    real = M._checkpoint_block
+    monkeypatch.setattr(
+        M, "_checkpoint_block",
+        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1), real(*a, **k))[1],
+    )
+    cfg = tiny_config(aux_loop_loss_weight=0.05)
+    model = OSRTForCausalLM(cfg)
+    model.train()
+    assert model.model._osrt_grad_ckpt is False  # default off at construction
+    ids = torch.randint(0, cfg.vocab_size, (2, 16))
+    model(ids, labels=ids.clone()).loss.backward()
+    assert calls["n"] == 0

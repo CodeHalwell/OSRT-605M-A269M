@@ -172,15 +172,14 @@ class OSRTConfig(PretrainedConfig):
         # main +1 head is unaffected (its logits are returned in the output).
         fused_cross_entropy_chunks: int = 0,
 
-        # --- Memory: gradient (activation) checkpointing ---
-        # When True, the recursive blocks recompute their activations in the
-        # backward pass instead of retaining them. Especially cheap here: the
-        # model reuses the SAME 3 physical blocks across 6 loops, so the
-        # recompute is of already-shared weights. Training-only — the forward
-        # guards it with `self.training and not use_cache`, so inference/decode
-        # is unaffected. Trades ~30% extra compute for a large activation-memory
-        # cut (the mHC 4× residual stream is the main beneficiary).
-        gradient_checkpointing: bool = False,
+        # NOTE: gradient (activation) checkpointing is deliberately NOT a field
+        # here. `gradient_checkpointing` is an HF-managed name on PretrainedConfig
+        # /PreTrainedModel — setting config.gradient_checkpointing=True makes
+        # post_init call HF's gradient_checkpointing_enable(), which our custom
+        # model doesn't implement (it raises on newer transformers, silently
+        # no-ops on others). Instead the trainer flips a private runtime gate
+        # (OSRTModel._osrt_grad_ckpt) — see run_training. Making the HF mechanism
+        # work is tracked under "HF tier-1 compliance".
 
         # --- Loop dropout (stochastic depth for recursive loops) ---
         # With probability loop_dropout_prob during training, truncate
@@ -325,7 +324,6 @@ class OSRTConfig(PretrainedConfig):
         self.mtp_heads = mtp_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.fused_cross_entropy_chunks = fused_cross_entropy_chunks
-        self.gradient_checkpointing = gradient_checkpointing
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
         self.router_balance_bias_enabled = router_balance_bias_enabled
