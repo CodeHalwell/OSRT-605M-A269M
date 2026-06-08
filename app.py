@@ -261,6 +261,18 @@ def run_seq8192_flash_check():
 
 
 @app.local_entrypoint()
+def run_final_check():
+    """Final pre-launch integration check: the REAL pretrain config (flash +
+    grouped-GEMM + checkpointing + fused-CE), compiled, 20 steps. One short
+    end-to-end pass to confirm the whole stack trains before committing to the
+    full run — exercises fullgraph compile, collapse telemetry, data streaming,
+    and the checkpoint-save gate (prints 'skipped'). ~8 min."""
+    call = pretrain_sanity.spawn(compile_on=True, steps=20, grouped=True)
+    print(f"Spawned final pre-launch check — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
 def run_pretrain():
     """Spawn the full v6 pretraining run (fire-and-forget)."""
     call = pretrain.spawn()
