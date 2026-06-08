@@ -35,6 +35,15 @@ image = (
         # failure mode: sanity run stuck at "Fetching first batch..."
         # for 45 min with no output until manually stopped.
         "TOKENIZERS_PARALLELISM": "false",
+        # CUDA allocator: expandable segments prevent fragmentation OOMs.
+        # The recursive + checkpointed + chunked-CE training churns the
+        # allocator with variable-size tensors (per-step attention scores,
+        # checkpoint recompute, fused-CE chunks); over many steps the default
+        # caching allocator fragments and can fail to find a contiguous block
+        # even with ~15GB free (observed: OOM at step ~27 with only 60/79GB
+        # actually allocated). expandable_segments grows segments in place
+        # instead of fragmenting. PyTorch's own OOM message recommends this.
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         # Persistent HF datasets cache. Volume mounted by SFT/eval/GRPO
         # functions; pretrain doesn't mount it, but HF datasets handles
         # a non-existent path gracefully under streaming=True (the
