@@ -45,6 +45,12 @@ OSRT_605M_A288M: dict = dict(
     mhc_sinkhorn_iters=20,
     swiglu_clamp=10.0,         # DeepSeek-style SwiGLU stability clamp (§7.8)
     attention_sink=True,       # per-head learnable softmax-denominator sink (§6.6)
+    # B4: grouped-GEMM MoE dispatch. Removes the per-expert .nonzero() — the
+    # only torch.compile graph break — so the model compiles fullgraph.
+    # Validated on H100: loss tracks the loop path, dropless, ~9-12% faster
+    # steady-state (gated by gradient-checkpointing recompute). Weights are
+    # identical to the loop path, so checkpoints load under either dispatch.
+    moe_grouped_gemm=True,
     # lean-v6 training stack (all already supported by the v5 model code)
     aux_loop_loss_weight=0.05,   # on from step 1 — anti loop-collapse
     # Multi-Token Prediction heads (§9.3, §11.4): 2 extra heads predicting +2/+3
