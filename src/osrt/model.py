@@ -1387,6 +1387,17 @@ class OSRTModel(OSRTPreTrainedModel):
         )
         self.adapter_scale = config.adapter_alpha / config.adapter_rank
 
+        # Recursive-loop collapse telemetry. Per effective layer (loop × block)
+        # we record the relative residual update ||Δx|| / ||x|| and the hidden
+        # norm ||x||. A deep loop whose update → 0 has collapsed to a no-op.
+        # Gated on telemetry_enabled (set per-step by the trainer, like the MoE
+        # telemetry) so the hook never runs on normal compiled steps — keeps the
+        # B4 fullgraph clean. Populated by forward; read by _collect_moe_metrics.
+        self.telemetry_enabled: bool = True
+        n_eff = config.num_blocks * config.recursive_loops
+        self.last_loop_update_norm: list[float] = [0.0] * n_eff
+        self.last_loop_hidden_norm: list[float] = [0.0] * n_eff
+
         self.norm_loop = nn.RMSNorm(config.dim)
         self.norm_out = nn.RMSNorm(config.dim)
 
@@ -1602,6 +1613,15 @@ class OSRTModel(OSRTPreTrainedModel):
                     past_key_values[idx] if past_key_values is not None else None
                 )
 
+                # Loop-collapse telemetry: snapshot the residual before this
+                # block so we can record how much it changes it. Gated on
+                # telemetry_enabled — on normal (compiled) steps this is skipped
+                # entirely, so the fullgraph stays clean; on log steps it adds
+                # the same .item() breaks the MoE telemetry already does.
+                collect_loop = self.telemetry_enabled
+                if collect_loop:
+                    x_prev = x.detach()
+
                 if use_ckpt:
                     def _block_fn(
                         _x, _a, _b, _cos, _sin,
@@ -1637,6 +1657,12 @@ class OSRTModel(OSRTPreTrainedModel):
                     )
                     if presents is not None:
                         presents.append(present_kv)
+
+                if collect_loop:
+                    base = x_prev.norm().clamp_min(1e-6)
+                    upd = (x.detach() - x_prev).norm()
+                    self.last_loop_update_norm[idx] = (upd / base).item()
+                    self.last_loop_hidden_norm[idx] = base.item()
 
                 # Accumulate router auxiliary losses (Switch balance,
                 # Z-loss, sequence-wise balance). Each is set as a
@@ -1694,6 +1720,7 @@ class OSRTModel(OSRTPreTrainedModel):
         consumer reads them on those steps (all reads are inside
         `if should_log:` guards).
         """
+        self.telemetry_enabled = enabled  # gates the loop-collapse hook
         for blk in self.blocks:
             blk.moe.telemetry_enabled = enabled
 

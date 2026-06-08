@@ -339,6 +339,7 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
     bias_ema_mins: list[float] = []
 
     metrics: dict = {}
+    dead_experts_total = 0
     for bi, blk in enumerate(base.blocks):
         # Log the EFFECTIVE gate (post-softplus) — the raw parameter is
         # an unconstrained pre-image and doesn't reflect the actual
@@ -405,6 +406,12 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
                 metrics[f"moe/expert_min_b{bi}_l{li}"] = mn
                 expert_maxes.append(mx)
                 expert_mins.append(mn)
+                # Dead experts: load below 10% of the uniform share (1/E).
+                # Counts per (block, loop) and accumulates a global total — a
+                # rising total is the clearest single collapse signal.
+                dead = sum(1 for f in fracs if f < 0.1 / len(fracs))
+                metrics[f"moe/dead_experts_b{bi}_l{li}"] = dead
+                dead_experts_total += dead
         for li, fracs in enumerate(blk.moe.last_clean_expert_fraction):
             if fracs:
                 mx = max(fracs)
@@ -441,6 +448,21 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
                     metrics[f"moe/prebias_expert_min_b{bi}_l{li}"] = mn
                     prebias_expert_maxes.append(mx)
                     prebias_expert_mins.append(mn)
+
+    # Recursive-loop collapse: per-effective-layer residual update ||Δx||/||x||.
+    # A deep loop whose update → 0 has collapsed to a no-op; update_norm_last
+    # (the deepest effective layer) and update_norm_min are the at-a-glance
+    # signals. hidden_norm tracks residual-stream growth/blowup.
+    loop_norms = list(getattr(base, "last_loop_update_norm", []) or [])
+    for idx, v in enumerate(loop_norms):
+        metrics[f"loop/update_norm_l{idx}"] = v
+    for idx, v in enumerate(getattr(base, "last_loop_hidden_norm", []) or []):
+        metrics[f"loop/hidden_norm_l{idx}"] = v
+    if loop_norms:
+        metrics["loop/update_norm_mean"] = _mean(loop_norms)
+        metrics["loop/update_norm_min"] = min(loop_norms)
+        metrics["loop/update_norm_last"] = loop_norms[-1]
+    metrics["moe/dead_experts_total"] = dead_experts_total
 
     metrics["moe/per_token_entropy_mean"] = _mean(per_token_ents)
     metrics["moe/marginal_entropy_mean"] = _mean(marginal_ents)
@@ -498,6 +520,10 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
         "prebias_top_margin": _mean(prebias_top_margins),
         "prebias_expert_max": _mean(prebias_expert_maxes),
         "prebias_expert_min": _mean(prebias_expert_mins),
+        "loop_update_norm_min": min(loop_norms) if loop_norms else 0.0,
+        "loop_update_norm_mean": _mean(loop_norms),
+        "loop_update_norm_last": loop_norms[-1] if loop_norms else 0.0,
+        "dead_experts_total": dead_experts_total,
     }
     return metrics, summary
 
@@ -561,6 +587,10 @@ def _average_moe_snapshots(
         "prebias_top_margin": avg.get("moe/prebias_top_margin_mean", 0.0),
         "prebias_expert_max": avg.get("moe/prebias_expert_max_mean", 0.0),
         "prebias_expert_min": avg.get("moe/prebias_expert_min_mean", 0.0),
+        "loop_update_norm_min": avg.get("loop/update_norm_min", 0.0),
+        "loop_update_norm_mean": avg.get("loop/update_norm_mean", 0.0),
+        "loop_update_norm_last": avg.get("loop/update_norm_last", 0.0),
+        "dead_experts_total": avg.get("moe/dead_experts_total", 0.0),
     }
     return avg, summary
 
@@ -1174,6 +1204,27 @@ def run_training(
                 f"margin={moe_summary['prebias_top_margin']:.3f} "
                 f"emax={moe_summary['prebias_expert_max']:.3f} "
                 f"emin={moe_summary['prebias_expert_min']:.3f}",
+                flush=True,
+            )
+            # Recursive-loop collapse: per-effective-layer residual update
+            # ||Δx||/||x||. A monotone decay to ~0 in the deep loops means they
+            # have collapsed to no-ops. 'last' = deepest loop, 'dead' = experts
+            # below 10% of uniform share across all blocks/loops.
+            n_eff = model_config.num_blocks * model_config.recursive_loops
+            loop_str = " ".join(
+                f"L{i}={moe_metrics.get(f'loop/update_norm_l{i}', 0.0):.3f}"
+                for i in range(n_eff)
+            )
+            print(
+                f"           loop |dx|/|x|: {loop_str}",
+                flush=True,
+            )
+            print(
+                f"           collapse: loop_upd min={moe_summary['loop_update_norm_min']:.3f} "
+                f"last={moe_summary['loop_update_norm_last']:.3f} "
+                f"mean={moe_summary['loop_update_norm_mean']:.3f} | "
+                f"dead_experts={int(moe_summary['dead_experts_total'])} | "
+                f"bias_abs_max={moe_summary['bias_abs_max']:.3f}",
                 flush=True,
             )
 
