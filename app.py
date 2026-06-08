@@ -177,7 +177,7 @@ def run_tokenizer(vocab_size: int = 65536, sample_size: int = 3_000_000_000):
     image=image,
     volumes={
         "/vol/checkpoints": vol,
-        "/vol/tokenizer": tokenizer_vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -186,7 +186,12 @@ def run_tokenizer(vocab_size: int = 65536, sample_size: int = 3_000_000_000):
     timeout=86400,
 )
 def pretrain():
-    """Run v5 pre-training with progressive seq_len curriculum."""
+    """Run v6 pre-training with progressive seq_len curriculum.
+
+    Uses the v6 65K/21-token tokenizer (osrt-v6-tokenizer) + the memory
+    fixes (fused linear-CE + gradient checkpointing) so the full batch/seq
+    fits an 80GB H100.
+    """
     import os
 
     import modal as _modal
@@ -196,7 +201,7 @@ def pretrain():
     from osrt.train import run_training
     from osrt.train_config import PretrainConfig
 
-    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol = _modal.Volume.from_name("osrt-v6-tokenizer")
     _tok_vol.reload()
 
     tokenizer_path = "/vol/tokenizer"
@@ -232,6 +237,9 @@ def pretrain():
     )
 
     train_cfg = PretrainConfig()
+    # Memory: drive gradient checkpointing from the TRAIN config (HF can't
+    # reset this one — see run_training). fused-CE is on via model_config.
+    train_cfg.gradient_checkpointing = True
 
     # Target budget (see compute_budget.py): ~601M physical / ~278M active per
     # token; ~2.5B FLOPs-equivalent via the 6 recursive loops.
@@ -245,7 +253,7 @@ def pretrain():
     image=image,
     volumes={
         "/vol/checkpoints": vol,
-        "/vol/tokenizer": tokenizer_vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -254,14 +262,13 @@ def pretrain():
     timeout=3600,
 )
 def pretrain_sanity():
-    """100-step smoke test of the full pretrain path on the canonical
-    OSRT-605M preset.
+    """Full-footprint MEMORY CHECK of the pretrain path on the v6 65K
+    tokenizer + memory fixes.
 
-    Verifies the assembled v6 architecture (GQA + V-from-K, mHC, 8-expert
-    MoE, sqrt-softplus routing, attention sink, aux-loop loss, MTP,
-    Muon+AdamW) trains stably on real streamed data before committing to a
-    full run. Eager mode (no torch.compile) so step events appear
-    immediately; no checkpoint saves, no wandb. ~10-15 min, a few dollars.
+    Runs the REAL batch 8 / seq 2048 with fused linear-CE + gradient
+    checkpointing to verify the footprint fits an 80GB H100 and still
+    trains. Eager (compile off) so steps + the checkpointing-enabled log
+    line appear immediately; no ckpt/eval/wandb. ~10 min.
     """
     import os
 
@@ -271,7 +278,7 @@ def pretrain_sanity():
     from osrt.train import run_training
     from osrt.train_config import PretrainConfig
 
-    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol = _modal.Volume.from_name("osrt-v6-tokenizer")
     _tok_vol.reload()
 
     tokenizer_path = "/vol/tokenizer"
@@ -280,22 +287,16 @@ def pretrain_sanity():
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
-    # FULL-FOOTPRINT memory validation: the model config now enables the two
-    # memory fixes (fused linear-CE on the 7 aux/MTP heads + gradient
-    # checkpointing on the recursive blocks). With these on, the REAL batch 8 /
-    # seq 2048 should fit an 80GB H100 — which is the whole point of this run.
-    # An earlier sanity had to shrink to batch 1 / seq 1024 to dodge the OOM;
-    # if this run survives 30 steps at full batch/seq, blocker #2 is cleared.
-    # Force vocab=65536 (the real v6 size) even though the mounted tokenizer is
-    # still the 32K v4 artifact: the logit tensors scale with vocab, so testing
-    # memory at 32K would understate the real footprint by ~2×. The 32K
-    # tokenizer emits token IDs < 32768 < 65536, so they're valid targets for a
-    # 65K-vocab model — only the embedding has unused rows. This makes the
-    # mem-check measure the TRUE footprint without waiting for the v6 tokenizer.
+    # FULL-FOOTPRINT memory validation on the REAL v6 65K tokenizer. The
+    # config enables both memory fixes (fused linear-CE on the 7 aux/MTP
+    # heads + gradient checkpointing on the recursive blocks); with them on,
+    # the real batch 8 / seq 2048 should fit an 80GB H100. An earlier sanity
+    # had to shrink to batch 1 / seq 1024 to dodge the OOM — if this survives
+    # 30 steps at full batch/seq, blocker #2 is cleared.
     from osrt.presets import build_config
     model_config = build_config(
-        vocab_size=65536,
-        real_vocab_size=65536,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
@@ -320,6 +321,8 @@ def pretrain_sanity():
         compile_enabled = False
         wandb_log = False
         wandb_run_name = "osrt-pretrain-memcheck"
+        # HF-immune gradient-checkpointing flag (run_training reads train_cfg)
+        gradient_checkpointing = True
 
     sanity_cfg = SanityCfg()
 

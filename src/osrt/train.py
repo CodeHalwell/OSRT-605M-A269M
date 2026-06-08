@@ -659,6 +659,30 @@ def run_training(
 
     # Model setup
     model = OSRTForCausalLM(model_config).to(device=device)
+    model.train()
+
+    # Gradient (activation) checkpointing — enable EXPLICITLY here, AFTER
+    # construction, and print confirmation. The model-config flag alone is
+    # unreliable: HF PreTrainedModel.post_init() runs
+    # _backward_compatibility_gradient_checkpointing, which (on newer
+    # transformers) calls HF's gradient_checkpointing_enable() — our custom
+    # model doesn't hook into it — and then RESETS config.gradient_checkpointing
+    # to False. So we read the flag from the TRAIN config (which HF never
+    # touches) OR the model config, and set model.model.gradient_checkpointing
+    # authoritatively here. This is the override that makes the recursive blocks
+    # recompute in backward, which is what makes the full batch/seq fit.
+    gc_on = bool(
+        getattr(train_cfg, "gradient_checkpointing", False)
+        or getattr(model_config, "gradient_checkpointing", False)
+    )
+    model.model.gradient_checkpointing = gc_on
+    print(
+        f"Gradient checkpointing: {'ENABLED' if gc_on else 'disabled'} "
+        f"(model.gradient_checkpointing={model.model.gradient_checkpointing})"
+    )
+    fce = getattr(model_config, "fused_cross_entropy_chunks", 0)
+    print(f"Fused linear-CE chunks: {fce} ({'on' if fce > 0 else 'off'})")
+
     total_params = sum(p.numel() for p in model.parameters())
     n_experts = 1 + model_config.num_routed_experts  # +1 shared
     print(f"Physical parameters : {total_params:>12,}")
