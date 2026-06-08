@@ -39,6 +39,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from osrt.config import OSRTConfig
+from osrt.fused_ce import fused_linear_cross_entropy
 from osrt.mhc import ManifoldHyperConnection
 
 # ── RoPE ────────────────────────────────────────────────────────────────
@@ -936,6 +937,20 @@ class RecursiveBlock(nn.Module):
         # routed to AdamW by build_param_groups with no change there. None when
         # disabled so the standard SDPA path stays bit-identical.
         self.attention_sink = config.attention_sink
+        # How the sink is computed when enabled — "manual" (materialised scores,
+        # default) or "flex" (fused flex_attention + lse rescale). Review B1.
+        # Read at forward time so it can be toggled per block (e.g. parity tests
+        # / a GPU-only switch) without changing any parameters.
+        self.attention_sink_impl = getattr(
+            config, "attention_sink_impl", "manual",
+        )
+        # Cache of flex_attention causal BlockMasks keyed by
+        # (S, total_len, past_len, device). The mask is identical across every
+        # block/loop/forward for a given shape, so it is built once and reused —
+        # rebuilding it per call is the flex_attention footgun that erases the
+        # fused-kernel win under torch.compile. Plain dict (not a buffer): not
+        # part of state_dict, rebuilt lazily, device-keyed so model.to() is safe.
+        self._flex_mask_cache: dict = {}
         if config.attention_sink:
             self.sink_logits = nn.Parameter(torch.zeros(self.heads))
 
@@ -1030,11 +1045,18 @@ class RecursiveBlock(nn.Module):
         gqa = self.group_size > 1
         if self.attention_sink:
             # Attention sink (ARCHITECTURE.md §6.6): the sink adds an extra term
-            # to the softmax denominator only, which SDPA cannot express. Use
-            # the manual path so we can apply the exact log-sum-exp rescale.
-            attn_out = self._attention_with_sink(
-                q, k, v, S, total_len, past_len,
-            )
+            # to the softmax denominator only, which SDPA cannot express. Both
+            # paths apply the exact sigmoid(lse - sink) rescale; "flex" gets the
+            # out + lse from a fused flex_attention kernel (flash memory under
+            # torch.compile/CUDA) instead of materialising the score matrix.
+            if self.attention_sink_impl == "flex":
+                attn_out = self._attention_with_sink_flex(
+                    q, k, v, S, total_len, past_len,
+                )
+            else:
+                attn_out = self._attention_with_sink(
+                    q, k, v, S, total_len, past_len,
+                )
         elif past_len > 0 and S > 1:
             attn_mask = torch.full(
                 (S, total_len), float("-inf"), device=q.device, dtype=q.dtype,
@@ -1114,6 +1136,74 @@ class RecursiveBlock(nn.Module):
         # sink_logits: (H,) → broadcast over (B,H,S). Done in fp32 then cast.
         sink = self.sink_logits.float().view(1, H, 1)
         rescale = torch.sigmoid(lse - sink).unsqueeze(-1).to(out.dtype)
+        return out * rescale
+
+    def _attention_with_sink_flex(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        S: int,
+        total_len: int,
+        past_len: int,
+    ) -> Tensor:
+        """Flash-class GQA attention with a per-head learnable sink (review B1).
+
+        Numerically equivalent to ``_attention_with_sink`` but obtains the
+        attention output and the per-query log-sum-exp from a single fused
+        ``flex_attention(return_lse=True)`` call instead of materialising the
+        ``(B, H, S, total_len)`` score matrix. The sink is applied afterwards by
+        the identical ``out * sigmoid(lse - sink[h])`` rescale (the sink's value
+        is zero, so it only enlarges the softmax denominator).
+
+        flex_attention computes ``lse`` on the SAME scaled scores the manual path
+        uses (default scale 1/sqrt(head_dim)), so the rescale matches. GQA is
+        handled by ``enable_gqa=True`` (q has ``heads``, k/v have ``kv_heads``).
+
+        Memory note: the flash/fused-kernel benefit only materialises under
+        ``torch.compile`` on CUDA; eager (and CPU) flex_attention still
+        materialises internally — so this path is about the GPU training/decode
+        memory profile, while remaining numerically identical everywhere.
+        Inputs q:(B,heads,S,hd), k/v:(B,kv_heads,total_len,hd).
+        """
+        from torch.nn.attention.flex_attention import (
+            create_block_mask,
+            flex_attention,
+        )
+
+        B, H, _, _ = q.shape
+        gqa = self.group_size > 1
+
+        if S > 1:
+            # Query i sits at absolute position past_len + i; key j is visible
+            # iff j <= past_len + i — the exact predicate the manual/SDPA paths
+            # use. The mask depends only on (S, total_len, past_len, device), so
+            # build it once per shape and cache it; a compiled GPU run then reuses
+            # the same BlockMask instead of rebuilding (and re-tracing) it every
+            # attention call.
+            mask_key = (S, total_len, past_len, str(q.device))
+            block_mask = self._flex_mask_cache.get(mask_key)
+            if block_mask is None:
+                def _causal(b, h, q_idx, kv_idx, _pl=past_len):
+                    return kv_idx <= (_pl + q_idx)
+
+                block_mask = create_block_mask(
+                    _causal, B=None, H=None, Q_LEN=S, KV_LEN=total_len,
+                    device=q.device, _compile=False,
+                )
+                self._flex_mask_cache[mask_key] = block_mask
+            out, lse = flex_attention(
+                q, k, v, block_mask=block_mask, enable_gqa=gqa, return_lse=True,
+            )
+        else:
+            # Single-token decode: every key is visible, no mask needed.
+            out, lse = flex_attention(
+                q, k, v, enable_gqa=gqa, return_lse=True,
+            )
+
+        # Identical sink rescale (fp32) as the manual path. lse: (B, H, S).
+        sink = self.sink_logits.float().view(1, H, 1)
+        rescale = torch.sigmoid(lse.float() - sink).unsqueeze(-1).to(out.dtype)
         return out * rescale
 
     def _moe(
@@ -1709,6 +1799,13 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             per_loop_weights = getattr(
                 self.config, "per_loop_aux_weights", None,
             )
+            # Fused chunked linear-CE (review B2): 0 = off (bit-identical
+            # F.linear+CE below); > 0 routes the aux/MTP head losses through
+            # osrt.fused_ce so only ~1/chunks of the (N, vocab) logits live at
+            # once. Same loss and gradients — see tests/test_fused_ce.py.
+            fused_ce_chunks = getattr(
+                self.config, "fused_cross_entropy_chunks", 0,
+            )
             if (
                 self.training
                 and aux_weight > 0.0
@@ -1716,15 +1813,27 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             ):
                 for i, h_loop in enumerate(intermediate_hiddens):
                     h_norm = self.model.norm_out(h_loop)
-                    h_logits = F.linear(h_norm, self.model.embedding.weight)
-                    h_shift = h_logits[
-                        ..., :-1, :self.config.real_vocab_size
-                    ].contiguous().float()
-                    aux_l = F.cross_entropy(
-                        h_shift.view(-1, self.config.real_vocab_size),
-                        shift_labels.view(-1),
-                        ignore_index=-100,
-                    )
+                    if fused_ce_chunks > 0:
+                        aux_l = fused_linear_cross_entropy(
+                            h_norm[:, :-1, :].reshape(-1, h_norm.shape[-1]),
+                            self.model.embedding.weight,
+                            shift_labels.reshape(-1),
+                            real_vocab_size=self.config.real_vocab_size,
+                            ignore_index=-100,
+                            n_chunks=fused_ce_chunks,
+                        )
+                    else:
+                        h_logits = F.linear(
+                            h_norm, self.model.embedding.weight,
+                        )
+                        h_shift = h_logits[
+                            ..., :-1, :self.config.real_vocab_size
+                        ].contiguous().float()
+                        aux_l = F.cross_entropy(
+                            h_shift.view(-1, self.config.real_vocab_size),
+                            shift_labels.view(-1),
+                            ignore_index=-100,
+                        )
                     per_loop_aux.append(aux_l)
                     # Per-loop scaling. When per_loop_weights is set,
                     # use it (must be at least as long as the captured
@@ -1764,20 +1873,35 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                         )
                         continue
                     head_hidden = head(hidden)
-                    head_logits = F.linear(
-                        head_hidden, self.model.embedding.weight,
-                    )
-                    # Logits at position i predict token at i+offset, so the
-                    # last `offset` positions have no in-range target → drop.
-                    m_shift_logits = head_logits[
-                        ..., :-offset, :self.config.real_vocab_size
-                    ].contiguous().float()
-                    m_shift_labels = labels[..., offset:].contiguous()
-                    mtp_l = F.cross_entropy(
-                        m_shift_logits.view(-1, self.config.real_vocab_size),
-                        m_shift_labels.view(-1),
-                        ignore_index=-100,
-                    )
+                    if fused_ce_chunks > 0:
+                        # Fused chunked linear-CE (review B2): same loss/grads.
+                        # Logits at position i predict token at i+offset, so the
+                        # last `offset` positions have no in-range target → drop.
+                        mtp_l = fused_linear_cross_entropy(
+                            head_hidden[:, :-offset, :].reshape(
+                                -1, head_hidden.shape[-1],
+                            ),
+                            self.model.embedding.weight,
+                            labels[..., offset:].reshape(-1),
+                            real_vocab_size=self.config.real_vocab_size,
+                            ignore_index=-100,
+                            n_chunks=fused_ce_chunks,
+                        )
+                    else:
+                        head_logits = F.linear(
+                            head_hidden, self.model.embedding.weight,
+                        )
+                        # Logits at position i predict token at i+offset, so the
+                        # last `offset` positions have no in-range target → drop.
+                        m_shift_logits = head_logits[
+                            ..., :-offset, :self.config.real_vocab_size
+                        ].contiguous().float()
+                        m_shift_labels = labels[..., offset:].contiguous()
+                        mtp_l = F.cross_entropy(
+                            m_shift_logits.view(-1, self.config.real_vocab_size),
+                            m_shift_labels.view(-1),
+                            ignore_index=-100,
+                        )
                     per_mtp.append(mtp_l)
                     mtp_total = mtp_total + mtp_l
 

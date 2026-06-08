@@ -72,6 +72,19 @@ class OSRTConfig(PretrainedConfig):
         # the exact F.scaled_dot_product_attention path (bit-identical to before).
         attention_sink: bool = False,
 
+        # How the attention sink is computed (only relevant when
+        # attention_sink=True) — review item B1:
+        #   "manual" — historical path; materialises the full (B, H, S, total_len)
+        #              fp32 score matrix and rescales by sigmoid(lse - sink).
+        #              Correct everywhere, but no flash → O(S·total_len) memory.
+        #   "flex"   — torch.flex_attention(return_lse=True) computes out + lse in
+        #              a fused kernel (flash-class memory under torch.compile on
+        #              CUDA), then the SAME sigmoid(lse - sink) rescale is applied.
+        #              Numerically equivalent to "manual" (see tests). Eager/CPU
+        #              still materialises internally, so the memory win only lands
+        #              on a compiled GPU run.
+        attention_sink_impl: str = "manual",
+
         # --- MoE (v5 architecture) ---
         # No dense FFN. Shared expert replaces it at larger hidden size.
         # 8 routed experts × hidden 2048, top-2 (Mixtral-style).
@@ -158,6 +171,18 @@ class OSRTConfig(PretrainedConfig):
         # Head k = 1..mtp_heads predicts the token at offset +(1+k).
         mtp_heads: int = 0,
         mtp_loss_weight: float = 0.3,
+
+        # --- Fused (chunked) linear-cross-entropy for aux/MTP heads (review B2) ---
+        # The per-loop aux heads and MTP heads each project the hidden state to
+        # the full vocab and upcast to fp32 for CE. At long context these
+        # (B, S, vocab) fp32 logit tensors dominate activation memory. When
+        # fused_cross_entropy_chunks > 0 those head losses are computed by
+        # osrt.fused_ce.fused_linear_cross_entropy, which materialises only
+        # ~1/n_chunks of the logits at a time (gradient-checkpointed) — same loss
+        # and gradients (tests/test_fused_ce.py), much lower peak memory.
+        # 0 = OFF (default; bit-identical to the historical F.linear+CE path).
+        # The main +1 LM head is unaffected (its logits are returned anyway).
+        fused_cross_entropy_chunks: int = 0,
 
         # --- Loop dropout (stochastic depth for recursive loops) ---
         # With probability loop_dropout_prob during training, truncate
@@ -288,6 +313,7 @@ class OSRTConfig(PretrainedConfig):
         self.mhc_sinkhorn_iters = mhc_sinkhorn_iters
         self.swiglu_clamp = swiglu_clamp
         self.attention_sink = attention_sink
+        self.attention_sink_impl = attention_sink_impl
 
         self.num_routed_experts = num_routed_experts
         self.top_k_experts = top_k_experts
@@ -301,6 +327,7 @@ class OSRTConfig(PretrainedConfig):
         self.per_loop_aux_weights = per_loop_aux_weights
         self.mtp_heads = mtp_heads
         self.mtp_loss_weight = mtp_loss_weight
+        self.fused_cross_entropy_chunks = fused_cross_entropy_chunks
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
         self.router_balance_bias_enabled = router_balance_bias_enabled
@@ -441,6 +468,11 @@ class OSRTConfig(PretrainedConfig):
                 f"router_affinity must be 'softmax' or 'sqrt_softplus', got "
                 f"{self.router_affinity!r}"
             )
+        if self.attention_sink_impl not in ("manual", "flex"):
+            raise ValueError(
+                f"attention_sink_impl must be 'manual' or 'flex', got "
+                f"{self.attention_sink_impl!r}"
+            )
         if self.mtp_heads < 0:
             raise ValueError(
                 f"mtp_heads must be >= 0, got {self.mtp_heads}"
@@ -448,6 +480,11 @@ class OSRTConfig(PretrainedConfig):
         if self.mtp_loss_weight < 0:
             raise ValueError(
                 f"mtp_loss_weight must be >= 0, got {self.mtp_loss_weight}"
+            )
+        if self.fused_cross_entropy_chunks < 0:
+            raise ValueError(
+                f"fused_cross_entropy_chunks must be >= 0, got "
+                f"{self.fused_cross_entropy_chunks}"
             )
         if self.spec_draft_loops < 1:
             raise ValueError(
