@@ -984,6 +984,19 @@ def run_training(
         # effective batch instead of reading only the last micro-batch.
         moe_snapshots: list[dict[str, float]] = []
 
+        # Hoist the "do we need MoE telemetry this step?" decision out of
+        # the micro-batch loop. _collect_moe_metrics does several .item()
+        # CPU-GPU syncs per call; skipping it on non-logging steps saves
+        # 18 (blocks × loops) × grad_accum syncs per skipped step
+        # (review/performance-loop-audit P1).
+        should_log_this_step = (
+            step % train_cfg.log_interval == 0
+            or step == 0
+            or (step < 100 and step % 10 == 0)
+        )
+        is_early_stop_step = step == train_cfg.early_stop_check_step
+        collect_moe_this_step = should_log_this_step or is_early_stop_step
+
         if step == start_step:
             print("Fetching first batch...")
             batch_t = time.time()
@@ -1028,11 +1041,13 @@ def run_training(
                     inner.last_balance_loss_normalised.detach() / grad_accum
                 )
 
-            # Snapshot per-micro-batch MoE telemetry. Cheap — the last_*
-            # lists are already Python floats, and reading moe_gate/
-            # balance_loss involves a handful of .item() CPU syncs.
-            micro_metrics, _ = _collect_moe_metrics(model)
-            moe_snapshots.append(micro_metrics)
+            # Snapshot per-micro-batch MoE telemetry, but ONLY when this
+            # step will actually consume it (logging or the early-stop
+            # gate). On non-logging steps the snapshot is pure overhead:
+            # each call does .item() reads that force CPU-GPU sync.
+            if collect_moe_this_step:
+                micro_metrics, _ = _collect_moe_metrics(model)
+                moe_snapshots.append(micro_metrics)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         optimizer.step()
@@ -1040,14 +1055,15 @@ def run_training(
 
         # Average snapshots once per step. Used for both logging and the
         # early-stop gate so both see the same grad-accum-averaged values.
-        moe_metrics, moe_summary = _average_moe_snapshots(moe_snapshots)
+        # Empty list on non-logging steps → empty dicts; downstream gates
+        # never consume moe_metrics/moe_summary on those steps.
+        if collect_moe_this_step:
+            moe_metrics, moe_summary = _average_moe_snapshots(moe_snapshots)
+        else:
+            moe_metrics, moe_summary = {}, {}
 
         # --- Logging ---
-        should_log = (
-            step % train_cfg.log_interval == 0
-            or step == 0
-            or (step < 100 and step % 10 == 0)
-        )
+        should_log = should_log_this_step
         if should_log:
             elapsed = time.time() - start_time
             vram_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -1589,6 +1605,17 @@ def run_pretrain_extend(
 
         optimizer.zero_grad(set_to_none=True)
 
+        # Hoist log decision out of the micro-batch loop so we can skip
+        # the .item()-heavy _collect_moe_metrics on non-logging steps
+        # (review/performance-loop-audit P1). Extend has no early-stop
+        # gate, so the only consumer of moe_metrics/moe_summary is the
+        # logging block.
+        extend_should_log = (
+            step % extend_cfg.log_interval == 0
+            or step == 0
+            or (step < 100 and step % 10 == 0)
+        )
+
         accum_task_loss = torch.tensor(0.0, device=device)
         accum_balance_norm = torch.tensor(0.0, device=device)
         moe_snapshots: list[dict[str, float]] = []
@@ -1650,8 +1677,9 @@ def run_pretrain_extend(
                 accum_balance_norm += (
                     inner.last_balance_loss_normalised.detach() / grad_accum
                 )
-            micro_metrics, _ = _collect_moe_metrics(model)
-            moe_snapshots.append(micro_metrics)
+            if extend_should_log:
+                micro_metrics, _ = _collect_moe_metrics(model)
+                moe_snapshots.append(micro_metrics)
 
         torch.nn.utils.clip_grad_norm_(
             model.parameters(), extend_cfg.grad_clip,
@@ -1659,14 +1687,13 @@ def run_pretrain_extend(
         optimizer.step()
         apply_router_balance_updates(model)
 
-        moe_metrics, moe_summary = _average_moe_snapshots(moe_snapshots)
+        if extend_should_log:
+            moe_metrics, moe_summary = _average_moe_snapshots(moe_snapshots)
+        else:
+            moe_metrics, moe_summary = {}, {}
 
         # ── Logging ────────────────────────────────────────────────
-        should_log = (
-            step % extend_cfg.log_interval == 0
-            or step == 0
-            or (step < 100 and step % 10 == 0)
-        )
+        should_log = extend_should_log
         if should_log:
             elapsed = time.time() - start_time
             vram_gb = torch.cuda.max_memory_allocated() / 1e9

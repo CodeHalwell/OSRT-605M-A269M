@@ -2938,17 +2938,24 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 )
 
             # Truncate at first EOS / stop token in completion region.
-            stop_set = {tok.eos_token_id, *cfg.stop_token_ids}
+            # Vectorised membership test — earlier impl did per-token .item()
+            # inside a Python comprehension which forced one CPU-GPU sync
+            # per generated token (review/performance-loop-audit P3).
+            stop_ids_t = torch.tensor(
+                [tok.eos_token_id, *cfg.stop_token_ids],
+                device=generated_batch.device,
+                dtype=generated_batch.dtype,
+            )
             completions = []
             for row in generated_batch:
                 comp_region = row[prompt_len:]
-                stop_hits = torch.tensor(
-                    [t.item() in stop_set for t in comp_region],
-                    device=row.device,
-                )
+                # (S, N_stop) → any-over-N → (S,) bool mask, all on-device.
+                stop_hits = (
+                    comp_region[:, None] == stop_ids_t[None, :]
+                ).any(dim=1)
                 hit_pos = stop_hits.nonzero(as_tuple=False)
                 if hit_pos.numel() > 0:
-                    first = int(hit_pos[0].item())
+                    first = int(hit_pos[0].item())  # one sync for the cut idx
                     completions.append(row[: prompt_len + first + 1])
                 else:
                     completions.append(row)
