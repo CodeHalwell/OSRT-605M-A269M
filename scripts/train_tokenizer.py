@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a custom 32K BPE tokenizer for NanoOSRT.
+"""Train a custom 32K BPE tokenizer for OSRT.
 
 Default uses HuggingFace byte-level BPE. Optionally falls through to
 SuperBPE (COLM 2025) if the 'superbpe' package is installed for the
@@ -354,7 +354,7 @@ def _create_hf_tokenizer_config(output_dir: str, special_tokens: list[str]) -> N
 
     # tokenizer_config.json
     config = {
-        "model_type": "nano-osrt",
+        "model_type": "osrt",
         "tokenizer_class": "PreTrainedTokenizerFast",
         "bos_token": "<|begin_of_text|>",
         "eos_token": "<|end_of_text|>",
@@ -423,7 +423,7 @@ def _verify_tokenizer(output_dir: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train custom 64K tokenizer for NanoOSRT"
+        description="Train custom 64K tokenizer for OSRT"
     )
     parser.add_argument(
         "--vocab-size",
@@ -451,7 +451,7 @@ def main():
     )
     args = parser.parse_args()
 
-    print("NanoOSRT — Custom Tokenizer Training")
+    print("OSRT — Custom Tokenizer Training")
     print("=" * 50)
 
     # Get training data

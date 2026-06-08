@@ -1,7 +1,7 @@
 [project]
-name = "nano-osrt"
-version = "0.5.0"
-description = "Recursive Mixtral-style MoE transformer (~363M physical params, ~192M active)"
+name = "osrt"
+version = "0.6.0"
+description = "OSRT — Optimized Sparse Recursive Transformer: recursive sparse-MoE LM (~608M physical / ~279M active)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -37,7 +37,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/nano_osrt"]
+packages = ["src/osrt"]
 
 [tool.ruff]
 line-length = 88
