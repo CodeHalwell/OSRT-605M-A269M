@@ -3,9 +3,16 @@
 Replaces the hand-derived tables in README.md / ARCHITECTURE.md with numbers
 generated from the real model on a meta device (no memory allocated).
 
+IMPORTANT: by default this reports the canonical preset OSRT_605M_A288M, which
+is the config that actually trains. Do NOT trust loose CLI overrides to
+reproduce the preset — the CLI only exposes a handful of knobs and everything
+else falls back to OSRTConfig defaults (e.g. num_kv_heads=None => MHA, not the
+preset's GQA-8, and mtp_heads=0). A partial override silently builds a
+different model. Prefer the default (whole preset) run.
+
 Usage:
-    PYTHONPATH=src python scripts/compute_budget.py                 # default cfg
-    PYTHONPATH=src python scripts/compute_budget.py --solve 605e6   # widen experts to hit a target
+    PYTHONPATH=src python scripts/compute_budget.py                 # canonical preset (default)
+    PYTHONPATH=src python scripts/compute_budget.py --solve 600e6   # widen experts to hit a target
 """
 
 from __future__ import annotations
@@ -16,16 +23,19 @@ import torch
 
 from osrt.config import OSRTConfig
 from osrt.model import OSRTForCausalLM
+from osrt.presets import OSRT_605M_A288M
 
-# Map a parameter name to a budget category.
+# Map a parameter name to a budget category. Ordered: first match wins.
 _CATEGORIES = [
-    ("embedding", lambda n: "embedding" in n),
+    ("embedding", lambda n: "embedding" in n or "lm_head" in n),
     ("attention", lambda n: any(k in n for k in ("q_proj", "kv_down", "v_from_k", "out_proj", "norm_q", "norm_k", "norm_attn"))),
+    ("mhc", lambda n: "mhc" in n),
     ("shared_expert", lambda n: "shared_expert" in n),
-    ("routed_experts", lambda n: ".moe.experts." in n),
+    ("routed_experts", lambda n: ".experts." in n),
     ("router", lambda n: "router" in n or "moe_gate" in n),
-    ("adapters", lambda n: "adapters_" in n),
-    ("loop_emb", lambda n: "loop_embeddings" in n),
+    ("adapters", lambda n: "adapter" in n),
+    ("mtp_heads", lambda n: "mtp" in n),
+    ("loop_emb", lambda n: "loop_emb" in n),
     ("norms_misc", lambda n: True),  # catch-all
 ]
 
@@ -49,13 +59,19 @@ def budget(cfg: OSRTConfig) -> dict[str, int]:
 
 
 def active_per_token(cats: dict[str, int], cfg: OSRTConfig) -> int:
-    """Active params per token: routed experts scaled by top_k / num_routed,
-    everything else fully active (embedding counted full: LM head touches the
-    whole matrix)."""
+    """Active params per token at INFERENCE: routed experts scaled by
+    top_k / num_routed; MTP heads excluded (training-time only, dropped at
+    deploy); everything else fully active (embedding counted full because the
+    tied LM head touches the whole matrix)."""
     sparse_frac = cfg.top_k_experts / cfg.num_routed_experts
     active = 0
     for cat, n in cats.items():
-        active += int(n * sparse_frac) if cat == "routed_experts" else n
+        if cat == "routed_experts":
+            active += int(n * sparse_frac)
+        elif cat == "mtp_heads":
+            continue  # training-only, not part of the inference forward
+        else:
+            active += n
     return active
 
 
@@ -65,19 +81,21 @@ def report(cfg: OSRTConfig) -> tuple[int, int]:
     active = active_per_token(cats, cfg)
     print(
         f"cfg: dim={cfg.dim} vocab={cfg.vocab_size} blocks={cfg.num_blocks} "
-        f"loops={cfg.recursive_loops} experts={cfg.num_routed_experts} "
-        f"top_k={cfg.top_k_experts} h_routed={cfg.expert_hidden} "
-        f"h_shared={cfg.shared_expert_hidden} rank={cfg.adapter_rank}"
+        f"loops={cfg.recursive_loops} kv_heads={cfg.num_kv_heads} "
+        f"experts={cfg.num_routed_experts} top_k={cfg.top_k_experts} "
+        f"h_routed={cfg.expert_hidden} h_shared={cfg.shared_expert_hidden} "
+        f"rank={cfg.adapter_rank} mtp={cfg.mtp_heads} mhc={cfg.use_mhc}"
     )
     print("-" * 64)
-    for cat in ("embedding", "attention", "shared_expert", "routed_experts",
-                "router", "adapters", "loop_emb", "norms_misc"):
+    for cat in ("embedding", "attention", "mhc", "shared_expert",
+                "routed_experts", "router", "adapters", "mtp_heads",
+                "loop_emb", "norms_misc"):
         if cat in cats:
             print(f"  {cat:<16} {cats[cat]:>14,}")
     print("-" * 64)
     print(f"  {'TOTAL PHYSICAL':<16} {total:>14,}  (~{total/1e6:.0f}M)")
     print(f"  {'ACTIVE / TOKEN':<16} {active:>14,}  (~{active/1e6:.0f}M, "
-          f"{100*active/total:.1f}% of physical)")
+          f"{100*active/total:.1f}% of physical, inference — excl. MTP)")
     return total, active
 
 
@@ -96,18 +114,30 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--solve", type=float, default=None,
                     help="target physical params; widens expert_hidden to hit it")
-    ap.add_argument("--vocab", type=int, default=65536)
-    ap.add_argument("--experts", type=int, default=8)
-    ap.add_argument("--h-shared", type=int, default=4608)
-    ap.add_argument("--h-routed", type=int, default=2048)
-    ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument(
+        "--override", nargs="*", default=[],
+        help="key=value overrides on top of the canonical preset, e.g. "
+             "--override expert_hidden=4096 num_routed_experts=12. Use with "
+             "care: the preset is the config that actually trains.",
+    )
     args = ap.parse_args()
 
-    base = OSRTConfig(
-        vocab_size=args.vocab, real_vocab_size=args.vocab,
-        num_routed_experts=args.experts, shared_expert_hidden=args.h_shared,
-        expert_hidden=args.h_routed, adapter_rank=args.rank,
-    )
+    # Start from the REAL canonical preset, not loose defaults. This is the
+    # config that trains; reporting anything else silently misleads (the
+    # old CLI fell back to MHA + no-MTP defaults and over-reported by ~6M).
+    preset = dict(OSRT_605M_A288M)
+    for kv in args.override:
+        k, _, v = kv.partition("=")
+        # int-ify where possible, else leave as string/bool
+        if v.lower() in ("true", "false"):
+            preset[k] = v.lower() == "true"
+        else:
+            try:
+                preset[k] = int(v)
+            except ValueError:
+                preset[k] = v
+    base = OSRTConfig(**preset)
+
     if args.solve:
         h = solve_expert_hidden(int(args.solve), base)
         print(f"=> expert_hidden={h} hits target {args.solve:.0f}\n")

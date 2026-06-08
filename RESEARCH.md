@@ -421,7 +421,7 @@ tying across depth" + "iteration-specific conditioning" pattern.
 
 ### What we rejected
 
-- **128 experts top-8** — too fine-grained at 600M; we use 12 experts
+- **128 experts top-8** — too fine-grained at 600M; we use 8 experts
   top-2
 - **151K vocab** — too expensive at 600M (would be 200M+ embedding)
 - **Drop shared experts** — DeepSeekMoE argument for shared experts
@@ -455,10 +455,12 @@ Specific results:
 
 ### What we adopted
 
-- **Shared + routed expert hybrid** (1 shared + 12 routed top-2 in
+- **Shared + routed expert hybrid** (1 shared + 8 routed top-2 in
   our 600M)
-- **DeepSeekMoE-style fine granularity** but stopped at 12 experts
-  (vs their 64 / Qwen3's 128) — appropriate for 600M scale
+- **DeepSeekMoE-style fine granularity** but stopped at 8 experts
+  (vs their 64 / Qwen3's 128) — at 600M, denser top-2-of-8 routing
+  (25% active) beats finer top-2-of-12; the "many tiny experts"
+  thesis pays off at 16B+, not here
 - **Small aux loss coefficient** (we'll use aux-loss-free per V3
   instead)
 
