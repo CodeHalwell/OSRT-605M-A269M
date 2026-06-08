@@ -230,6 +230,22 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
         accum_loss = torch.tensor(0.0, device=device)
         accum_trained_tokens = 0
 
+        # Gate the .item()/.tolist() MoE telemetry inside model forward
+        # so non-logging steps skip ~21 syncs × 18 MoE applications per
+        # micro-batch. The sft logging block reads block.moe.last_*
+        # under `if should_log:` (line ~298), so disabling on non-log
+        # steps is consumer-safe.
+        sft_should_log = (
+            step % sft_cfg.log_interval == 0
+            or step == 0
+            or (step < 50 and step % 5 == 0)
+        )
+        inner_for_telemetry = (
+            model._orig_mod if hasattr(model, "_orig_mod") else model
+        )
+        if hasattr(inner_for_telemetry, "set_moe_telemetry"):
+            inner_for_telemetry.set_moe_telemetry(sft_should_log)
+
         for _micro in range(sft_cfg.grad_accum_steps):
             try:
                 input_ids, labels = next(loader_iter)

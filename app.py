@@ -2170,17 +2170,18 @@ def grpo():
             # rectangular. Truncate each row to its first EOS in the
             # completion region (inclusive) so downstream scoring and
             # policy log-prob computation don't see the EOS padding.
+            comp_region_batch = generated_batch[:, prompt_len:]
+            eos_hits_2d = (comp_region_batch == tok.eos_token_id)
+            indices = torch.arange(eos_hits_2d.shape[1], device=generated_batch.device)
+            masked_indices = torch.where(eos_hits_2d, indices, eos_hits_2d.shape[1])
+            first_eos_indices = masked_indices.min(dim=1).values.tolist()
+
             completions = []
-            for row in generated_batch:
-                comp_region = row[prompt_len:]
-                eos_hits = (
-                    comp_region == tok.eos_token_id
-                ).nonzero(as_tuple=False)
-                if eos_hits.numel() > 0:
-                    first_eos = int(eos_hits[0].item())
-                    completions.append(row[: prompt_len + first_eos + 1])
+            for row_idx, first_eos in enumerate(first_eos_indices):
+                if first_eos < eos_hits_2d.shape[1]:
+                    completions.append(generated_batch[row_idx, : prompt_len + first_eos + 1])
                 else:
-                    completions.append(row)
+                    completions.append(generated_batch[row_idx])
 
             # Score — IMPORTANT: skip_special_tokens=False so native tags
             # like <|think|>, <|answer|> survive decoding for the reward
@@ -2946,19 +2947,18 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 device=generated_batch.device,
                 dtype=generated_batch.dtype,
             )
+            comp_region_batch = generated_batch[:, prompt_len:]
+            stop_hits_2d = (comp_region_batch[:, :, None] == stop_ids_t[None, None, :]).any(dim=2)
+            indices = torch.arange(stop_hits_2d.shape[1], device=generated_batch.device)
+            masked_indices = torch.where(stop_hits_2d, indices, stop_hits_2d.shape[1])
+            first_hit_indices = masked_indices.min(dim=1).values.tolist()
+
             completions = []
-            for row in generated_batch:
-                comp_region = row[prompt_len:]
-                # (S, N_stop) → any-over-N → (S,) bool mask, all on-device.
-                stop_hits = (
-                    comp_region[:, None] == stop_ids_t[None, :]
-                ).any(dim=1)
-                hit_pos = stop_hits.nonzero(as_tuple=False)
-                if hit_pos.numel() > 0:
-                    first = int(hit_pos[0].item())  # one sync for the cut idx
-                    completions.append(row[: prompt_len + first + 1])
+            for row_idx, first_hit in enumerate(first_hit_indices):
+                if first_hit < stop_hits_2d.shape[1]:
+                    completions.append(generated_batch[row_idx, : prompt_len + first_hit + 1])
                 else:
-                    completions.append(row)
+                    completions.append(generated_batch[row_idx])
 
             # Score each completion using env-aware reward dispatcher.
             rewards: list[float] = []

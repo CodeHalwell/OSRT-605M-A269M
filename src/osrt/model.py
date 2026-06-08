@@ -259,6 +259,16 @@ class MoELayer(nn.Module):
         )
         self.balance_accum_enabled = True
 
+        # When False, MoELayer.forward skips the ~21 .item()/.tolist()
+        # calls in the telemetry block (one per stat × multiple stats).
+        # On CUDA each .item() forces synchronisation; with 18 effective
+        # MoE applications per forward this adds up. The training loop
+        # flips this off on non-logging steps via
+        # OSRTForCausalLM.set_moe_telemetry(False). Default True so
+        # downstream consumers (sft_train, monitoring, test_monitoring)
+        # keep working without explicit opt-in.
+        self.telemetry_enabled: bool = True
+
         # NOTE: orthogonal expert init is NOT applied here because HF's
         # post_init() walks the module tree and calls _init_weights on every
         # nn.Linear, which would stomp the orthogonal weights. Apply via
@@ -734,6 +744,16 @@ class MoELayer(nn.Module):
         #     uniform top-2 router showed max_prob = 0.5 not 1/E. Report raw.
         #   - Add top_margin = raw top-1 prob - raw top-2 prob, which
         #     directly measures router confidence in its primary pick.
+        # Telemetry block — gated so non-logging training steps skip
+        # the ~21 .item()/.tolist() CUDA syncs per MoE forward. The
+        # training loop sets self.telemetry_enabled = False on
+        # non-logging steps via OSRTForCausalLM.set_moe_telemetry().
+        # When skipped, the self.last_* attributes retain the values
+        # from the previous logging step — that's safe because
+        # consumers (_collect_moe_metrics, sft_train MoE telemetry
+        # block) only read them on logging steps too.
+        if not self.telemetry_enabled:
+            return shared_out, moe_out
         with torch.no_grad():
             # Per-token entropy — the real sharpness metric. Uniform per-token
             # softmax => ln(E). Sharp routing => much lower. Average over tokens.
@@ -1521,6 +1541,23 @@ class OSRTModel(OSRTPreTrainedModel):
             presents,
         )
 
+    def set_moe_telemetry(self, enabled: bool) -> None:
+        """Toggle per-MoE-layer telemetry calculation in forward.
+
+        When disabled, each MoELayer skips its ~21 .item()/.tolist()
+        calls — one CUDA sync each on GPU. The training loops set this
+        to False on non-logging steps so MoE diagnostics are only paid
+        for when actually consumed.
+
+        Consumers (`_collect_moe_metrics`, sft_train's MoE block,
+        `monitoring.moe_health`) read the `block.moe.last_*` lists; on
+        disabled steps these retain the previous-step values, but no
+        consumer reads them on those steps (all reads are inside
+        `if should_log:` guards).
+        """
+        for blk in self.blocks:
+            blk.moe.telemetry_enabled = enabled
+
 
 class OSRTForCausalLM(OSRTPreTrainedModel):
     """OSRT with causal LM head. HF-compatible.
@@ -1571,6 +1608,10 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # detached per-head raw CE values (length == config.mtp_heads).
         self.last_mtp_loss: Tensor | None = None
         self.last_mtp_losses: list[Tensor] = []
+
+    def set_moe_telemetry(self, enabled: bool) -> None:
+        """Delegate to OSRTModel.set_moe_telemetry — see docstring there."""
+        self.model.set_moe_telemetry(enabled)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embedding
@@ -1873,6 +1914,11 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         out = self.forward(context, use_cache=True, num_loops=num_loops)
         past_key_values = cast("PastKV | None", out.past_key_values)
 
+        # Precompute stop tensor if any
+        stop_tensor = None
+        if stop_token_ids:
+            stop_tensor = torch.tensor(list(stop_token_ids), device=input_ids.device)
+
         # Per-row finished mask. A row is "finished" once it has ever
         # emitted eos_token_id on any decode step. Once finished, we
         # overwrite its next-token with EOS so downstream callers can
@@ -1885,12 +1931,26 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         logits_last = (
             logits_tensor[:, -1, :self.config.real_vocab_size].float()
         )
-        generated = input_ids.clone()
+        # Preallocate the output buffer instead of repeatedly torch.cat-ing
+        # a 1-token column onto a growing tensor. The old pattern paid
+        # O(prompt + step) memory bandwidth on EVERY decode step. With a
+        # 400-token rollout that's ~80,000 copied positions vs the new
+        # cost of one preallocation + in-place writes. Cursor tracks the
+        # next-write position; we slice generated[:, :cursor] for
+        # repetition-penalty / return so the unwritten tail (zero-filled)
+        # never leaks into observable output.
+        total_len = input_ids.shape[1] + max_new_tokens
+        generated = torch.zeros(
+            batch_size, total_len,
+            dtype=input_ids.dtype, device=input_ids.device,
+        )
+        generated[:, :input_ids.shape[1]] = input_ids
+        cursor = input_ids.shape[1]
 
         for step_idx in range(max_new_tokens):
             if step_idx > 0:
                 # Decode: pass only the newest token + existing cache.
-                new_tok = generated[:, -1:]
+                new_tok = generated[:, cursor - 1:cursor]
                 # Don't trim past_key_values when the cache exceeds
                 # max_position_embeddings — left-truncating the cache
                 # shifts the absolute RoPE indices that the forward
@@ -1927,9 +1987,11 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             # original "apply once per unique id" loop.
             if repetition_penalty != 1.0:
                 vocab = logits_last.shape[-1]
-                # Mask out-of-vocab tokens so gather doesn't touch them.
-                gen_clamped = generated.clamp(max=vocab - 1)
-                in_vocab = (generated < vocab)
+                # Slice to the actually-written portion — the preallocated
+                # tail (zeros) would otherwise penalise token 0 every step.
+                already = generated[:, :cursor]
+                gen_clamped = already.clamp(max=vocab - 1)
+                in_vocab = (already < vocab)
                 score = torch.gather(logits_last, 1, gen_clamped)
                 penalised = torch.where(
                     score > 0,
@@ -1940,6 +2002,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                 # original score back (no-op) so scatter doesn't corrupt
                 # in-vocab logits with garbage from clamped indices.
                 penalised = torch.where(in_vocab, penalised, score)
+                logits_last = logits_last.clone()
                 logits_last.scatter_(1, gen_clamped, penalised)
 
             if temperature > 0:
@@ -1968,14 +2031,18 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             # Force already-finished rows to keep emitting EOS so the
             # tensor stays rectangular, their completion is stable, and
             # we stop polluting them with extra tokens.
-            if eos_token_id is not None and finished.any():
+            if eos_token_id is not None:
                 next_token = torch.where(
                     finished.unsqueeze(-1),
                     torch.full_like(next_token, eos_token_id),
                     next_token,
                 )
 
-            generated = torch.cat([generated, next_token], dim=1)
+            # In-place write into the preallocated buffer (no growing
+            # tensor copy). next_token is (B, 1); generated[:, c:c+1] is
+            # the matching slice — copy_ keeps the dtype/layout sane.
+            generated[:, cursor:cursor + 1].copy_(next_token)
+            cursor += 1
 
             # Per-row termination. A row is finished once it has EVER
             # emitted EOS or any stop_token_id — we track that in
@@ -1983,7 +2050,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             # some point, not only when all rows happen to emit a stop
             # token on the same step.
             #
-            # stop_token_ids lets callers stop on chat-template markers
+            # stop_token_ids/stop_tensor lets callers stop on chat-template markers
             # like <|/answer|> (token 10) or <|user|> (token 11). Useful
             # because MOPD-distilled models often generate additional
             # answer blocks after the first one or try to start a new
@@ -1991,13 +2058,14 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             nt = next_token.squeeze(-1)
             if eos_token_id is not None:
                 finished = finished | (nt == eos_token_id)
-            if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
-            if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
+            if stop_tensor is not None:
+                finished = finished | torch.isin(nt, stop_tensor)
+            if (eos_token_id is not None or stop_tensor is not None) and bool(finished.all()):
                 break
 
-        return generated
+        # Slice to actually-written length so the preallocated tail
+        # (zeros) never leaks into callers.
+        return generated[:, :cursor]
 
     @torch.no_grad()
     def _generate_speculative(
@@ -2078,6 +2146,11 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         batch_size = context.shape[0]
         device = context.device
         D = spec_draft_tokens
+
+        # Precompute stop tensor if any
+        stop_tensor = None
+        if stop_token_ids:
+            stop_tensor = torch.tensor(list(stop_token_ids), device=device)
 
         def _greedy(logits_row: Tensor, gen: Tensor) -> Tensor:
             """Greedy next-token from a (B, vocab) logit row, with the same
@@ -2168,24 +2241,23 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             v_logits = cast(Tensor, vv.logits)  # (B, D+1, vocab)
 
             # verify_preds[:, i] verifies drafts[:, i]; bonus is the D-th.
-            verify_preds_list = []
-            running = generated
-            for i in range(D + 1):
-                vt = _greedy(v_logits[:, i, :], running)
-                verify_preds_list.append(vt)
-                running = torch.cat([running, vt], dim=1)
-            verify_preds = torch.cat(verify_preds_list, dim=1)  # (B, D+1)
+            if repetition_penalty == 1.0:
+                verify_preds = v_logits[:, :D + 1, :self.config.real_vocab_size].float().argmax(dim=-1)
+            else:
+                verify_preds_list = []
+                running = generated
+                for i in range(D + 1):
+                    vt = _greedy(v_logits[:, i, :], running)
+                    verify_preds_list.append(vt)
+                    running = torch.cat([running, vt], dim=1)
+                verify_preds = torch.cat(verify_preds_list, dim=1)  # (B, D+1)
 
             # ── 3. COMMIT longest greedy-matching prefix + 1 correction ──
             # accept = number of leading positions where the draft matches the
             # verifier across ALL rows (conservative but correct for B > 1).
             all_match = (drafts == verify_preds[:, :D]).all(dim=0)  # (D,)
-            accept = 0
-            for i in range(D):
-                if bool(all_match[i]):
-                    accept += 1
-                else:
-                    break
+            mismatches = (~all_match).nonzero(as_tuple=True)[0]
+            accept = int(mismatches[0].item()) if mismatches.numel() > 0 else D
 
             new_cols: list[Tensor] = [drafts[:, i:i + 1] for i in range(accept)]
             # On a mismatch emit the verifier's correction at slot `accept`; on
@@ -2193,14 +2265,27 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             # straight from verify_preds (which has D + 1 columns).
             new_cols.append(verify_preds[:, accept:accept + 1])
 
+            # Slice to budget limits
+            limit = max_new_tokens - produced
+            if len(new_cols) > limit:
+                new_cols = new_cols[:limit]
+
             # Mask finished rows so they keep emitting EOS (rectangular tensor).
-            if eos_token_id is not None and bool(finished.any()):
-                for j, col in enumerate(new_cols):
-                    new_cols[j] = torch.where(
-                        finished.unsqueeze(-1),
-                        torch.full_like(col, eos_token_id),
-                        col,
-                    )
+            masked_cols = []
+            for col in new_cols:
+                if eos_token_id is not None:
+                    col = torch.where(finished.unsqueeze(-1), torch.full_like(col, eos_token_id), col)
+                masked_cols.append(col)
+
+                t = col.squeeze(-1)
+                if eos_token_id is not None:
+                    finished = finished | (t == eos_token_id)
+                if stop_tensor is not None:
+                    finished = finished | torch.isin(t, stop_tensor)
+
+            if masked_cols:
+                generated = torch.cat([generated, *masked_cols], dim=1)
+                produced += len(masked_cols)
 
             # Re-establish the cache invariant by truncation alone (no extra
             # forward needed). Both forwards fed inputs through sequence
@@ -2220,22 +2305,6 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             verify_past = _trunc(verify_past_full, keep)
             draft_past = _trunc(draft_past, min(keep, cache_len + D))
 
-            # Append committed tokens, advance counters / finished mask, and
-            # respect the budget (a full-accept round emits D + 1 tokens).
-            stop_round = False
-            for col in new_cols:
-                generated = torch.cat([generated, col], dim=1)
-                produced += 1
-                t = col.squeeze(-1)
-                if eos_token_id is not None:
-                    finished = finished | (t == eos_token_id)
-                if stop_token_ids:
-                    for sid in stop_token_ids:
-                        finished = finished | (t == sid)
-                if produced >= max_new_tokens:
-                    stop_round = True
-                    break
-
             # The verify cache is now correct up to `keep`. Bring the draft
             # cache to the same length when a full accept left it one short
             # (draft_{D-1} was never fed as a draft input). cache_len becomes
@@ -2253,10 +2322,10 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                 draft_past = cast("PastKV | None", de.past_key_values)
             cache_len = keep
 
-            if stop_round:
+            if produced >= max_new_tokens:
                 break
             if (
-                (eos_token_id is not None or stop_token_ids)
+                (eos_token_id is not None or stop_tensor is not None)
                 and bool(finished.all())
             ):
                 break

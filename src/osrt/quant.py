@@ -35,6 +35,7 @@ channel and nothing matrix-sized is stored.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 
@@ -73,17 +74,9 @@ def _hadamard_matrix(n: int, device, dtype) -> Tensor:
     return h / math.sqrt(n)
 
 
-def make_rotation(dim: int, seed: int, device=None, dtype=torch.float32) -> Tensor:
-    """Build a fixed, seeded orthogonal rotation matrix of shape (dim, dim).
-
-    Power-of-two dim: a randomized Hadamard rotation — a normalized Sylvester
-    Hadamard matrix with a random ±1 diagonal sign flip (the standard cheap
-    random rotation; the signs are what randomize it so a fixed Hadamard
-    doesn't align with the data axes). Otherwise: the Q factor of a QR
-    decomposition of a seeded Gaussian, a general random orthogonal matrix.
-    Either way the result R satisfies R @ R.T == I, so the inverse rotation is
-    just R.T — dequantization needs no separately stored inverse.
-    """
+@functools.lru_cache(maxsize=32)
+def _cached_rotation_cpu(dim: int, seed: int) -> Tensor:
+    """CPU-side fixed orthogonal rotation matrix build."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     if _is_pow2(dim):
         h = _hadamard_matrix(dim, device="cpu", dtype=torch.float32)
@@ -95,8 +88,22 @@ def make_rotation(dim: int, seed: int, device=None, dtype=torch.float32) -> Tens
         a = torch.randn((dim, dim), generator=gen, dtype=torch.float32)
         q, _ = torch.linalg.qr(a)
         r = q
-    r = r.to(device=device, dtype=dtype)
     return r
+
+
+def make_rotation(dim: int, seed: int, device=None, dtype=torch.float32) -> Tensor:
+    """Build a fixed, seeded orthogonal rotation matrix of shape (dim, dim).
+
+    Power-of-two dim: a randomized Hadamard rotation — a normalized Sylvester
+    Hadamard matrix with a random ±1 diagonal sign flip (the standard cheap
+    random rotation; the signs are what randomize it so a fixed Hadamard
+    doesn't align with the data axes). Otherwise: the Q factor of a QR
+    decomposition of a seeded Gaussian, a general random orthogonal matrix.
+    Either way the result R satisfies R @ R.T == I, so the inverse rotation is
+    just R.T — dequantization needs no separately stored inverse.
+    """
+    r = _cached_rotation_cpu(dim, seed)
+    return r.to(device=device, dtype=dtype)
 
 
 # ── int4 pack / unpack (optional 2-values-per-byte storage) ─────────────────

@@ -997,6 +997,11 @@ def run_training(
         is_early_stop_step = step == train_cfg.early_stop_check_step
         collect_moe_this_step = should_log_this_step or is_early_stop_step
 
+        # Tell the model whether to bother computing the .item()/.tolist()
+        # MoE telemetry inside its forward. Skipping it saves ~21 syncs ×
+        # 18 effective MoE layers per micro-batch on non-logging steps.
+        inner.set_moe_telemetry(collect_moe_this_step)
+
         if step == start_step:
             print("Fetching first batch...")
             batch_t = time.time()
@@ -1615,6 +1620,11 @@ def run_pretrain_extend(
             or step == 0
             or (step < 100 and step % 10 == 0)
         )
+
+        # Gate the .item()/.tolist() MoE telemetry inside model forward
+        # on whether this step will actually consume it. Extend has no
+        # early-stop gate, so the only consumer is the logging block.
+        inner.set_moe_telemetry(extend_should_log)
 
         accum_task_loss = torch.tensor(0.0, device=device)
         accum_balance_norm = torch.tensor(0.0, device=device)
