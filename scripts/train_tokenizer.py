@@ -73,17 +73,30 @@ def sample_training_data(sample_size: int = 2_000_000_000, seed: int = 42) -> st
         encoding="utf-8",
     )
 
+    # Mix matched to the model's ACTUAL pretraining corpus, not the
+    # "multilingual" marketing. The model is math-first (mid-training is
+    # ~47% math, GRPO is verifiable-math), so the tokenizer MUST see
+    # math-dense text or LaTeX/symbols/numerics tokenize near byte-level
+    # — permanently, since the vocab freezes into the embedding. OpenWebMath
+    # (same source used in pretrain_extend2) supplies that. Multilingual is
+    # deliberately absent because the pretraining corpus is English-only.
     sources = [
         {
             "name": "FineWeb-Edu",
             "hf_id": "HuggingFaceFW/fineweb-edu",
-            "fraction": 0.55,
+            "fraction": 0.45,
+            "text_key": "text",
+        },
+        {
+            "name": "OpenWebMath",
+            "hf_id": "open-web-math/open-web-math",
+            "fraction": 0.20,
             "text_key": "text",
         },
         {
             "name": "CodeParrot Clean",
             "hf_id": "codeparrot/codeparrot-clean",
-            "fraction": 0.30,
+            "fraction": 0.20,
             "text_key": "content",
         },
         {
