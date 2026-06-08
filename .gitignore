@@ -72,3 +72,8 @@ var/
 venv/
 wandb/
 wheels/
+.agents/
+.claude/
+.junie/
+.ruff_cache/
+.son-of-anton/

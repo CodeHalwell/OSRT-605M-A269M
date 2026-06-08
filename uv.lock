@@ -1874,75 +1874,6 @@ wheels = [
 ]
 
 [[package]]
-name = "nano-osrt"
-version = "0.5.0"
-source = { editable = "." }
-dependencies = [
-    { name = "accelerate" },
-    { name = "datasets" },
-    { name = "google-genai" },
-    { name = "gradio" },
-    { name = "immutabledict" },
-    { name = "langdetect" },
-    { name = "lion-pytorch" },
-    { name = "lm-eval" },
-    { name = "modal" },
-    { name = "numpy" },
-    { name = "openai" },
-    { name = "openrouter" },
-    { name = "pandas" },
-    { name = "python-dotenv" },
-    { name = "pyyaml" },
-    { name = "tensorboard" },
-    { name = "tiktoken" },
-    { name = "torch" },
-    { name = "torchvision" },
-    { name = "tqdm" },
-    { name = "transformers" },
-    { name = "wandb" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", specifier = ">=0.28.0" },
-    { name = "datasets", specifier = ">=2.18.0" },
-    { name = "google-genai", specifier = ">=2.8.0" },
-    { name = "gradio", specifier = ">=6.9.0" },
-    { name = "immutabledict", specifier = ">=4.3.1" },
-    { name = "langdetect", specifier = ">=1.0.9" },
-    { name = "lion-pytorch", specifier = ">=0.2.0" },
-    { name = "lm-eval", specifier = ">=0.4.11" },
-    { name = "modal", specifier = ">=1.3.5" },
-    { name = "numpy", specifier = ">=1.26.0" },
-    { name = "openai", specifier = ">=2.41.0" },
-    { name = "openrouter", specifier = ">=0.9.1" },
-    { name = "pandas", specifier = ">=3.0.1" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "pyyaml", specifier = ">=6.0.1" },
-    { name = "tensorboard", specifier = ">=2.16.0" },
-    { name = "tiktoken", specifier = ">=0.6.0" },
-    { name = "torch", specifier = ">=2.2.0" },
-    { name = "torchvision", specifier = ">=0.17.0" },
-    { name = "tqdm", specifier = ">=4.66.0" },
-    { name = "transformers", specifier = ">=4.39.0" },
-    { name = "wandb", specifier = ">=0.25.1" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.1.0" },
-    { name = "pytest-cov", specifier = ">=5.0.0" },
-    { name = "ruff", specifier = ">=0.3.0" },
-]
-
-[[package]]
 name = "networkx"
 version = "3.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2279,6 +2210,75 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1d/d3/f19b47ce16820cc2c480f7f1723e17f6d411b3a295c60c8ad3aa9ff1c96a/orjson-3.11.7-cp314-cp314-win32.whl", hash = "sha256:89e13dd3f89f1c38a9c9eba5fbf7cdc2d1feca82f5f290864b4b7a6aac704576", size = 127997, upload-time = "2026-02-02T15:38:45.06Z" },
     { url = "https://files.pythonhosted.org/packages/12/df/172771902943af54bf661a8d102bdf2e7f932127968080632bda6054b62c/orjson-3.11.7-cp314-cp314-win_amd64.whl", hash = "sha256:845c3e0d8ded9c9271cd79596b9b552448b885b97110f628fb687aee2eed11c1", size = 124985, upload-time = "2026-02-02T15:38:46.388Z" },
     { url = "https://files.pythonhosted.org/packages/6f/1c/f2a8d8a1b17514660a614ce5f7aac74b934e69f5abc2700cc7ced882a009/orjson-3.11.7-cp314-cp314-win_arm64.whl", hash = "sha256:4a2e9c5be347b937a2e0203866f12bba36082e89b402ddb9e927d5822e43088d", size = 126038, upload-time = "2026-02-02T15:38:47.703Z" },
+]
+
+[[package]]
+name = "osrt"
+version = "0.6.0"
+source = { editable = "." }
+dependencies = [
+    { name = "accelerate" },
+    { name = "datasets" },
+    { name = "google-genai" },
+    { name = "gradio" },
+    { name = "immutabledict" },
+    { name = "langdetect" },
+    { name = "lion-pytorch" },
+    { name = "lm-eval" },
+    { name = "modal" },
+    { name = "numpy" },
+    { name = "openai" },
+    { name = "openrouter" },
+    { name = "pandas" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+    { name = "tensorboard" },
+    { name = "tiktoken" },
+    { name = "torch" },
+    { name = "torchvision" },
+    { name = "tqdm" },
+    { name = "transformers" },
+    { name = "wandb" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", specifier = ">=0.28.0" },
+    { name = "datasets", specifier = ">=2.18.0" },
+    { name = "google-genai", specifier = ">=2.8.0" },
+    { name = "gradio", specifier = ">=6.9.0" },
+    { name = "immutabledict", specifier = ">=4.3.1" },
+    { name = "langdetect", specifier = ">=1.0.9" },
+    { name = "lion-pytorch", specifier = ">=0.2.0" },
+    { name = "lm-eval", specifier = ">=0.4.11" },
+    { name = "modal", specifier = ">=1.3.5" },
+    { name = "numpy", specifier = ">=1.26.0" },
+    { name = "openai", specifier = ">=2.41.0" },
+    { name = "openrouter", specifier = ">=0.9.1" },
+    { name = "pandas", specifier = ">=3.0.1" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "pyyaml", specifier = ">=6.0.1" },
+    { name = "tensorboard", specifier = ">=2.16.0" },
+    { name = "tiktoken", specifier = ">=0.6.0" },
+    { name = "torch", specifier = ">=2.2.0" },
+    { name = "torchvision", specifier = ">=0.17.0" },
+    { name = "tqdm", specifier = ">=4.66.0" },
+    { name = "transformers", specifier = ">=4.39.0" },
+    { name = "wandb", specifier = ">=0.25.1" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.1.0" },
+    { name = "pytest-cov", specifier = ">=5.0.0" },
+    { name = "ruff", specifier = ">=0.3.0" },
 ]
 
 [[package]]
