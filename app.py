@@ -137,12 +137,17 @@ def pretrain():
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
-    expected_vocab = 32768
+    expected_vocab = 65536
     if len(tok) != expected_vocab:
         print(f"WARNING: Expected {expected_vocab} vocab but got {len(tok)}!")
         print("  Retrain tokenizer: modal run app_v4.py --stage tokenizer")
 
-    model_config = OSRTConfig(
+    # Build from the canonical OSRT-605M-A279M preset (GQA, attention sink,
+    # MTP, sqrt-softplus routing, the 4032/2816 expert widths, etc.) and only
+    # override the tokenizer-specific fields. A bare OSRTConfig() here would
+    # silently fall back to the old v5 363M shape for the expensive run.
+    from osrt.presets import build_config
+    model_config = build_config(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -152,9 +157,9 @@ def pretrain():
 
     train_cfg = PretrainConfig()
 
-    # Expected budget (measured, see V5_PLAN.md): ~363M total, ~192M active.
-    # Effective compute via 6 recursive loops: ~1.15B FLOPs-equivalent.
-    print("Expected v5 budget: ~363M total, ~192M active per token.")
+    # Target budget (see compute_budget.py): ~604M physical / ~269M active per
+    # token; ~3.6B FLOPs-equivalent via the 6 recursive loops.
+    print("Target budget: ~604M physical / ~269M active per token.")
 
     run_training(model_config, train_cfg, vol, tokenizer_name)
 

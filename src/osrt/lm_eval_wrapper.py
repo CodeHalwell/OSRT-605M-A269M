@@ -387,6 +387,13 @@ class OSRTLMEval(LM):
             ctx_ids = self.tok_encode(
                 self._wrap_context(context, for_generate=False),
             )
+            # lm-eval can pass an empty context (unconditional scoring). The
+            # logit slice below conditions the first continuation token on
+            # position ctx_len-1, so an empty context would index -1 (the
+            # wrong/last position). Seed a single BOS/EOS so ctx_len >= 1 and
+            # the first token has a well-defined conditioning position.
+            if not ctx_ids:
+                ctx_ids = [self.eot_token_id]
             cont_ids = self.tok_encode(continuation)
             # Truncate from the left if context+continuation exceeds
             # max_length. We keep the continuation intact and lop off

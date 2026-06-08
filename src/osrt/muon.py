@@ -158,17 +158,20 @@ class Muon(torch.optim.Optimizer):
                 state = self.state[p]
                 buf = state.get("momentum_buffer")
                 if buf is None:
-                    buf = torch.zeros_like(grad)
+                    buf = torch.zeros_like(grad, dtype=torch.float32)
                     state["momentum_buffer"] = buf
 
                 # SGD momentum buffer update — operate in fp32 so the
                 # buffer doesn't accumulate bf16 roundoff over millions
-                # of steps.
-                buf.mul_(momentum).add_(grad)
-                update = grad.add(buf, alpha=momentum) if nesterov else buf
+                # of steps (torch.zeros_like alone would inherit grad's
+                # dtype, so force fp32 here and on the grad it accumulates).
+                grad_fp32 = grad.to(dtype=torch.float32)
+                buf.mul_(momentum).add_(grad_fp32)
+                update = grad_fp32.add(buf, alpha=momentum) if nesterov else buf
 
-                # Newton-Schulz orthogonalisation of the update.
-                ortho = newton_schulz5(update, steps=ns_steps)
+                # Newton-Schulz orthogonalisation of the update. Cast back
+                # to the parameter dtype before the in-place apply below.
+                ortho = newton_schulz5(update, steps=ns_steps).to(dtype=p.dtype)
 
                 # Shape-aware scale. For fat matrices (rows < cols, e.g.
                 # SwiGLU's w_down) we shrink the update so the per-element

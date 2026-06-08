@@ -111,7 +111,10 @@ def loop_depth_probe(model, input_ids, labels) -> LoopDepth:
     if not was_training:
         model.eval()
 
-    per_loop = [float(l) for l in model.last_per_loop_aux_losses]  # loops 0..n-2
+    # Guard against an unpopulated attribute (aux loop disabled, or a model
+    # that never set it) — iterating None would raise.
+    per_loop_losses = getattr(model, "last_per_loop_aux_losses", None) or []
+    per_loop = [float(l) for l in per_loop_losses]  # loops 0..n-2
     final = float(model.last_task_loss)
     d = LoopDepth(per_loop_ce=per_loop + [final])
     if len(d.per_loop_ce) < 2:

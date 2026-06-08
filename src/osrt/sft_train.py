@@ -149,7 +149,14 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
     # as pretrain).
     # ------------------------------------------------------------------
     prefix = getattr(sft_cfg, "stage_prefix", "sft")
-    ckpt_dir = "/vol/checkpoints/v5"
+    # Checkpoint dir: config > env > Modal-volume default. Hardcoding the
+    # Modal path made local runs write to a non-existent dir and prevented
+    # callers from isolating runs (cf. run_training(..., ckpt_dir=...)).
+    ckpt_dir = (
+        getattr(sft_cfg, "ckpt_dir", None)
+        or os.environ.get("OSRT_CKPT_DIR")
+        or "/vol/checkpoints/v5"
+    )
     os.makedirs(ckpt_dir, exist_ok=True)
     best_step = -1
     best_ckpt: str | None = None

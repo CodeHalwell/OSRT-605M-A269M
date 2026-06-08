@@ -23,10 +23,14 @@ random ORTHOGONAL rotation applied before quantization mixes every channel into
 every other, so a lone outlier is spread across the block and the per-block max
 (which sets the step) drops toward the RMS rather than the peak. Because the
 rotation is orthogonal it is exactly invertible: dequantize rotates back with
-the transpose. We use a normalized randomized Hadamard transform when the block
-size is a power of two (O(n log n), no stored matrix) and fall back to a seeded
-random orthogonal matrix (QR of a Gaussian) otherwise. The rotation is fully
-determined by a fixed seed, so encode and decode agree with no side channel.
+the transpose. We use a normalized Hadamard rotation when the block size is a
+power of two and fall back to a seeded random orthogonal matrix (QR of a
+Gaussian) otherwise. Both are currently materialized as a dense n×n block matrix
+and applied by matmul (O(n²) per block — fine at the small block sizes used
+here; a fast Walsh–Hadamard transform would make the power-of-two path
+O(n log n) if larger blocks are ever needed). The matrix is rebuilt on demand
+from a fixed seed rather than persisted, so encode and decode agree with no side
+channel and nothing matrix-sized is stored.
 """
 
 from __future__ import annotations

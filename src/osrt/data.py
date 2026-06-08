@@ -213,8 +213,13 @@ def _format_openthoughts(example: dict) -> str:
     convs = example.get("conversations")
     if not (isinstance(convs, list) and len(convs) >= 2):
         return ""
-    user_msg = next((m for m in convs if m.get("from") == "user"), None)
-    assistant_msg = next((m for m in convs if m.get("from") == "assistant"), None)
+    # OpenThoughts ships ShareGPT-format conversations, which use
+    # "human"/"gpt" for the speaker; accept the "user"/"assistant" variant
+    # too so neither tag convention silently drops every row.
+    user_msg = next((m for m in convs if m.get("from") in ("user", "human")), None)
+    assistant_msg = next(
+        (m for m in convs if m.get("from") in ("assistant", "gpt")), None
+    )
     if not user_msg or not assistant_msg:
         return ""
     q = user_msg.get("value", "")
