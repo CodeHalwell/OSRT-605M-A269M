@@ -229,6 +229,24 @@ def run_grouped_check():
 
 
 @app.local_entrypoint()
+def run_seq8192_check():
+    """Long-context memory check: the REAL phase-3 footprint (seq 8192, batch 2)
+    + grouped + sink + checkpointing, eager, 12 steps. Eager because the binding
+    question is memory: at seq 8192 the manual sink materialises a (B,H,S,S)
+    score matrix (~13-25GB transient even at batch 2) — identical compiled vs
+    eager, and eager skips the slow 8192 compile trace.
+
+    Gate: fits 80GB. If it OOMs in _attention_with_sink, the sink doesn't scale
+    to long context → phase 3 needs attention_sink=False (flash SDPA, which
+    never materialises scores). If 8192 fits, seq 4096 (smaller) is safe too."""
+    call = pretrain_sanity.spawn(
+        compile_on=False, steps=12, grouped=True, seq_len=8192, batch=2,
+    )
+    print(f"Spawned seq-8192 mem-check — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
 def run_pretrain():
     """Spawn the full v6 pretraining run (fire-and-forget)."""
     call = pretrain.spawn()
@@ -337,6 +355,8 @@ def pretrain_sanity(
     attention_sink: bool = True,
     grad_ckpt: bool = True,
     grouped: bool = False,
+    seq_len: int = 0,
+    batch: int = 0,
 ):
     """Full-footprint check of the pretrain path on the v6 65K tokenizer.
 
@@ -417,12 +437,27 @@ def pretrain_sanity(
         # HF-immune gradient-checkpointing flag (run_training reads train_cfg)
         gradient_checkpointing = grad_ckpt
 
+        # Long-context memory check: override the foundation phase to the target
+        # seq_len/batch (reusing its datasets — peak memory is data-independent)
+        # so we test e.g. the real phase-3 footprint (seq 8192, batch 2) from
+        # step 0. grad_accum=2 keeps steps quick; peak memory is per-micro-batch
+        # so it's unchanged by accum.
+        if seq_len:
+            _phases = {k: dict(v) for k, v in PretrainConfig.phases.items()}
+            _phases["foundation"]["seq_len"] = seq_len
+            _phases["foundation"]["batch_size"] = batch
+            _phases["foundation"]["grad_accum_steps"] = 2
+            phases = _phases
+            batch_size = batch
+
     sanity_cfg = SanityCfg()
 
     mode = "torch.compile" if compile_on else "eager"
+    _sq = seq_len if seq_len else 2048
+    _bs = batch if batch else 8
     print(
         f"pretrain {'COMPILE-CHECK' if compile_on else 'MEM-CHECK'}: {steps} "
-        f"steps, {mode}, FULL batch=8 seq=2048 | fused-CE on | "
+        f"steps, {mode}, batch={_bs} seq={_sq} | fused-CE on | "
         f"attention_sink={attention_sink} "
         f"({'flash SDPA' if not attention_sink else 'manual (B,H,S,S) sink'}) | "
         f"gradient_checkpointing={grad_ckpt} | "
