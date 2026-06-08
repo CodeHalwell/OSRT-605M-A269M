@@ -973,6 +973,13 @@ def run_training(
                 tokenizer_name,
                 current_batch_size,
                 step,
+                # Honor the config's worker count (default 1). make_loader
+                # defaults to 4, but 4 workers × N streams opens too many
+                # concurrent HF connections from one container, which
+                # triggers SSL BAD_RECORD_MAC / "Bad file descriptor" /
+                # connection-reset storms under any HF flakiness. 1 worker
+                # = far fewer simultaneous streams = robust.
+                num_workers=getattr(train_cfg, "dataloader_num_workers", 1),
             )
             loader_iter = iter(current_loader)
             print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
@@ -1050,6 +1057,7 @@ def run_training(
                     tokenizer_name,
                     p_cfg.get("batch_size", train_cfg.batch_size),
                     step,
+                    num_workers=getattr(train_cfg, "dataloader_num_workers", 1),
                 )
                 loader_iter = iter(current_loader)
                 input_ids, labels = next(loader_iter)
