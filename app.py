@@ -183,9 +183,18 @@ def run_tokenizer(vocab_size: int = 65536, sample_size: int = 3_000_000_000):
 
 @app.local_entrypoint()
 def run_pretrain_sanity():
-    """Spawn the full-footprint memory check (fire-and-forget)."""
+    """Spawn the full-footprint memory check (eager, fire-and-forget)."""
     call = pretrain_sanity.spawn()
     print(f"Spawned pretrain mem-check — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_pretrain_compile_check():
+    """Spawn the torch.compile validation (compile on, 40 steps so tracing
+    amortises and steady-state tok/s is meaningful)."""
+    call = pretrain_sanity.spawn(compile_on=True, steps=40)
+    print(f"Spawned pretrain compile-check — call_id={call.object_id}")
     print("Monitor: modal app logs <app-id>")
 
 
@@ -290,16 +299,19 @@ def pretrain():
         modal.Secret.from_name("wandb-secret"),
         modal.Secret.from_name("hf-secret"),
     ],
-    timeout=3600,
+    timeout=7200,
 )
-def pretrain_sanity():
-    """Full-footprint MEMORY CHECK of the pretrain path on the v6 65K
-    tokenizer + memory fixes.
+def pretrain_sanity(compile_on: bool = False, steps: int = 30):
+    """Full-footprint check of the pretrain path on the v6 65K tokenizer.
 
     Runs the REAL batch 8 / seq 2048 with fused linear-CE + gradient
-    checkpointing to verify the footprint fits an 80GB H100 and still
-    trains. Eager (compile off) so steps + the checkpointing-enabled log
-    line appear immediately; no ckpt/eval/wandb. ~10 min.
+    checkpointing. compile_on=False (default) is the fast eager MEMORY
+    check; compile_on=True is the torch.compile validation — confirms the
+    model compiles without erroring (mHC Sinkhorn loop, the data-dependent
+    MoE .nonzero() dispatch, gradient-checkpoint + fused-CE nesting are the
+    risky parts) and measures the steady-state tok/s speedup vs eager
+    (~4.5k). `steps` sets total_steps (use more for compile so tracing
+    amortises and steady tok/s is meaningful). No ckpt/eval/wandb.
     """
     import os
 
@@ -339,7 +351,7 @@ def pretrain_sanity():
     # eager (compile off) so steps appear immediately and we isolate "does it
     # fit + learn" from compile; wandb off.
     class SanityCfg(PretrainConfig):
-        total_steps = 30
+        total_steps = steps
         warmup_steps = 5
         grad_accum_steps = 2  # fewer micro-batches → quicker steps; peak mem
                               # is per-micro-batch so this doesn't change the
@@ -348,18 +360,24 @@ def pretrain_sanity():
         ckpt_interval = 999_999
         eval_interval = 999_999
         early_stop_check_step = 999_999
-        compile_enabled = False
+        compile_enabled = compile_on
         wandb_log = False
-        wandb_run_name = "osrt-pretrain-memcheck"
+        wandb_run_name = (
+            "osrt-pretrain-compilecheck" if compile_on else "osrt-pretrain-memcheck"
+        )
         # HF-immune gradient-checkpointing flag (run_training reads train_cfg)
         gradient_checkpointing = True
 
     sanity_cfg = SanityCfg()
 
+    mode = "torch.compile" if compile_on else "eager"
     print(
-        "pretrain MEM-CHECK: 30 steps, eager, FULL batch=8 seq=2048 with "
-        "fused-CE + gradient checkpointing — verifying the real footprint "
-        "fits an 80GB H100 and still trains."
+        f"pretrain {'COMPILE-CHECK' if compile_on else 'MEM-CHECK'}: {steps} "
+        f"steps, {mode}, FULL batch=8 seq=2048 with fused-CE + gradient "
+        f"checkpointing. "
+        + ("Confirming compile works + measuring tok/s speedup vs eager (~4.5k)."
+           if compile_on else
+           "Verifying the real footprint fits an 80GB H100 and trains.")
     )
     run_training(model_config, sanity_cfg, vol, tokenizer_name)
 
