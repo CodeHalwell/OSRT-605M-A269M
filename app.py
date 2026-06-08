@@ -208,6 +208,7 @@ def run_pretrain():
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -283,6 +284,7 @@ def pretrain():
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),

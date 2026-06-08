@@ -448,57 +448,77 @@ class TokenStream(IterableDataset):
 
         buffer: list[int] = []
 
-        def _reconnect_stream(stream_idx: int) -> None:
+        def _reconnect_stream(stream_idx: int) -> bool:
             # Mid-run reconnect uses the same retry-aware open path as
             # initial setup, plus a randomised seed offset so the
-            # reshuffle doesn't replay identical examples.
-            ds = _open_stream(stream_idx, seed_offset=rng.randint(1, 100_000))
-            streams[stream_idx] = iter(ds)
+            # reshuffle doesn't replay identical examples. Returns True on
+            # success; swallows failures (returns False) so a reconnect
+            # that itself errors can't propagate and kill the worker.
+            try:
+                ds = _open_stream(
+                    stream_idx, seed_offset=rng.randint(1, 100_000),
+                )
+                streams[stream_idx] = iter(ds)
+                print(
+                    f"[DataWorker] Reconnected to "
+                    f"{self.dataset_configs[stream_idx]['hf_id']}",
+                    flush=True,
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[DataWorker] reconnect to "
+                    f"{self.dataset_configs[stream_idx]['hf_id']} failed: "
+                    f"{type(exc).__name__}: {str(exc)[:120]}",
+                    flush=True,
+                )
+                return False
+
+        max_retries = 8
+
+        def _robust_next(stream_idx: int, ds_name: str):
+            """Fetch the next example, surviving ANY failure.
+
+            The previous code only caught StopIteration on the
+            post-reconnect retry, so a reconnected stream that immediately
+            raised (e.g. httpx 'Cannot send a request, as the client has
+            been closed' after a mass HF disconnect) propagated out and
+            killed the DataLoader worker — taking the whole multi-hour run
+            with it. This catches EVERYTHING (StopIteration, connection
+            resets, SSL errors, closed-client RuntimeErrors), reconnects
+            with bounded exponential backoff, and returns None if it can't
+            recover this attempt so the caller just skips and continues.
+            """
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return next(streams[stream_idx])
+                except StopIteration:
+                    # _cycling_iter should make this unreachable, but if a
+                    # stream genuinely ends, rebuild it.
+                    _reconnect_stream(stream_idx)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"[DataWorker] {ds_name}: {type(exc).__name__}: "
+                        f"{str(exc)[:160]} — reconnect [{attempt}/{max_retries}]",
+                        flush=True,
+                    )
+                    time.sleep(min(2 * attempt, 30))
+                    _reconnect_stream(stream_idx)
             print(
-                f"[DataWorker] Reconnected to "
-                f"{self.dataset_configs[stream_idx]['hf_id']}",
+                f"[DataWorker] {ds_name}: giving up after {max_retries} "
+                f"retries, skipping batch",
                 flush=True,
             )
-
-        max_retries = 5
+            return None
 
         while True:
             idx = _pick_stream()
             ds_cfg_i = self.dataset_configs[idx]
             ds_name = ds_cfg_i.get("name", ds_cfg_i["hf_id"])
 
-            try:
-                example = next(streams[idx])
-            except StopIteration:
-                _reconnect_stream(idx)
-                try:
-                    example = next(streams[idx])
-                except StopIteration:
-                    continue
-            except Exception as exc:
-                # Connection drops, corrupt shards, HTTP errors —
-                # log, sleep, reconnect, and continue. A flaky remote
-                # gzip shard should never kill a multi-hour Modal job.
-                for attempt in range(1, max_retries + 1):
-                    print(
-                        f"[DataWorker] {ds_name}: {type(exc).__name__}: "
-                        f"{exc} — reconnecting [{attempt}/{max_retries}]",
-                        flush=True,
-                    )
-                    time.sleep(2 * attempt)
-                    try:
-                        _reconnect_stream(idx)
-                        example = next(streams[idx])
-                        break
-                    except Exception as retry_exc:
-                        exc = retry_exc
-                else:
-                    print(
-                        f"[DataWorker] {ds_name}: giving up after "
-                        f"{max_retries} retries, skipping batch",
-                        flush=True,
-                    )
-                    continue
+            example = _robust_next(idx, ds_name)
+            if example is None:
+                continue
 
             # Extract text from example. Per-stream `format` config
             # (used by extend-stage rehearsal) overrides the generic
