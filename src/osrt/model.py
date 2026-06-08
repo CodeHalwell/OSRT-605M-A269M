@@ -420,7 +420,12 @@ class MoELayer(nn.Module):
             token_indices = (assign == ei).nonzero(as_tuple=True)[0]
             if token_indices.numel() == 0:
                 continue
-            moe_out.index_add_(0, token_indices, expert(x_flat[token_indices]))
+            # Cast to moe_out.dtype: under bf16 autocast the expert may
+            # emit a dtype that index_add_ rejects against the bf16 buffer.
+            moe_out.index_add_(
+                0, token_indices,
+                expert(x_flat[token_indices]).to(moe_out.dtype),
+            )
         moe_out = moe_out.view(B, S, D)
 
         # Aux losses: deterministic routing has nothing to balance. Keep them as
@@ -723,7 +728,14 @@ class MoELayer(nn.Module):
 
             # Scatter-add: a token may contribute from multiple experts
             # (different ranks), so use index_add, not direct assignment.
-            moe_out.index_add_(0, token_indices, expert_output * gates)
+            # The gate (from the fp32 router softmax) is applied in fp32 for
+            # precision, then cast back to the output dtype — without the
+            # cast, index_add_ raises under bf16 autocast because moe_out is
+            # bf16 while (expert_output * gates) promotes to fp32.
+            moe_out.index_add_(
+                0, token_indices,
+                (expert_output * gates).to(moe_out.dtype),
+            )
 
         moe_out = moe_out.view(B, S, D)
 

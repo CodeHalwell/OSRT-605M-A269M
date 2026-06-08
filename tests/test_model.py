@@ -2056,3 +2056,47 @@ def test_config_spec_draft_loops_clamped_and_lower_bound():
     assert cfg.spec_draft_loops == 4
     with pytest.raises(ValueError, match="spec_draft_loops"):
         tiny_config(recursive_loops=4, spec_draft_loops=0)
+
+
+# ── bf16 autocast (regression: MoE index_add_ dtype) ───────────────────
+
+
+def test_bf16_autocast_forward_backward():
+    """Regression for the MoE index_add_ dtype crash.
+
+    Under bf16 autocast, moe_out is bf16 but the router gate (from the
+    fp32 softmax) promotes `expert_output * gates` to fp32, so
+    `index_add_` raised "self (BFloat16) and source (Float) must have the
+    same scalar type". The local fp32 tests never exercised autocast, so
+    this only surfaced on Modal (GPU, bf16). CPU autocast triggers the
+    same device-agnostic dtype check, so this catches it for free.
+    """
+    torch.manual_seed(0)
+    cfg = tiny_config()
+    model = OSRTForCausalLM(cfg)
+    model.train()
+    ids = torch.randint(0, cfg.vocab_size, (2, 16))
+    labels = ids.clone()
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(ids, labels=labels)
+
+    assert out.loss is not None
+    assert torch.isfinite(out.loss), f"non-finite loss under bf16: {out.loss}"
+    out.loss.backward()  # must not raise the index_add_ dtype error
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads, "no gradients flowed under bf16 autocast"
+
+
+def test_bf16_autocast_hash_routing():
+    """Same dtype guard on the hash-routing dispatch path (block 0)."""
+    torch.manual_seed(0)
+    cfg = tiny_config(hash_routing_blocks=1)
+    model = OSRTForCausalLM(cfg)
+    model.train()
+    ids = torch.randint(0, cfg.vocab_size, (2, 16))
+    labels = ids.clone()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(ids, labels=labels)
+    assert torch.isfinite(out.loss)
+    out.loss.backward()

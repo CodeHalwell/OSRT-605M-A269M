@@ -164,6 +164,93 @@ def pretrain():
     run_training(model_config, train_cfg, vol, tokenizer_name)
 
 
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=3600,
+)
+def pretrain_sanity():
+    """100-step smoke test of the full pretrain path on the canonical
+    OSRT-605M preset.
+
+    Verifies the assembled v6 architecture (GQA + V-from-K, mHC, 8-expert
+    MoE, sqrt-softplus routing, attention sink, aux-loop loss, MTP,
+    Muon+AdamW) trains stably on real streamed data before committing to a
+    full run. Eager mode (no torch.compile) so step events appear
+    immediately; no checkpoint saves, no wandb. ~10-15 min, a few dollars.
+    """
+    import os
+
+    import modal as _modal
+    from transformers import AutoTokenizer
+
+    from osrt.train import run_training
+    from osrt.train_config import PretrainConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+
+    tokenizer_path = "/vol/tokenizer"
+    tokenizer_name = tokenizer_path
+    print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    print(f"Tokenizer loaded: vocab_size={len(tok)}")
+
+    from osrt.presets import build_config
+    model_config = build_config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    # Subclass so the real PretrainConfig is untouched. ckpt/eval pushed
+    # past total_steps so neither fires; warmup short enough to exit and
+    # see a cosine LR before the run ends; compile + wandb off.
+    #
+    # Footprint reduced (batch 8→1, seq 2048→1024) so the smoke test fits
+    # comfortably on one H100 in EAGER mode. The full PretrainConfig
+    # (batch 8, seq 2048) OOMs in eager because the 8 full-vocab fp32
+    # logit tensors (1 main + 5 aux-loop + 2 MTP) plus the mHC 4× residual
+    # stream dominate activation memory — that's the known activation-
+    # memory item the architecture-optimization review flags (fused
+    # linear-CE / gradient checkpointing are the fixes, GPU-phase work).
+    # A smoke test only needs to prove the stack LEARNS, which a small
+    # batch does fine.
+    class SanityCfg(PretrainConfig):
+        total_steps = 100
+        warmup_steps = 20
+        batch_size = 1
+        grad_accum_steps = 2
+        log_interval = 5
+        ckpt_interval = 999_999
+        eval_interval = 999_999
+        early_stop_check_step = 999_999
+        compile_enabled = False
+        wandb_log = False
+        wandb_run_name = "osrt-pretrain-sanity"
+
+    sanity_cfg = SanityCfg()
+    # Shrink the foundation-phase sequence length for the smoke test.
+    sanity_cfg.phases["foundation"]["seq_len"] = 1024
+    sanity_cfg.phases["foundation"]["grad_accum_steps"] = 2
+
+    print(
+        "pretrain SANITY: 100 steps, eager, batch=1 seq=1024, "
+        "no ckpts/eval/wandb — validating the full v6 stack trains."
+    )
+    run_training(model_config, sanity_cfg, vol, tokenizer_name)
+
+
 # =============================================================================
 # PRETRAIN_EXTEND (continued pretraining / "mid-training" on top of SFT ckpt)
 # =============================================================================

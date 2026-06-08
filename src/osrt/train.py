@@ -690,10 +690,17 @@ def run_training(
     )
     print()
 
-    print("Compiling model with torch.compile...")
-    compile_start = time.time()
-    model = torch.compile(model)
-    print(f"Model compile done in {time.time() - compile_start:.1f}s")
+    # compile_enabled opt-out (default True) lets a stage skip torch.compile
+    # entirely — matches run_pretrain_extend. Eager mode starts producing step
+    # events immediately instead of ~10 min of silent compile tracing, which
+    # is what a short smoke test wants.
+    if getattr(train_cfg, "compile_enabled", True):
+        print("Compiling model with torch.compile...")
+        compile_start = time.time()
+        model = torch.compile(model)
+        print(f"Model compile done in {time.time() - compile_start:.1f}s")
+    else:
+        print("\nSkipping torch.compile (compile_enabled=False, eager mode).")
 
     # W&B
     use_wandb = train_cfg.wandb_log and wandb is not None
