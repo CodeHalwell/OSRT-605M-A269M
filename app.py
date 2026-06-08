@@ -176,6 +176,27 @@ def run_tokenizer(vocab_size: int = 65536, sample_size: int = 3_000_000_000):
     print("  modal app logs <app-id>   (app id shown above)")
 
 
+# ALL Modal runs go through a spawn entrypoint (project rule: only ever use
+# .spawn(), never `modal run --detach app.py::<func>` directly). Launch with
+# `modal run --detach app.py::run_<stage>`, then `modal app logs ap-<id>`.
+
+
+@app.local_entrypoint()
+def run_pretrain_sanity():
+    """Spawn the full-footprint memory check (fire-and-forget)."""
+    call = pretrain_sanity.spawn()
+    print(f"Spawned pretrain mem-check — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_pretrain():
+    """Spawn the full v6 pretraining run (fire-and-forget)."""
+    call = pretrain.spawn()
+    print(f"Spawned v6 pretrain — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
 # =============================================================================
 # PRE-TRAINING
 # =============================================================================
