@@ -628,13 +628,6 @@ class MoELayer(nn.Module):
         else:
             capacity = N * self.top_k  # effectively unlimited (one pair per slot)
 
-        # Dispatch/noisy assignment stats. These keep the existing telemetry
-        # semantics: last_expert_fraction and marginal_entropy describe the
-        # actual noisy dispatch path while Gumbel exploration is enabled.
-        dispatch_one_hot = F.one_hot(top_idx, num_classes=self.num_routed)
-        f = dispatch_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
-        p = probs.float().mean(dim=0)
-
         # Switch balance loss extended to top-k. Compute it on the RAW router
         # logits, not the noisy dispatch path or the bias-corrected clean path.
         # Gumbel is exploration and bias is an external controller; the aux
@@ -755,6 +748,17 @@ class MoELayer(nn.Module):
         if not self.telemetry_enabled:
             return shared_out, moe_out
         with torch.no_grad():
+            # Dispatch/noisy assignment stats. These keep the existing telemetry
+            # semantics: last_expert_fraction and marginal_entropy describe the
+            # actual noisy dispatch path while Gumbel exploration is enabled.
+            # Computed here (inside the telemetry guard) rather than above so
+            # non-logging training steps skip them entirely — f/p/dispatch_one_hot
+            # feed ONLY the telemetry below; the Switch balance loss uses the
+            # separate raw_balance_* tensors, so this move is bit-identical.
+            dispatch_one_hot = F.one_hot(top_idx, num_classes=self.num_routed)
+            f = dispatch_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
+            p = probs.float().mean(dim=0)
+
             # Per-token entropy — the real sharpness metric. Uniform per-token
             # softmax => ln(E). Sharp routing => much lower. Average over tokens.
             log_probs = torch.log(probs.clamp_min(1e-10))
@@ -1954,15 +1958,15 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                 # Don't trim past_key_values when the cache exceeds
                 # max_position_embeddings — left-truncating the cache
                 # shifts the absolute RoPE indices that the forward
-                # derives from past_key_values[0].shape[2] (model.py:761
-                # past_length read), so cached K (rotated at original
-                # absolute positions) and the new K (rotated at the
-                # post-trim shifted index) end up in different
-                # positional bases and attention breaks.
+                # derives from past_key_values[idx].shape[1] (the
+                # past_length read in OSRTModel.forward), so cached K
+                # (rotated at original absolute positions) and the new K
+                # (rotated at the post-trim shifted index) end up in
+                # different positional bases and attention breaks.
                 # The forward already handles required_seq_len > the
-                # precomputed RoPE range by recomputing on demand
-                # (model.py:773-786), so letting the cache grow
-                # naturally is safe. Memory cost grows with generation
+                # precomputed RoPE range by recomputing cos/sin on demand
+                # (the else-branch of the rope_cos slice), so letting the
+                # cache grow naturally is safe. Memory cost grows with generation
                 # length; if that becomes a constraint, the right fix
                 # is sliding-window with re-rotation, not a naive trim.
                 out = self.forward(
