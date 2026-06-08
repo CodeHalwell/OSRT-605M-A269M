@@ -161,6 +161,30 @@ def orthogonal_expert_init(expert: ExpertFFN, seed: int, gain: float = 1.0) -> N
 # ── MoE Layer (Switch-style) ────────────────────────────────────────────
 
 
+def _ref_grouped_mm(a: Tensor, b: Tensor, offs: Tensor) -> Tensor:
+    """Reference (CPU-safe) grouped matmul matching torch._grouped_mm.
+
+    a:    (M, K) tokens already sorted into contiguous per-expert spans.
+    b:    (G, K, N) per-expert weight matrices.
+    offs: (G,) int cumulative END offsets into M (offs[-1] == M); expert g is
+          rows [prev:offs[g]] @ b[g].
+    Returns (M, N).
+
+    torch._grouped_mm's CUDA kernel is the production path (fused, no graph
+    break). Its CPU *backward* is broken in torch 2.10, so this loop-of-matmuls
+    is used on CPU (forward+backward both correct) and as the parity oracle for
+    the kernel. The Python loop over G groups graph-breaks under compile — fine,
+    it only ever runs on CPU/tests; CUDA uses the fused kernel.
+    """
+    outs = []
+    lo = 0
+    for g in range(b.shape[0]):
+        hi = int(offs[g])
+        outs.append(a[lo:hi] @ b[g])
+        lo = hi
+    return torch.cat(outs, dim=0)
+
+
 class MoELayer(nn.Module):
     """Mixtral-style MoE: top-k (default 2) softmax routing, capacity-limited.
 
@@ -185,6 +209,8 @@ class MoELayer(nn.Module):
         self.dim = config.dim
         self.num_routed = config.num_routed_experts
         self.top_k = config.top_k_experts
+        # B4: grouped-GEMM dispatch (vs the per-expert .nonzero() loop).
+        self.grouped_gemm = getattr(config, "moe_grouped_gemm", False)
         self.expert_hidden = config.expert_hidden
         self.capacity_factor = config.router_capacity_factor
         self.num_loops = config.recursive_loops
@@ -473,6 +499,127 @@ class MoELayer(nn.Module):
 
         return shared_out, moe_out
 
+    def _dispatch_loop(
+        self, x_flat: Tensor, top_idx: Tensor, top_probs: Tensor, capacity: int,
+    ) -> tuple[Tensor, int]:
+        """Per-expert .nonzero() gather + index_add dispatch (the default).
+
+        For each expert, gather every token that picked it at ANY top-k rank,
+        apply the per-expert capacity cap (dropping a shuffled subset on
+        overflow), run the expert, and scatter-add the gated output. Returns
+        (moe_out_flat (N, D), total_dropped). The data-dependent .nonzero()
+        graph-breaks torch.compile — see _dispatch_grouped for the fused path.
+        """
+        moe_out = torch.zeros_like(x_flat)
+        total_dropped = 0
+        for ei, expert in enumerate(self.experts):
+            is_chosen = (top_idx == ei)  # (N, K), bool
+            token_indices, rank_indices = is_chosen.nonzero(as_tuple=True)
+            if token_indices.numel() == 0:
+                continue
+            # Capacity cap. nonzero() returns token-major order, so a naive
+            # [:capacity] always drops late positions — shuffle first so every
+            # position has equal survival probability. In eval capacity == N*K
+            # so this never triggers.
+            if token_indices.numel() > capacity:
+                total_dropped += (token_indices.numel() - capacity)
+                perm = torch.randperm(
+                    token_indices.numel(), device=token_indices.device,
+                )
+                keep = perm[:capacity]
+                token_indices = token_indices[keep]
+                rank_indices = rank_indices[keep]
+            expert_input = x_flat[token_indices]  # (T, D)
+            expert_output = expert(expert_input)   # (T, D)
+            # Gate = renormalised softmax prob for this (token, rank) pair;
+            # applied in fp32 then cast (index_add_ rejects an fp32 source
+            # against a bf16 buffer under autocast).
+            gates = top_probs[token_indices, rank_indices].unsqueeze(-1)
+            moe_out.index_add_(
+                0, token_indices,
+                (expert_output * gates).to(moe_out.dtype),
+            )
+        return moe_out, total_dropped
+
+    def _grouped_ffn(
+        self, x_sorted: Tensor, offs: Tensor, use_kernel: bool | None = None,
+    ) -> Tensor:
+        """SwiGLU across all experts via grouped GEMM.
+
+        x_sorted: (T, D) tokens sorted into contiguous per-expert spans.
+        offs:     (E,) int32 cumulative END offsets (one per routed expert).
+        Stacks the per-expert SwiGLU weights into (E, D, H)/(E, H, D) and runs
+        three grouped matmuls. use_kernel=None auto-selects torch._grouped_mm on
+        CUDA (fused, compile-friendly) and the CPU-safe reference otherwise
+        (the kernel's CPU backward is broken). Weights are cast to the token
+        dtype so the matmul precision matches the loop path's autocast.
+        """
+        if use_kernel is None:
+            use_kernel = x_sorted.is_cuda
+        # nn.Linear weight is (out, in); grouped_mm wants b = (E, in, out).
+        w_gate = torch.stack([e.w_gate.weight.t() for e in self.experts])
+        w_up = torch.stack([e.w_up.weight.t() for e in self.experts])
+        w_down = torch.stack([e.w_down.weight.t() for e in self.experts])
+        if use_kernel:
+            # torch._grouped_mm (compiled) supports only bf16/fp16. The model
+            # trains under bf16 autocast, so casting tokens + weights to bf16
+            # also matches the loop path's matmul precision (autocast casts
+            # nn.Linear inputs to bf16). The fp32 residual stream is cast here
+            # exactly as autocast would for the loop's nn.Linear calls.
+            cdt = torch.bfloat16
+            xs = x_sorted.to(cdt)
+            gate = torch._grouped_mm(xs, w_gate.to(cdt), offs=offs)
+            up = torch._grouped_mm(xs, w_up.to(cdt), offs=offs)
+        else:
+            dt = x_sorted.dtype
+            gate = _ref_grouped_mm(x_sorted, w_gate.to(dt), offs)
+            up = _ref_grouped_mm(x_sorted, w_up.to(dt), offs)
+        clamp = self.experts[0].clamp
+        if clamp is not None:
+            gate = gate.clamp(max=clamp)
+            up = up.clamp(min=-clamp, max=clamp)
+        h = F.silu(gate) * up
+        if use_kernel:
+            out = torch._grouped_mm(h.to(cdt), w_down.to(cdt), offs=offs)
+        else:
+            out = _ref_grouped_mm(h, w_down.to(x_sorted.dtype), offs)
+        return out
+
+    def _dispatch_grouped(
+        self, x_flat: Tensor, top_idx: Tensor, top_probs: Tensor,
+    ) -> tuple[Tensor, int]:
+        """Grouped-GEMM dispatch (B4). Dropless by construction.
+
+        Flatten the (token, rank) pairs, sort by chosen expert, run one grouped
+        SwiGLU over the sorted tokens, gate, then scatter-add back per token.
+        Equivalent to _dispatch_loop in the no-drop regime; in training it keeps
+        every token (no capacity cap). Fixed-shape ops only (argsort, bincount,
+        cumsum, index_add) so the path is torch.compile-clean. Returns
+        (moe_out_flat (N, D), 0).
+        """
+        N, D = x_flat.shape
+        K = self.top_k
+        E = self.num_routed
+        pair_expert = top_idx.reshape(-1)                  # (N*K,)
+        pair_gate = top_probs.reshape(-1)                  # (N*K,)
+        pair_token = torch.arange(
+            N, device=x_flat.device,
+        ).repeat_interleave(K)                             # (N*K,)
+        # Sort pairs by expert (stable → deterministic) so each expert's tokens
+        # form one contiguous span for the grouped GEMM.
+        order = torch.argsort(pair_expert, stable=True)
+        sorted_token = pair_token[order]
+        sorted_gate = pair_gate[order]
+        counts = torch.bincount(pair_expert, minlength=E)  # (E,)
+        offs = counts.cumsum(0).to(torch.int32)            # (E,) cumulative ends
+        x_sorted = x_flat[sorted_token]                    # (N*K, D)
+        out = self._grouped_ffn(x_sorted, offs)            # (N*K, D)
+        # Gate in fp32 (like the loop), then scatter-add back per token.
+        out = out * sorted_gate.unsqueeze(-1)
+        moe_out = torch.zeros_like(x_flat)
+        moe_out.index_add_(0, sorted_token, out.to(moe_out.dtype))
+        return moe_out, 0
+
     def forward(
         self,
         x: Tensor,
@@ -688,54 +835,18 @@ class MoELayer(nn.Module):
             f_seq * p_seq
         ).sum(dim=-1).mean()
 
-        # Dispatch: for each expert, gather every token that picked it at
-        # ANY top-k rank, apply capacity, run expert, scatter-add into output
-        # with the renormalised gate weights.
-        moe_out = torch.zeros_like(x_flat)
-        total_dropped = 0
-
-        for ei, expert in enumerate(self.experts):
-            # Where (token_idx, rank) pairs where this expert is chosen
-            is_chosen = (top_idx == ei)  # (N, K), bool
-            token_indices, rank_indices = is_chosen.nonzero(as_tuple=True)  # both (T,)
-
-            if token_indices.numel() == 0:
-                continue
-
-            # Apply capacity limit. `nonzero()` returns indices in
-            # token-major order, so a naive `[:capacity]` always drops
-            # the tail of the sequence and keeps prefix positions —
-            # under expert collapse or long-context bursts this trains
-            # the model to ignore late positions. Shuffle the (token,
-            # rank) pairs before truncating so every position has equal
-            # survival probability when an expert overflows. In eval
-            # mode capacity == N*K so this branch never triggers.
-            if token_indices.numel() > capacity:
-                total_dropped += (token_indices.numel() - capacity)
-                perm = torch.randperm(
-                    token_indices.numel(), device=token_indices.device,
-                )
-                keep = perm[:capacity]
-                token_indices = token_indices[keep]
-                rank_indices = rank_indices[keep]
-
-            # Run expert on selected tokens (one forward per expert per batch)
-            expert_input = x_flat[token_indices]  # (T, D)
-            expert_output = expert(expert_input)   # (T, D)
-
-            # Gate = renormalised softmax prob for this (token, rank) pair.
-            # Router gets gradient through this gate.
-            gates = top_probs[token_indices, rank_indices].unsqueeze(-1)  # (T, 1)
-
-            # Scatter-add: a token may contribute from multiple experts
-            # (different ranks), so use index_add, not direct assignment.
-            # The gate (from the fp32 router softmax) is applied in fp32 for
-            # precision, then cast back to the output dtype — without the
-            # cast, index_add_ raises under bf16 autocast because moe_out is
-            # bf16 while (expert_output * gates) promotes to fp32.
-            moe_out.index_add_(
-                0, token_indices,
-                (expert_output * gates).to(moe_out.dtype),
+        # Dispatch the gated top-k assignment to the routed experts. Two
+        # numerically-equivalent (in the no-drop regime) implementations (B4):
+        #   loop:    per-expert .nonzero() gather + index_add — correct, but the
+        #            data-dependent .nonzero() is the only torch.compile break.
+        #   grouped: sort pairs by expert + one grouped GEMM, dropless.
+        if self.grouped_gemm:
+            moe_out, total_dropped = self._dispatch_grouped(
+                x_flat, top_idx, top_probs,
+            )
+        else:
+            moe_out, total_dropped = self._dispatch_loop(
+                x_flat, top_idx, top_probs, capacity,
             )
 
         moe_out = moe_out.view(B, S, D)

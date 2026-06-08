@@ -214,6 +214,21 @@ def run_flash_experiment():
 
 
 @app.local_entrypoint()
+def run_grouped_check():
+    """B4 acceptance run: grouped-GEMM MoE + compile, real config (sink + ckpt
+    + fused-CE), 40 steps. Gates:
+      • compiles fullgraph (the MoE .nonzero() break is gone)
+      • loss tracks the loop baseline (11.39→7.27 over 32 steps, same config)
+      • steady tok/s beats the loop+compile baseline (~5.3k)
+    If loss diverges from the baseline, the grouped dispatch has a training-path
+    bug (the kernel backward, untestable on CPU) — do NOT ship; revert the flag.
+    """
+    call = pretrain_sanity.spawn(compile_on=True, steps=40, grouped=True)
+    print(f"Spawned B4 grouped-GEMM check — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
 def run_pretrain():
     """Spawn the full v6 pretraining run (fire-and-forget)."""
     call = pretrain.spawn()
@@ -321,6 +336,7 @@ def pretrain_sanity(
     steps: int = 30,
     attention_sink: bool = True,
     grad_ckpt: bool = True,
+    grouped: bool = False,
 ):
     """Full-footprint check of the pretrain path on the v6 65K tokenizer.
 
@@ -375,6 +391,9 @@ def pretrain_sanity(
     # routes every attention through F.scaled_dot_product_attention (flash) and
     # never builds the (B,H,S,total_len) score matrix.
     model_config.attention_sink = attention_sink
+    # B4: grouped-GEMM MoE for this run only. True → fullgraph compile (the MoE
+    # .nonzero() is the only break); validate the loss tracks the loop baseline.
+    model_config.moe_grouped_gemm = grouped
 
     # Subclass so the real PretrainConfig is untouched. Real batch_size/seq
     # (8 / 2048 foundation). ckpt/eval/early-stop pushed past total_steps;
@@ -406,7 +425,8 @@ def pretrain_sanity(
         f"steps, {mode}, FULL batch=8 seq=2048 | fused-CE on | "
         f"attention_sink={attention_sink} "
         f"({'flash SDPA' if not attention_sink else 'manual (B,H,S,S) sink'}) | "
-        f"gradient_checkpointing={grad_ckpt}. "
+        f"gradient_checkpointing={grad_ckpt} | "
+        f"moe={'grouped-GEMM (fullgraph)' if grouped else 'loop dispatch'}. "
         + ("Confirming compile works + measuring tok/s speedup vs eager (~4.5k)."
            if compile_on else
            "Verifying the real footprint fits an 80GB H100 and trains.")

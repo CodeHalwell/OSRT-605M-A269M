@@ -79,6 +79,13 @@ class OSRTConfig(PretrainedConfig):
         top_k_experts: int = 2,
         expert_hidden: int = 2048,          # routed experts
         shared_expert_hidden: int = 4096,   # shared expert (replaces dense FFN)
+        # B4: grouped-GEMM MoE dispatch. False → the per-expert .nonzero()
+        # loop (correct, but the data-dependent .nonzero() is the ONLY
+        # torch.compile graph break in the model). True → sort pairs by expert
+        # + one grouped GEMM (torch._grouped_mm on CUDA, loop-of-matmuls
+        # reference on CPU), dropless. Off by default; turn on for compiled
+        # GPU training to get a fullgraph compile.
+        moe_grouped_gemm: bool = False,
 
         # --- Routing (Switch-style + explicit load controller) ---
         # Balance loss: num_experts * sum(f_i * p_i) where
@@ -313,6 +320,7 @@ class OSRTConfig(PretrainedConfig):
 
         self.num_routed_experts = num_routed_experts
         self.top_k_experts = top_k_experts
+        self.moe_grouped_gemm = moe_grouped_gemm
         self.expert_hidden = expert_hidden
         self.shared_expert_hidden = shared_expert_hidden
 

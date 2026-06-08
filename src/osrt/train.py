@@ -719,6 +719,16 @@ def run_training(
     # events immediately instead of ~10 min of silent compile tracing, which
     # is what a short smoke test wants.
     if getattr(train_cfg, "compile_enabled", True):
+        # B4 grouped-GEMM MoE: torch._grouped_mm with data-dependent offsets
+        # needs these two dynamo flags or it graph-breaks on .item()/.tolist()
+        # of the per-expert offsets. Harmless when grouped is off; only set
+        # when both compile and grouped are on. With them set, the model
+        # compiles fullgraph (verified: 0 breaks vs 12 for the loop path).
+        if getattr(model_config, "moe_grouped_gemm", False):
+            import torch._dynamo as _dynamo
+            _dynamo.config.capture_scalar_outputs = True
+            _dynamo.config.capture_dynamic_output_shape_ops = True
+            print("Grouped-GEMM MoE: enabled dynamo scalar/dynamic-shape capture")
         print("Compiling model with torch.compile...")
         compile_start = time.time()
         model = torch.compile(model)
