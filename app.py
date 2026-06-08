@@ -199,6 +199,21 @@ def run_pretrain_compile_check():
 
 
 @app.local_entrypoint()
+def run_flash_experiment():
+    """FLASH EXPERIMENT (advisor-designed decider): flip BOTH attention_sink
+    and gradient_checkpointing OFF, compile on, 40 steps. Reads three outcomes:
+      • fits 80GB + faster  → flash SDPA wins, ship the 1-line preset flip
+      • OOMs without ckpt    → checkpointing needed either way → skip flash, do B4
+      • fits, not faster     → MoE .nonzero() graph break is the ceiling → B4
+    Compare vram + steady tok/s against the sink+ckpt compile-check (~68.7GB)."""
+    call = pretrain_sanity.spawn(
+        compile_on=True, steps=40, attention_sink=False, grad_ckpt=False,
+    )
+    print(f"Spawned FLASH experiment — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
 def run_pretrain():
     """Spawn the full v6 pretraining run (fire-and-forget)."""
     call = pretrain.spawn()
@@ -301,17 +316,28 @@ def pretrain():
     ],
     timeout=7200,
 )
-def pretrain_sanity(compile_on: bool = False, steps: int = 30):
+def pretrain_sanity(
+    compile_on: bool = False,
+    steps: int = 30,
+    attention_sink: bool = True,
+    grad_ckpt: bool = True,
+):
     """Full-footprint check of the pretrain path on the v6 65K tokenizer.
 
-    Runs the REAL batch 8 / seq 2048 with fused linear-CE + gradient
-    checkpointing. compile_on=False (default) is the fast eager MEMORY
-    check; compile_on=True is the torch.compile validation — confirms the
-    model compiles without erroring (mHC Sinkhorn loop, the data-dependent
-    MoE .nonzero() dispatch, gradient-checkpoint + fused-CE nesting are the
-    risky parts) and measures the steady-state tok/s speedup vs eager
-    (~4.5k). `steps` sets total_steps (use more for compile so tracing
-    amortises and steady tok/s is meaningful). No ckpt/eval/wandb.
+    Runs the REAL batch 8 / seq 2048 with fused linear-CE. compile_on=False
+    (default) is the fast eager MEMORY check; compile_on=True is the
+    torch.compile validation — confirms the model compiles without erroring
+    (mHC Sinkhorn loop, the data-dependent MoE .nonzero() dispatch,
+    gradient-checkpoint + fused-CE nesting are the risky parts) and measures
+    the steady-state tok/s speedup vs eager (~4.5k). `steps` sets total_steps
+    (use more for compile so tracing amortises and steady tok/s is
+    meaningful). No ckpt/eval/wandb.
+
+    attention_sink / grad_ckpt override the preset's sink (True) and the
+    checkpointing flag (True) for THIS run only — the FLASH EXPERIMENT flips
+    both False to test whether flash SDPA (no manual (B,H,S,S) materialise)
+    still fits 80GB without checkpointing, and whether that's faster. The
+    preset is untouched; we override on the config object.
     """
     import os
 
@@ -345,6 +371,10 @@ def pretrain_sanity(compile_on: bool = False, steps: int = 30):
         pad_token_id=tok.pad_token_id,
         fused_cross_entropy_chunks=8,
     )
+    # Override sink for this run only (preset stays True). attention_sink=False
+    # routes every attention through F.scaled_dot_product_attention (flash) and
+    # never builds the (B,H,S,total_len) score matrix.
+    model_config.attention_sink = attention_sink
 
     # Subclass so the real PretrainConfig is untouched. Real batch_size/seq
     # (8 / 2048 foundation). ckpt/eval/early-stop pushed past total_steps;
@@ -366,15 +396,17 @@ def pretrain_sanity(compile_on: bool = False, steps: int = 30):
             "osrt-pretrain-compilecheck" if compile_on else "osrt-pretrain-memcheck"
         )
         # HF-immune gradient-checkpointing flag (run_training reads train_cfg)
-        gradient_checkpointing = True
+        gradient_checkpointing = grad_ckpt
 
     sanity_cfg = SanityCfg()
 
     mode = "torch.compile" if compile_on else "eager"
     print(
         f"pretrain {'COMPILE-CHECK' if compile_on else 'MEM-CHECK'}: {steps} "
-        f"steps, {mode}, FULL batch=8 seq=2048 with fused-CE + gradient "
-        f"checkpointing. "
+        f"steps, {mode}, FULL batch=8 seq=2048 | fused-CE on | "
+        f"attention_sink={attention_sink} "
+        f"({'flash SDPA' if not attention_sink else 'manual (B,H,S,S) sink'}) | "
+        f"gradient_checkpointing={grad_ckpt}. "
         + ("Confirming compile works + measuring tok/s speedup vs eager (~4.5k)."
            if compile_on else
            "Verifying the real footprint fits an 80GB H100 and trains.")
