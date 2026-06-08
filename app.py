@@ -260,6 +260,70 @@ def run_seq8192_flash_check():
     print("Monitor: modal app logs <app-id>")
 
 
+@app.function(
+    image=image,
+    volumes={"/vol/tokenizer": v6_tokenizer_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=900,
+)
+def smoke_new_datasets():
+    """Stream-test the candidate Nemotron/Cosmopedia datasets IN the Modal env:
+    proves the hf-secret token has the gated grants AND that text extraction +
+    v6 tokenization work for each. CPU-only, ~2 min. Skips Nemotron-Code-Metadata
+    (no text field). Run before wiring them into the full pretrain mix."""
+    import os
+
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    has_tok = bool(
+        os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    )
+    print(f"HF token present in container: {has_tok}", flush=True)
+
+    candidates = [
+        ("nvidia/Nemotron-CC-Math-v1", "4plus", "text"),
+        ("nvidia/Nemotron-CC-Math-v1", "4plus_MIND", "text"),
+        ("nvidia/Nemotron-Pretraining-Code-v2", "Synthetic-Question-Answering", "content"),
+        ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-STEM-SFT", "text"),
+        ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-Math-Textbooks", "text"),
+        ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-InfiniByte-Reasoning", "text"),
+        ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-RQA", "text"),
+        ("HuggingFaceTB/cosmopedia", "web_samples_v2", "text"),
+        ("HuggingFaceTB/cosmopedia", "openstax", "text"),
+    ]
+    ok = 0
+    for repo, cfg, field in candidates:
+        short = f"{repo.split('/')[-1]}/{cfg}"
+        try:
+            ds = load_dataset(repo, cfg, split="train", streaming=True)
+            ex = next(iter(ds))
+            text = ex.get(field) or ""
+            n = len(tok(text[:4000]).input_ids)
+            if text:
+                ok += 1
+                print(
+                    f"OK   {short}: field={field!r} chars={len(text)} "
+                    f"tok(4k)={n} :: {text[:55]!r}",
+                    flush=True,
+                )
+            else:
+                print(f"EMPTY {short}: field {field!r} was empty", flush=True)
+        except Exception as e:
+            print(f"FAIL {short}: {type(e).__name__}: {str(e)[:130]}", flush=True)
+    print(f"\nSMOKE RESULT: {ok}/{len(candidates)} streamed + tokenized OK", flush=True)
+
+
+@app.local_entrypoint()
+def run_smoke_new_datasets():
+    """Spawn the gated-dataset streaming smoke test (proves Modal hf-secret
+    access before wiring the new datasets into the full pretrain)."""
+    call = smoke_new_datasets.spawn()
+    print(f"Spawned dataset smoke test — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
 @app.local_entrypoint()
 def run_final_check():
     """Final pre-launch integration check: the REAL pretrain config (flash +
