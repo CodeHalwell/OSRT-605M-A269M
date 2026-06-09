@@ -1445,7 +1445,15 @@ def run_pretrain_extend(
     print()
 
     # ── HRA injection (BEFORE state_dict load) ─────────────────────
-    if extend_cfg.hra_enabled:
+    # v5 path: the foundation model had NO HRA, so this stage injects
+    #   HRALinear wrappers before loading an SFT checkpoint whose
+    #   state_dict contains them.
+    # v6 path (hra_native=True): HRA is built inline from config
+    #   (model.py adapters_a/adapters_b ParameterList) and is ALREADY in
+    #   the foundation checkpoint. Injecting HRALinear here would graft a
+    #   second, mismatched layout and make load_model_state_or_raise throw.
+    hra_native = getattr(extend_cfg, "hra_native", False)
+    if extend_cfg.hra_enabled and not hra_native:
         from osrt.hra import inject_hra
         print(f"Injecting HRA before load (rank={extend_cfg.hra_rank})...")
         inject_hra(
@@ -1457,6 +1465,11 @@ def run_pretrain_extend(
         with_hra_params = sum(p.numel() for p in model.parameters())
         added = with_hra_params - base_params
         print(f"  HRA injected: +{added:,} params ({added / 1e6:.1f}M)")
+    elif hra_native:
+        print(
+            "HRA is native (built from config) — skipping inject_hra; "
+            "foundation checkpoint already carries adapters_a/adapters_b."
+        )
 
     # ── Load SFT checkpoint ────────────────────────────────────────
     ckpt_path = extend_cfg.pretrained_checkpoint
