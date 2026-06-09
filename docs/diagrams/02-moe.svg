@@ -50,7 +50,6 @@
   <text x="680" y="401" text-anchor="middle" class="lbl">top-2 select  (idx, gate)</text>
 
   <!-- aux losses side -->
-  <line class="e" x1="820" y1="320" x2="858" y2="320"/>
   <rect class="aux" x="724" y="120" width="146" height="92" rx="8" stroke-width="1.4"/>
   <text x="797" y="142" text-anchor="middle" class="note" font-weight="700">aux losses</text>
   <text x="797" y="160" text-anchor="middle" class="sub">Switch balance</text>

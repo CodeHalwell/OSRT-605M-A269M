@@ -42,7 +42,7 @@
   <line class="e" x1="230" y1="266" x2="230" y2="300"/>
   <rect class="box attn" x="120" y="300" width="220" height="40"/>
   <text x="230" y="325" text-anchor="middle" class="lbl">QK-Norm → RoPE  (Q)</text>
-  <line class="e" x1="230" y1="340" x2="360" y2="430"/>
+  <line class="e" x1="230" y1="340" x2="345" y2="482"/>
 
   <!-- kv_down path (right) -->
   <rect class="box attn" x="510" y="222" width="240" height="44"/>
@@ -98,11 +98,11 @@
   <rect class="box io" x="330" y="696" width="200" height="40"/>
   <text x="430" y="721" text-anchor="middle" class="lbl">attention output (B, S, 1536)</text>
 
-  <!-- note -->
-  <rect x="30" y="392" width="300" height="86" rx="8" fill="#fff7ed" stroke="#fdba74"/>
-  <text x="45" y="414" class="note" font-weight="700">Why cache only the latent?</text>
-  <text x="45" y="432" class="note">RoPE is positional → can't cache rotated K.</text>
-  <text x="45" y="448" class="note">V is derived from the un-rotated latent.</text>
-  <text x="45" y="464" class="note">One 512-vec rebuilds K (view→norm→RoPE)</text>
-  <text x="45" y="478" class="note">and V (v_from_k) → ~2× smaller cache.</text>
+  <!-- note (bottom-left, clear of the K/V column) -->
+  <rect x="30" y="560" width="258" height="100" rx="8" fill="#fff7ed" stroke="#fdba74"/>
+  <text x="44" y="582" class="note" font-weight="700">Why cache only the latent?</text>
+  <text x="44" y="600" class="note">RoPE is positional → can't cache rotated K.</text>
+  <text x="44" y="616" class="note">V is derived from the un-rotated latent.</text>
+  <text x="44" y="632" class="note">One 512-vec rebuilds K (view→norm→RoPE)</text>
+  <text x="44" y="648" class="note">and V (v_from_k) → ~2× smaller cache.</text>
 </svg>
