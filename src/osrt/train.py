@@ -1452,6 +1452,13 @@ def run_pretrain_extend(
     #   (model.py adapters_a/adapters_b ParameterList) and is ALREADY in
     #   the foundation checkpoint. Injecting HRALinear here would graft a
     #   second, mismatched layout and make load_model_state_or_raise throw.
+    # Key shapes disambiguate the two "HRA"s: native uses plural,
+    #   dotted-index keys `adapters_a.N`/`adapters_b.N`; inject_hra's
+    #   HRALinear uses singular `....adapter_a` nested per wrapped Linear.
+    # NB: hra_native=True is meant to pair with hra_frozen=False (the
+    #   shipped MidtrainConfig); with both True, _freeze_hra_params keys
+    #   on singular `.adapter_a` and silently freezes nothing on a native
+    #   model.
     hra_native = getattr(extend_cfg, "hra_native", False)
     if extend_cfg.hra_enabled and not hra_native:
         from osrt.hra import inject_hra
