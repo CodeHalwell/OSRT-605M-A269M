@@ -556,15 +556,27 @@ loops=6 = baseline full quality.
 
 **Deferred / left to a GPU-specific pass (cross-ref `docs/02-attention.md`):**
 
-- **Attention sink via a fused flex-attention kernel.** The learnable per-head
-  attention sink (`ARCHITECTURE.md` §6.6) needs an extra term in the softmax
-  denominator that SDPA cannot express, so OSRT uses a manual log-sum-exp rescale
-  path (`src/osrt/model.py:1057-1121`). `flex_attention(return_lse=True)` was
-  investigated as the "flash + lse" route but on the current target (torch 2.12,
-  CPU) it materialises the full score matrix anyway without `torch.compile`, emits
-  a deprecation warning, and needs a custom `mask_mod` for GQA — so the manual
-  O(S·total_len) path was kept as the simplest provably-correct option
-  (`src/osrt/model.py:1077-1085`). A fused kernel is a natural GPU-side follow-up.
+- **Attention is flash SDPA — the sink (and its fused-kernel follow-up) is
+  retired by default.** The shipping preset sets `attention_sink=False`
+  (`src/osrt/presets.py:54`), so every attention call goes through fused
+  `F.scaled_dot_product_attention` and the score matrix is never materialised
+  (`src/osrt/model.py:1177-1183`). The learnable per-head attention sink
+  (`ARCHITECTURE.md` §6.6) needed an extra term in the softmax denominator that
+  SDPA cannot express, so when it was on it routed to a manual log-sum-exp
+  rescale path (`_attention_with_sink`, `src/osrt/model.py:1187-1251`) that
+  materialised the full `(B, H, S, total_len)` score matrix per head. At the
+  seq-8192 instruction phase that matrix (~12 GB at batch 2, *recomputed* in the
+  gradient-checkpointed backward) OOMed the run (>85 GB); flash never builds the
+  score matrix, so the same seq-8192 / batch-2 config fits at 35.9 GB — which is
+  why the sink was dropped (see `docs/02-attention.md` §6.3). The
+  `flex_attention(return_lse=True)` "flash + lse" route (the natural way to keep
+  a fused kernel *and* recover the log-sum-exp the sink rescale needs) was
+  investigated but rejected for the current target (torch 2.12, CPU): without
+  `torch.compile` it materialises the full score matrix anyway, emits a
+  `return_lse` deprecation warning, and needs a custom `mask_mod` for GQA
+  (`_attention_with_sink` docstring, `src/osrt/model.py:1207-1215`). With the
+  sink off none of this is on the critical path; the manual path and the
+  fused-kernel follow-up matter only if `attention_sink` is ever re-enabled.
 - **Fused cross-entropy.** The training-time losses use stock
   `F.cross_entropy` (`src/osrt/model.py:1678`, `1727`, `1780`); a fused CE is a
   training-throughput item, not an inference one, and is out of scope for the

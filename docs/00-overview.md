@@ -37,7 +37,7 @@ config change.
 
 | quantity | value |
 |---|---|
-| **Physical parameters** | **601,444,465 (~601M)** |
+| **Physical parameters** | **601,444,393 (~601M)** |
 | **Active per token (inference)** | **278,217,841 (~278M, 46.3%)** |
 | Hidden dim `d_model` | 1,536 |
 | Vocab | 65,536 (byte-level BPE) |
@@ -58,10 +58,15 @@ config change.
 
 The **architecture is implemented** in `src/osrt/`. 144 unit tests pass,
 and the `dummy_train` / `sanity_overfit` CPU smoke tests confirm the full
-stack trains and learns without MoE/loop collapse. **No GPU training run
-has happened yet** — the model is in CPU pre-flight; several
-optimizations (flex attention sink, fused cross-entropy, mHC stability,
-grouped-GEMM MoE) are deferred to GPU bring-up.
+stack trains and learns without MoE/loop collapse. GPU bring-up has begun:
+the attention sink was **dropped** in favour of flash
+`F.scaled_dot_product_attention` (the manual sink path OOMed at seq 8192;
+flash fits — `presets.py:47-54`), and **grouped-GEMM MoE** is on
+(`moe_grouped_gemm=True`, validated on H100 to track the loop path,
+dropless, ~9-12% faster — `presets.py:55-60`). Fused cross-entropy and
+gradient checkpointing are wired and mandatory for the 80GB fit
+(seq-2048 footprint ~39.5GB); mHC stability still needs profiling on real
+hardware.
 
 ## How a token flows through the model
 
@@ -79,7 +84,7 @@ input_ids
    │     ┌──────────────────────────────────────────────┐   │
    │     │ Attention sub-block                            │   │
    │     │   GQA + V-from-K latent cache                  │   │ → ch.02
-   │     │   QK-Norm, RoPE, attention sink                │   │
+   │     │   QK-Norm, RoPE, flash SDPA (no sink)          │   │
    │     │   + HRA rank-256 adapter (this effective layer)│   │ → ch.05
    │     │ mHC mixes the contribution into the streams    │   │ → ch.04
    │     ├──────────────────────────────────────────────┤   │
@@ -88,10 +93,12 @@ input_ids
    │     │   sqrt(softplus) router, top-2 of 8            │   │ → ch.03
    │     │   1 shared expert (always on) + 2 routed       │   │
    │     │   aux-loss-free balance bias                   │   │
+   │     │   grouped-GEMM dispatch (dropless, fullgraph)  │   │
    │     │ mHC mixes the contribution into the streams    │   │
    │     └──────────────────────────────────────────────┘   │
    │                                                          │
-   │   (end of loop r → capture hidden for per-loop aux loss) │ → ch.06/07
+   │   (end of loop r → per-loop aux loss + collapse         │ → ch.06/07
+   │      telemetry: loop/update_norm_l* residual norm)      │
    └──────────────────────────────────────────────────────────┘
    │
    ▼  collapse the n_hc streams (dedicated mhc_collapse head) → ch.04
@@ -112,7 +119,7 @@ shrinks it for deployment.
 | # | chapter | covers |
 |---|---|---|
 | 01 | [Tokenizer & Embedding](01-tokenizer-embedding.md) | byte-level BPE, the 21-token contract (14 built / 7 missing), tied embedding ↔ LM head |
-| 02 | [Attention](02-attention.md) | GQA, the V-from-K latent KV cache, RoPE, QK-Norm, attention sink |
+| 02 | [Attention](02-attention.md) | GQA via flash `F.scaled_dot_product_attention`, the V-from-K latent KV cache, RoPE, QK-Norm (attention sink dropped) |
 | 03 | [MoE & Routing](03-moe-and-routing.md) | shared + 8 routed experts, sqrt(softplus) router, aux-loss-free balancing, hash routing, SwiGLU clamp |
 | 04 | [mHC](04-mhc.md) | the n_hc=4 residual stream, Birkhoff/Sinkhorn doubly-stochastic mixing, the collapse head |
 | 05 | [HRA Adapters](05-hra-adapters.md) | the 18 rank-256 attention-path adapters (+ the separate injected retrofit path) |

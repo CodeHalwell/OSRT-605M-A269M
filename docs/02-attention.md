@@ -6,7 +6,7 @@
 
 ## 1. Purpose / summary
 
-Each physical transformer block in OSRT-605M runs an attention sub-block followed by a Mixture-of-Experts sub-block (`RecursiveBlock`, `src/osrt/model.py:889`). The attention sub-block is grouped-query attention (GQA) with an MLA-style **compressed K/V latent**: 24 query heads attend over 8 key/value heads of head-dim 64, but instead of caching K *and* V it caches a single un-rotated 512-dim latent `c_kv`, reads K straight off it, and derives V from it with one learned linear map. On top of that it layers three numerical/expressivity refinements that have become standard in 2024–2025 small models: **QK-Norm** (bound the logits), **RoPE** (inject position), and a learnable **attention sink** (let a head attend to "nothing"). The method returns a *pre-residual contribution* — the caller decides how to fold it back into the stream (plain residual add, or a manifold-constrained hyper-connection mix). This document walks each piece and explains *why* it is built the way it is.
+Each physical transformer block in OSRT-605M runs an attention sub-block followed by a Mixture-of-Experts sub-block (`RecursiveBlock`, `src/osrt/model.py:1019`). The attention sub-block is grouped-query attention (GQA) with an MLA-style **compressed K/V latent**: 24 query heads attend over 8 key/value heads of head-dim 64, but instead of caching K *and* V it caches a single un-rotated 512-dim latent `c_kv`, reads K straight off it, and derives V from it with one learned linear map. The actual attention is **standard flash SDPA** (`F.scaled_dot_product_attention`) — the score matrix is never materialised. On top of GQA + latent KV it layers two numerical/expressivity refinements that have become standard in 2024–2025 small models: **QK-Norm** (bound the logits) and **RoPE** (inject position). A third refinement — a learnable **attention sink** (let a head attend to "nothing") — was implemented but is now **dropped from the shipping preset** (`attention_sink=False`); its code path still exists behind that flag but is dormant (§6). The method returns a *pre-residual contribution* — the caller decides how to fold it back into the stream (plain residual add, or a manifold-constrained hyper-connection mix). This document walks each piece and explains *why* it is built the way it is.
 
 The whole attention stack costs **17,308,032 parameters across the 3 blocks** (`scripts/compute_budget.py` — see §8).
 
@@ -149,11 +149,13 @@ It splits the 64-dim head vector into two halves of 32 and pairs dim *i* with di
 
 ---
 
-## 6. Attention sink — what it is, the two paths, why it disables flash
+## 6. Attention sink — what it was, why it was dropped, the dormant path
+
+> **Status: DROPPED.** The shipping preset now sets `attention_sink=False` (`src/osrt/presets.py:54`). Attention runs through standard flash SDPA (§6.4). The sink code — the `sink_logits` parameter (`src/osrt/model.py:1062-1074`) and the `_attention_with_sink` method (`src/osrt/model.py:1187-1251`) — still **exists** behind the flag, but with the flag off it is never constructed or called. This section documents what it was and the OOM finding that retired it.
 
 ### 6.1 The idea
 
-A standard softmax forces a query's attention weights to sum to exactly 1: the query *must* spread its attention over the available keys, even when none of them is relevant. An attention sink relaxes that. It adds one extra, learnable term to the softmax **denominator only** (`src/osrt/model.py:932-944`):
+A standard softmax forces a query's attention weights to sum to exactly 1: the query *must* spread its attention over the available keys, even when none of them is relevant. An attention sink relaxes that. It adds one extra, learnable term to the softmax **denominator only** (`src/osrt/model.py:1062-1074`):
 
 ```python
 self.attention_sink = config.attention_sink
@@ -161,40 +163,47 @@ if config.attention_sink:
     self.sink_logits = nn.Parameter(torch.zeros(self.heads))
 ```
 
-The math (from the docstring at `src/osrt/model.py:937`):
+The math (from the docstring at `src/osrt/model.py:1067`):
 
 ```
 s_{h,i,j} = exp(z_{h,i,j}) / (Σ_k exp(z_{h,i,k}) + exp(sink[h]))
 ```
 
-`sink_logits` is one scalar **per query head** (length 24 — `torch.zeros(self.heads)`), initialised to zero so the sink contributes `exp(0) = 1` to the denominator at step 0. Because the sink has no value vector, it never enters the numerator — it only ever *removes* probability mass. The effect: a head's real attention weights are now allowed to sum to **less than 1**, i.e. the head can attend to "nothing" when nothing is relevant (`ARCHITECTURE.md` §6.6). In the preset, `attention_sink=True` (`src/osrt/presets.py:47`).
+`sink_logits` is one scalar **per query head** (length 24 — `torch.zeros(self.heads)`), initialised to zero so the sink contributes `exp(0) = 1` to the denominator at step 0. Because the sink has no value vector, it never enters the numerator — it only ever *removes* probability mass. The effect: a head's real attention weights are now allowed to sum to **less than 1**, i.e. the head can attend to "nothing" when nothing is relevant (`ARCHITECTURE.md` §6.6). With the flag off, `sink_logits` is never even allocated (the `if config.attention_sink` guard at `src/osrt/model.py:1073` is false), and the model is 72 params lighter than it was with the sink on.
 
-### 6.2 Two code paths
+### 6.2 The dormant manual path
 
-The branch is in `_attention` (`src/osrt/model.py:1034-1053`):
+When the sink *was* enabled, the branch in `_attention` (`src/osrt/model.py:1165`) routed to a hand-written attention (`_attention_with_sink`, `src/osrt/model.py:1187-1251`) instead of SDPA. PyTorch's fused `F.scaled_dot_product_attention` (flash attention) computes a *plain* softmax and gives you no hook to add a term to its denominator, so the sink path had to materialise the score matrix explicitly.
 
-- **Sink enabled → manual path** (`_attention_with_sink`, `src/osrt/model.py:1057-1121`). PyTorch's fused `F.scaled_dot_product_attention` (flash attention) computes a *plain* softmax and gives you no hook to add a term to its denominator. So when the sink is on, the block falls back to a hand-written attention that materialises the score matrix explicitly.
+The clever part is that it does **not** redo a "softmax with sink." It computes the ordinary masked softmax output `out` and the per-query log-sum-exp `lse = log Σ_k exp(z)`, then rescales (`src/osrt/model.py:1242-1251`):
 
-  The clever part is that it does **not** redo a "softmax with sink." It computes the ordinary masked softmax output `out` and the per-query log-sum-exp `lse = log Σ_k exp(z)`, then rescales (`src/osrt/model.py:1109-1121`):
+```python
+scores_f = scores.float()
+lse = torch.logsumexp(scores_f, dim=-1)
+attn_weights = torch.softmax(scores_f, dim=-1).to(v.dtype)
+out = torch.matmul(attn_weights, v)
 
-  ```python
-  scores_f = scores.float()
-  lse = torch.logsumexp(scores_f, dim=-1)
-  attn_weights = torch.softmax(scores_f, dim=-1).to(v.dtype)
-  out = torch.matmul(attn_weights, v)
+sink = self.sink_logits.float().view(1, H, 1)
+rescale = torch.sigmoid(lse - sink).unsqueeze(-1).to(out.dtype)
+return out * rescale
+```
 
-  sink = self.sink_logits.float().view(1, H, 1)
-  rescale = torch.sigmoid(lse - sink).unsqueeze(-1).to(out.dtype)
-  return out * rescale
-  ```
+Adding `exp(sink)` to the denominator simply multiplies the sink-free output by `Σexp(z) / (Σexp(z) + exp(sink)) = sigmoid(lse - sink[h])`, because the sink's value is zero (`src/osrt/model.py:1196-1205`). This is an *exact* rescale, computed in fp32 for stability, not an approximation. GQA broadcasting is done explicitly with `repeat_interleave(self.group_size, dim=1)` on the KV heads (`src/osrt/model.py:1221-1223`), and the causal mask is built to match SDPA's semantics exactly (`src/osrt/model.py:1233-1237`). This code is still present but inert: with `attention_sink=False` the `if self.attention_sink` branch is never taken.
 
-  Adding `exp(sink)` to the denominator simply multiplies the sink-free output by `Σexp(z) / (Σexp(z) + exp(sink)) = sigmoid(lse - sink[h])`, because the sink's value is zero (`src/osrt/model.py:1066-1075`). This is an *exact* rescale, computed in fp32 for stability, not an approximation. GQA broadcasting is done explicitly with `repeat_interleave(self.group_size, dim=1)` on the KV heads (`src/osrt/model.py:1091-1093`), and the causal mask is built to match SDPA's semantics exactly (`src/osrt/model.py:1103-1107`).
+### 6.3 Why the sink was dropped — the seq-8192 OOM
 
-- **Sink disabled → SDPA / flash path** (`src/osrt/model.py:1042-1053`). With `attention_sink=False` the block uses `F.scaled_dot_product_attention` with `enable_gqa=gqa` so SDPA broadcasts the KV groups internally without materialising repeated heads. Two sub-cases: a cached-decode case (`past_len > 0 and S > 1`) builds an explicit triangular `attn_mask`; the prefill / single-token case uses `is_causal=(S > 1)`. The sink parameter is `None` in this configuration specifically so the standard path stays bit-identical (`src/osrt/model.py:940-941`).
+That manual path is exactly what killed it. Flash/SDPA is a *fused* kernel: it never writes the full `S × total_len` score matrix to memory, which is what makes it memory-frugal at long context. But its softmax denominator is fixed — there is no API to inject `exp(sink[h])`. To get the sink you must compute the denominator yourself, which means materialising a `(B, H, S, total_len)` score matrix per head (`src/osrt/model.py:1226`).
 
-### 6.3 Why the sink disables flash
+At the **seq-8192 instruction phase** that matrix is roughly 12 GB at batch 2 — and because the block is gradient-checkpointed, the scores are *recomputed* in the checkpointed backward, so that cost is paid again. The measured result was an OOM: total memory exceeded 85 GB and the run died. The sink had been kept only because it happened to fit at the earlier seq-2048 phase, and it had shown no demonstrated quality benefit, so it was retired rather than worked around. Switching to flash SDPA (`attention_sink=False`) makes the **same** seq-8192 / batch-2 configuration fit at **35.9 GB** — flash never builds the score matrix, so there is nothing to recompute in the backward (`src/osrt/presets.py:47-54`).
 
-Flash/SDPA is a *fused* kernel: it never writes the full `S × total_len` score matrix to memory, which is exactly what makes it fast and memory-frugal at long context. But its softmax denominator is fixed — there is no API to inject `exp(sink[h])`. To get the sink, you must compute the softmax denominator yourself, which means materialising the scores. So enabling the sink trades flash attention's fused efficiency for a manual `O(S × total_len)` score matrix per head (`src/osrt/model.py:1083-1085`). At the model's current sequence lengths this is fine — the comment calls it "the simplest thing that is provably right" — but it is the dominant attention cost at long context (see §9).
+### 6.4 What ships: flash SDPA
+
+With `attention_sink=False` the block uses `F.scaled_dot_product_attention` with `enable_gqa=gqa` so SDPA broadcasts the KV groups internally without materialising repeated heads. There are two sub-cases (`src/osrt/model.py:1172-1183`):
+
+- **Cached decode** (`past_len > 0 and S > 1`): an explicit triangular `attn_mask` is built so the `S` new query positions attend causally over the full `[0:total_len]` span (`src/osrt/model.py:1172-1179`).
+- **Prefill / single-token decode**: `is_causal=(S > 1)` — causal for a multi-token prefill, unmasked for a single-token decode step (`src/osrt/model.py:1180-1183`).
+
+Because the sink is off, `sink_logits` is never allocated and the manual path is dead code, so attention is bit-for-bit the standard fused kernel.
 
 ---
 
@@ -258,9 +267,9 @@ For context, attention is a small slice of the 605M physical total — the route
 
 ## 9. Known caveats / GPU-phase notes
 
-- **The attention sink disables flash attention.** With `attention_sink=True` (the shipping preset), every attention call materialises the full `S × total_len` score matrix per head (`src/osrt/model.py:1083-1085`). That is `O(S²)` memory and compute at prefill and grows with context during decode. At the model's current sequence lengths this is acceptable and provably correct, but it is the obvious bottleneck once context grows on GPU.
+- **Attention is now flash SDPA — the sink no longer constrains it.** The shipping preset sets `attention_sink=False` (`src/osrt/presets.py:54`), so every attention call goes through fused `F.scaled_dot_product_attention` and the `S × total_len` score matrix is never materialised (`src/osrt/model.py:1172-1183`). This is what retired the sink: its manual path materialised a `(B, H, S, total_len)` score matrix (`src/osrt/model.py:1226`), and at the seq-8192 instruction phase the gradient-checkpointed backward recompute of that matrix OOMed (>85 GB at batch 2); flash fits the same config at 35.9 GB (§6.3). The `O(S²)` attention-memory bottleneck this caveat used to warn about is gone with the default preset. The sink code path still exists behind `attention_sink` (default False) and would reintroduce the score-matrix cost only if re-enabled.
 
-- **flex_attention is investigated/planned, not shipping.** The `_attention_with_sink` docstring (`src/osrt/model.py:1077-1085`) records that `flex_attention(return_lse=True)` was evaluated as the "flash + lse" route — the natural way to keep a fused kernel *and* recover the log-sum-exp needed for the sink rescale — but was rejected for the current target (torch 2.12 / CPU): it emitted a `return_lse` deprecation warning, materialised the full score matrix anyway without `torch.compile`, and needed a custom `mask_mod` to express GQA broadcasting. It is listed as future **GPU-phase** work in `ARCHITECTURE.md:1486` ("flex-attention" among the GPU-phase optimizations). There is no separate flex feature branch in this repo today; flex is the planned fix for the `O(S²)` sink cost, not a current option.
+- **flex_attention is moot for the default config, recorded only for the dormant sink path.** The `_attention_with_sink` docstring (`src/osrt/model.py:1207-1215`) records that `flex_attention(return_lse=True)` was evaluated as the "flash + lse" route — the natural way to keep a fused kernel *and* recover the log-sum-exp needed for the sink rescale — but was rejected for the current target (torch 2.12 / CPU): it emitted a `return_lse` deprecation warning, materialised the full score matrix anyway without `torch.compile`, and needed a custom `mask_mod` to express GQA broadcasting. With the sink off this is no longer on the critical path — flash SDPA already gives the fused kernel with no score matrix. It remains listed as **GPU-phase** work in `ARCHITECTURE.md:1486` only as the route that *would* be needed if the sink were ever revived.
 
 - **Partial RoPE is a no-op at this config** (see §5.2): `ARCHITECTURE.md` §6.5 describes partial rotary, but with `head_dim = 64` and "last 64 dims" it is full rotation. A future genuinely-partial variant would need code changes.
 

@@ -608,8 +608,23 @@ than for non-recurrent models.
 
 ### What we adopted
 
-- **Nemotron-CC-Math** as math data source in pretrain mix (already
-  in v5 lineage; carry to v6)
+- **Math-first Nemotron/Cosmopedia pretrain mix** — the v6 mix in
+  `train_config.py` (2026-06-08) makes NVIDIA Nemotron sets the
+  backbone and drops the old codeparrot-clean + Wikipedia streams:
+  - **Foundation** (seq 2048): fineweb-edu 0.40, Nemotron-CC-Math-v1
+    `4plus` 0.25, Nemotron-Pretraining-Code-v2
+    `Synthetic-Question-Answering` 0.20, Cosmopedia `web_samples_v2`
+    0.15
+  - **Knowledge** (seq 4096): Nemotron-CC-Math-v1 `4plus` 0.25,
+    Nemotron-Pretraining-Specialized-v1 `STEM-SFT` 0.15 +
+    `Math-Textbooks` 0.15 + `InfiniByte-Reasoning` 0.10, fineweb-edu
+    0.15, Nemotron Code `Synthetic-Question-Answering` 0.10, Cosmopedia
+    `openstax` 0.10
+  - **Instruction** (seq 8192): smoltalk, Evol-Instruct-Code,
+    OpenHermes-2.5, Nemotron-Post-Training-Dataset-v1 (math + stem)
+  - Most NVIDIA Nemotron sets are **gated** (Nemotron-CC-Math,
+    Nemotron-Pretraining-*, Nemotron-Post-Training) — access approval
+    required.
 - **Nemotron-CC ensemble approach** as Tier 3 upgrade path for v6
   pretraining
 
@@ -617,6 +632,10 @@ than for non-recurrent models.
 
 - **Nemotron 3 Ultra as teacher** for MOPD — too slow (100s/rollout
   vs DeepSeek's 13s)
+- **codeparrot-clean + Wikipedia** as pretrain streams — dropped from
+  the v6 base mix in favour of the Nemotron synthetic-QA code +
+  Nemotron/Cosmopedia knowledge streams above (they survive only in
+  the mid-training extend configs).
 
 ---
 
@@ -792,3 +811,6 @@ summarized:
 
 - **2026-06-07** — initial creation, captures all research integrated
   through DeepSeek-V4 / LFM2 / AlphaQ
+- **2026-06-09** — §12 updated to the implemented math-first
+  Nemotron/Cosmopedia pretrain mix (`train_config.py`); recorded the
+  drop of codeparrot-clean + Wikipedia from the v6 base mix

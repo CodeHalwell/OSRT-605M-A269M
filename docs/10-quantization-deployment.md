@@ -18,7 +18,7 @@ is labelled IMPLEMENTED or PLANNED, and section 7 has the full table. Where the
 code and the spec disagree, the code wins and the discrepancy is flagged.
 
 A naming note. The `docs/` series brands the model **OSRT-605M**;
-`compute_budget.py` reports **601,444,465 physical parameters** ("~601M"); and
+`compute_budget.py` reports **601,444,393 physical parameters** ("~601M"); and
 `ARCHITECTURE.md §2.5` brands it "OSRT-600M". These are the same model — the
 suffix is a round marketing label, not a precise count. This document uses the
 exact figure **601M physical** for all memory math.
@@ -30,7 +30,7 @@ exact figure **601M physical** for all memory math.
 OSRT is a mixture-of-experts model. Its *physical* parameter count (601M) is
 large because it stores many routed experts, but only a fraction
 (~278M, 46%) is *active* per token — the router picks the top-2 of 8 experts per
-MoE block (`compute_budget.py` reports `ACTIVE / TOKEN 278,217,841`). That gap
+MoE block (`compute_budget.py` reports `ACTIVE / TOKEN 278,217,769`). That gap
 is the whole point of MoE: lots of stored knowledge, cheap per-token compute.
 
 But "cheap compute" does not mean "cheap memory". On a phone or a Pi, **every
@@ -66,10 +66,10 @@ The real per-component parameter breakdown, straight from
   router                   36,867
   adapters (HRA)       14,155,776    ( 2.4%)
   mtp_heads             4,721,664    ( 0.8%)   ← DROPPED at deploy
-  norms_misc                7,752
+  norms_misc                7,680
   ----------------------------------------------
-  TOTAL PHYSICAL      601,444,465    (~601M)
-  ACTIVE / TOKEN      278,217,841    (~278M, 46.3% of physical, excl. MTP)
+  TOTAL PHYSICAL      601,444,393    (~601M)
+  ACTIVE / TOKEN      278,217,769    (~278M, 46.3% of physical, excl. MTP)
 ```
 
 Two things to read off this table.
@@ -402,7 +402,62 @@ in `ARCHITECTURE.md §14`, not yet implemented**.
 
 ---
 
-## 8. Cross-references
+## 8. Saving & loading the deployed model — HF compliance (IMPLEMENTED)
+
+Quantization decides how *small* the artifact is; this section is about the
+*format* it ships in. The model is a `transformers.PreTrainedModel` subclass
+(`OSRTPreTrainedModel`, `src/osrt/model.py:1339`) with `model_type = "osrt"`
+(`config.py:32`), and `save_pretrained` / `from_pretrained` **round-trip
+bit-exact** when the `osrt` package is installed — so a deployed checkpoint
+reloads to the identical weights it was saved with.
+
+**The persistent-RoPE fix (load-bearing for correctness).** The RoPE
+`cos`/`sin` tables are registered with `persistent=True`
+(`model.py:1389-1390`), so they are written into the checkpoint and restored on
+load. They were previously `persistent=False`: HF's `from_pretrained` builds the
+model skeleton on the **meta device** and then never materialises non-loaded
+buffers, leaving `rope_cos`/`rope_sin` as **uninitialised garbage** —
+**corrupting RoPE on every reloaded model**. Making them persistent costs ~2 MB
+at the real config (negligible) and is what makes the round-trip actually
+correct, not just structurally valid (rationale at `model.py:1382-1388`). The
+on-the-fly recompute path still handles sequence lengths beyond the cached range
+(`model.py:1558-1573`).
+
+**Auto-class registration.** Importing the package registers the model with the
+HF auto-classes (`model.py:2569-2576`):
+
+- `AutoConfig.register("osrt", OSRTConfig)` and
+  `AutoModelForCausalLM.register(OSRTConfig, OSRTForCausalLM)` let
+  `AutoModelForCausalLM.from_pretrained(dir)` and `.from_config(cfg)` resolve the
+  class **without naming it** (guarded by `try/except ValueError` so a re-import
+  is a no-op).
+- `OSRTConfig.register_for_auto_class()` and
+  `OSRTForCausalLM.register_for_auto_class("AutoModelForCausalLM")` make
+  `save_pretrained` write the `auto_map` into `config.json` — the hook that
+  `trust_remote_code` loading reads.
+
+**Deployment-relevant flags on the base class** (`model.py:1348-1351`):
+
+- `supports_gradient_checkpointing = False` — checkpointing is managed
+  internally via the private `OSRTModel._osrt_grad_ckpt` gate set by the trainer,
+  **not** HF's `gradient_checkpointing_enable()`; advertising `False` stops HF
+  attempting its own mechanism (which trips `post_init` and isn't what runs).
+- `_no_split_modules = ["RecursiveBlock"]` keeps each recursive block intact
+  under `device_map="auto"` sharding.
+- A **custom `generate()`** is retained on `OSRTForCausalLM` (the latent-only KV
+  cache and recursive decode are not expressible through HF's default loop).
+
+**Caveat — full `trust_remote_code` without the package is a follow-up.**
+The Auto* path above is fully functional *with the `osrt` package installed*.
+Loading purely via `trust_remote_code` (no package) additionally needs
+self-contained modeling/config files in the repo, because osrt's cross-module
+imports (`fused_ce`, `hra`, `muon`) are **not auto-copied** by
+`save_pretrained`. That consolidation is a separate follow-up
+(`model.py:2564-2568`).
+
+---
+
+## 9. Cross-references
 
 - **KV cache layout, size, and decode update:** `ARCHITECTURE.md §13.2` (cache
   growth: 18 KB/token, 72 MB at 4K) and `§13.4` (un-rotated K_DOWN is what gets

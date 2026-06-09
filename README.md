@@ -73,10 +73,10 @@ Routed experts: 3 × 8 × SwiGLU h=3840          : 424,673,280   (top-2 of 8 →
 HRA adapters (rank 256, 18 injection points)   :  14,155,776   (always trained)
 MTP heads × 2 (training-only, dropped at deploy):  4,721,664
 mHC (Sinkhorn/Birkhoff mixers)                 :     921,766
-Router + loop_emb + norms + sink               :      ~45,929
+Router + loop_emb + norms                       :      ~44,547
 
-Total physical params                          : 601,444,465 (~601M)
-Active per token (inference, excl. MTP)         : 278,217,841 (~278M, 46.3 %)
+Total physical params                          : 601,444,393 (~601M)
+Active per token (inference, excl. MTP)         : 278,217,769 (~278M, 46.3 %)
 Effective compute per token (× 6 loops)        : ~2.5 B FLOPs-equivalent
 ```
 

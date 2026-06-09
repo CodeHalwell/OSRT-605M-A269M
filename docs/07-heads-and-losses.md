@@ -519,6 +519,16 @@ against the dense path.
 > described in §§2–4. The optimization remains available to merge when the GPU
 > phase needs the activation memory back; until then this section documents the
 > *design and rationale*, not live code.
+>
+> The **attention-sink (B1)** half of that same `b1b2-attn-sink-fused-ce` branch
+> likewise never landed, and the canonical model does **not** use an attention
+> sink. The preset sets `attention_sink=False` (`src/osrt/presets.py:54`), so
+> attention routes through flash `F.scaled_dot_product_attention`
+> (`src/osrt/model.py:1177-1183`) rather than the manual sink-rescale path. The
+> `sink_logits` / `_attention_with_sink` machinery still exists in the model
+> guarded behind that flag, but it is off in the trained model. (Attention itself
+> is covered in chapter 02; mentioned here only because the same branch name
+> couples it to the fused-CE history above.)
 
 ---
 

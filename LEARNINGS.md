@@ -628,6 +628,106 @@ For balance — the lessons aren't all "what we did wrong":
 
 ---
 
+## 11a. v6 implementation lessons (CPU pre-flight → GPU bring-up, 2026-06-08/09)
+
+These are NOT v5 training lessons — they're things the v6 (OSRT-600M)
+implementation taught us as the `src/osrt/` stack moved from CPU
+pre-flight toward the first GPU pretraining run. Recorded here so we
+don't relitigate them.
+
+### 11a.1 The attention sink doesn't scale to long context — OOMs at seq 8192
+
+We kept v5's learnable attention sink (per-head sink logit added to the
+softmax denominator) into the v6 build. It works only because it
+HAPPENED to fit at seq 2048. The sink term cannot be expressed by
+`F.scaled_dot_product_attention` (SDPA only normalises over the real
+keys), so it forces a **manual attention path that materialises a full
+(B, H, S, S) score matrix** (`_attention_with_sink` in model.py). At
+the seq-8192 instruction phase that score matrix is ~12 GB and gets
+recomputed inside the gradient-checkpointed backward → measured OOM
+(>85 GB) at batch 2.
+
+**The fix:** `attention_sink=False` (presets.py). With the sink off,
+attention routes through flash SDPA (`F.scaled_dot_product_attention`,
+standard GQA, `enable_gqa=True`), which never builds the score matrix —
+the SAME workload fits at **35.9 GB**. The sink had no demonstrated
+quality benefit; it was kept only because it fit at short context.
+The V-from-K latent KV cache is unchanged. Dropping the sink param
+moved the model from the old count to **601,444,393 params**.
+
+**Lesson:** don't carry a feature into a longer-context phase just
+because it fit at short context. Anything that defeats flash attention
+(materialises the score matrix) is a long-context OOM waiting to
+happen. Default to SDPA; only diverge from it for a measured win.
+
+### 11a.2 Flash attention alone does NOT let you drop gradient checkpointing
+
+Switching sink→flash freed a lot of activation memory, but the 80 GB
+H100 budget still REQUIRES gradient checkpointing (and fused
+linear-CE) to fit the recursive 18-effective-layer forward at the
+target batch/seq. Flash buys headroom; it does not buy you out of
+checkpointing. Both are mandatory together for v6 on a single H100.
+
+**Lesson:** these are independent levers. "We added flash" is not a
+licence to turn off checkpointing — re-measure before assuming the
+saving compounds.
+
+### 11a.3 B4 grouped-GEMM removes the only torch.compile graph break
+
+v6's MoE dispatch had a per-expert `.nonzero()` gather (the loop path,
+`_dispatch_loop`). That data-dependent op is **the only torch.compile
+graph break** in the model — it was responsible for all 12 graph
+breaks and blocked fullgraph compilation. Replacing it with a
+sort-by-expert +
+`torch._grouped_mm` grouped-GEMM dispatch (`moe_grouped_gemm=True`,
+`_dispatch_grouped`) is dropless and compiles **fullgraph (0 graph
+breaks)**, ~9-12% faster steady-state. Weights are identical to the
+loop path, so checkpoints load under either dispatch; the loop path is
+retained as a CPU-safe fallback.
+
+**Lesson:** one data-dependent op (`.nonzero()`, `.item()`, dynamic
+shapes) can cost you fullgraph compile across the WHOLE model. Hunt
+the graph breaks; a single fix can be worth all the others combined.
+
+### 11a.4 Non-persistent rope buffers get materialised as garbage by HF from_pretrained
+
+Making the v6 model HF-compliant (`save_pretrained`/`from_pretrained`,
+AutoConfig/AutoModelForCausalLM registration) surfaced a subtle data
+corruption: HF's `from_pretrained` builds the model skeleton on the
+**meta device**, then loads only the saved tensors. RoPE cos/sin
+tables are derived from config, so the instinct is to register them
+`persistent=False` (don't bloat the checkpoint). But a non-persistent
+buffer is NOT in the checkpoint → `from_pretrained` leaves it as the
+**uninitialised meta-device garbage** the skeleton allocated → every
+reloaded model had corrupted RoPE.
+
+**The fix:** register `rope_cos`/`rope_sin` with `persistent=True`
+(model.py) so they ride along in the checkpoint and get restored. ~2 MB
+at the real config — negligible. The on-the-fly recompute path still
+handles seq_len beyond the cached range.
+
+**Lesson:** under meta-device init, "derived from config" is NOT the
+same as "safe to omit from the checkpoint". Any buffer you want
+correct after `from_pretrained` must be persistent (or explicitly
+re-materialised post-load). Also note v6 deliberately sets
+`supports_gradient_checkpointing = False` and gates checkpointing
+through a PRIVATE `_osrt_grad_ckpt` flag — HF's own gradient-checkpoint
+mechanism collided with the recursive-loop forward, so we keep HF out
+of it entirely.
+
+### 11a.5 Collapse telemetry is now wired from step 1 (the v5 lesson, applied)
+
+v5's biggest discovery (loop collapse, §1.1) and the per-loop routing
+finding (§8.4) are now permanent instrumentation in v6, not
+post-hoc probes: per-loop residual-update norm (`loop/update_norm_l*`,
+plus mean/min/last) and a dead-expert count (`moe/dead_experts_total`)
+are computed every log step and emitted to BOTH W&B and stdout. A loop
+whose update-norm → 0 has collapsed to a no-op; a rising dead-expert
+count is router collapse. This is the "measure first" principle from
+§0 finally built into the loop instead of bolted on after a regression.
+
+---
+
 ## 12. The brutal honest summary
 
 v5 was a year of "look how clever this architecture is" followed by
@@ -668,3 +768,9 @@ These are genuinely unresolved and should inform v6 ablations:
 
 - **2026-06-07** — initial creation, captures v5 lineage through
   `system_sft` in-progress
+- **2026-06-09** — added §11a (v6 CPU-pre-flight → GPU bring-up
+  lessons): attention sink OOMs at seq 8192 (flash SDPA required),
+  flash alone doesn't drop checkpointing, B4 grouped-GEMM removes the
+  only compile graph break, non-persistent rope buffers materialise as
+  meta-init garbage under HF `from_pretrained`, collapse telemetry now
+  wired from step 1

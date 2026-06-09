@@ -280,6 +280,54 @@ a usable next-token distribution, you can read off a *draft* prediction at an
 early loop and verify it at the full loop count — the speculative-decode hook of
 §7.
 
+### 4.4 Detecting collapse at runtime — the per-loop residual-update telemetry
+
+The aux losses and loop dropout (§5) *prevent* collapse; a separate telemetry
+hook *detects* it, so a regressing run is caught early. The signal is the
+**relative residual update** each effective layer makes to the hidden stream,
+`||Δx|| / ||x||`. A block whose update has decayed to ~0 has become a no-op — a
+collapsed loop — so a monotone decay through the deep loops is the at-a-glance
+collapse fingerprint.
+
+It is computed inside the recursion loop in `OSRTModel.forward`
+(`src/osrt/model.py:1636-1685`). Before each block it snapshots the residual,
+and after the block records the ratio per effective layer
+`idx = loop*num_blocks + block_idx`:
+
+```python
+# src/osrt/model.py:1681-1685
+if collect_loop:
+    base = x_prev.norm().clamp_min(1e-6)
+    upd = (x.detach() - x_prev).norm()
+    self.last_loop_update_norm[idx] = (upd / base).item()
+    self.last_loop_hidden_norm[idx] = base.item()
+```
+
+Two pieces are stored, one per effective layer: the relative update
+`last_loop_update_norm` and the raw hidden norm `last_loop_hidden_norm`
+(`src/osrt/model.py:1417-1419`).
+
+**Gated exactly like the MoE telemetry.** `collect_loop = self.telemetry_enabled`
+(`src/osrt/model.py:1641`), and the *same* `set_moe_telemetry` call that toggles
+the MoE diagnostics also flips this hook (`src/osrt/model.py:1743`,
+`"# gates the loop-collapse hook"`). On normal compiled steps it is off, so the
+`.item()`/`.detach()` syncs never run and the B4 fullgraph (chapter 03 §7) stays
+clean; on logging steps it adds the same kind of sync the MoE telemetry already
+pays for.
+
+The trainer's `_collect_moe_metrics` surfaces it (`src/osrt/train.py:452-464`):
+each layer as `loop/update_norm_l{idx}` in W&B, plus aggregate
+`loop/update_norm_min` / `_last` / `_mean`. Stdout prints a per-layer
+`loop |dx|/|x|: L0=.. L1=..` line and a `collapse:` line whose `loop_upd
+min/last/mean` come straight from these values (`src/osrt/train.py:1218-1228`),
+sitting next to the MoE-side `dead_experts` / `bias_abs_max` (chapter 03 §10).
+
+> **Scope.** This detects *recursive-loop* collapse (a deep loop gone idle) — the
+> §4 failure mode — and is distinct from the MoE *expert* collapse the
+> dead-expert count watches (chapter 03 §13). Both ride the one
+> `telemetry_enabled` gate and print on the same `collapse:` line, but they
+> measure different things.
+
 ---
 
 ## 5. Loop dropout (stochastic depth) — making early loops stand alone

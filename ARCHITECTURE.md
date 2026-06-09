@@ -77,9 +77,11 @@ physical count.
 
 > ✅ **GENERATED** — run `PYTHONPATH=src python scripts/compute_budget.py`
 > (no args = the canonical `OSRT_605M_A288M` preset). The table below is
-> a verbatim transcription of that output. Do NOT pass loose CLI
-> overrides expecting to reproduce the preset — the CLI starts from the
-> full preset and only applies explicit `--override k=v` on top.
+> a transcription of that output, with two figures hand-adjusted by −72
+> for the dropped attention sink (see the note after the table). Do NOT
+> pass loose CLI overrides expecting to reproduce the preset — the CLI
+> starts from the full preset and only applies explicit `--override k=v`
+> on top.
 
 ```
 COMPONENT                                       PHYSICAL        ACTIVE / TOKEN (inference)
@@ -112,16 +114,28 @@ HRA adapters (rank 256, 18 injection points)     14,155,776     14,155,776
 MTP heads × 2 (§9.3)                              4,721,664              0
   -- training-time only; dropped at deploy → 0 active at inference
 
-Router + loop embeddings + norms + attn sink        ~45,929        ~45,929
+Router + loop embeddings + norms                    ~45,857        ~45,857
 
 ─────────────────────────────────────────────────────────────────────────────────────
-TOTAL PHYSICAL                                  601,444,465  →  ~601M
-ACTIVE / TOKEN (inference, excl. MTP)                          278,217,841  →  ~278M
+TOTAL PHYSICAL                                  601,444,393  →  ~601M
+ACTIVE / TOKEN (inference, excl. MTP)                          278,217,769  →  ~278M
 ACTIVE FRACTION                                                    ≈ 46.3%
 ```
 
 (With the training-only MTP heads counted, the train-time active figure
 is ~283M; the 278M headline is the inference forward.)
+
+> 🔧 **Attention sink DROPPED (−72 params).** The earlier table (and the
+> repo/preset names) carried the per-head learnable sink logits
+> (3 blocks × 24 heads = 72 params, in BOTH columns). The canonical
+> preset now sets `attention_sink=False` (`presets.py`), and the sink
+> `nn.Parameter` is only created `if config.attention_sink:`
+> (`model.py::RecursiveBlock.__init__`) — so it is no longer
+> instantiated. Physical and active both drop by 72
+> (601,444,465 → 601,444,393; 278,217,841 → 278,217,769) and "attn
+> sink" is removed from the misc-params line. These two figures were
+> hand-adjusted by −72 from the last `compute_budget.py` output pending
+> a clean regen; re-run the script to refresh the full table. See §6.6.
 
 ### 2.2 At-a-glance
 
@@ -191,8 +205,10 @@ top-k masking of HRA.
 - **R**ecursive — 3 physical blocks × 6 loops = 18 effective layers
 - **T**ransformer — standard pre-norm decoder backbone
 
-`600M` rounds the **physical** parameter count of **601,444,465**
-(601M). Active per token at inference is **278M** (46.3%).
+`600M` rounds the **physical** parameter count of **601,444,393**
+(601M). Active per token at inference is **278M** (46.3%). (The count
+dropped by 72 from 601,444,465 when the per-head attention-sink logits
+were removed — see §2.1 / §6.6.)
 
 **Naming note:** the GitHub repo is `OSRT-605M-A269M` and the canonical
 preset `OSRT_605M_A288M`; both numbers were locked at earlier points
@@ -454,30 +470,60 @@ Apply RoPE to the **last 64 dimensions only** of Q and K head vectors:
 Base θ = 10,000 (standard). Will be scaled via YaRN-style for context
 extension in mid-training.
 
-### 6.6 Attention sink
+### 6.6 Attention sink — REMOVED (kept behind `attention_sink=False`)
 
-Learnable per-head sink logits:
+> 🔧 **DROPPED for OOM at long context.** The attention sink was a
+> learnable per-head sink logit added to the softmax DENOMINATOR only:
+> ```
+> sink_logits ∈ ℝ^(24)     # per RecursiveBlock; 3 × 24 = 72 params total
+> s_{h,i,j} = exp(z_{h,i,j}) / (Σ_k exp(z_{h,i,k}) + exp(sink_logits[h]))
+> ```
+> letting a head's weights sum to < 1 (attend to "nothing" when no key
+> is relevant). It is **off in the canonical preset**
+> (`presets.py: attention_sink=False`) and the standard GQA path runs
+> through `F.scaled_dot_product_attention` (flash) instead.
+>
+> **Why it was dropped:** SDPA cannot express the sink term, so
+> `attention_sink=True` falls back to the manual `_attention_with_sink`
+> path (`model.py`), which materialises the full `(B, H, S, total_len)`
+> score matrix to compute the per-query log-sum-exp for the sink
+> rescale. At the seq-8192 instruction phase that score matrix is
+> recomputed inside the gradient-checkpointed backward (~12GB at batch
+> 2) and the run measured OOM (>85GB on an 80GB H100). Flash never
+> builds the score matrix → the **same** seq-8192/batch-2 config fits at
+> ~35.9GB. The sink had no demonstrated benefit (it was kept only
+> because it happened to fit at seq 2048), so it was removed in favour
+> of v5's proven flash path which scales to every phase.
+>
+> **Code state:** the `attention_sink` config flag, the
+> `_attention_with_sink` method, and the `sink_logits` parameter all
+> still exist as a clean A/B knob. With the flag False (the canonical
+> setting) the `sink_logits` `nn.Parameter` is **never instantiated**
+> (`if config.attention_sink:` in `RecursiveBlock.__init__`), so the
+> model is 72 params lighter (§2.1). See §6.7.
+
+### 6.7 Scaled dot-product attention (flash GQA)
+
+The canonical path is standard flash SDPA — no sink:
 ```
-sink_logits ∈ ℝ^(24)
+attn_output = F.scaled_dot_product_attention(Q, K, V,
+                  is_causal=(S > 1), enable_gqa=(group_size > 1))
+# (cached-decode with S>1 builds an explicit -inf causal mask shifted
+#  by past_len instead of is_causal — model.py::_attention)
 ```
 
-Added to softmax denominator:
-```
-s_{h,i,j} = exp(z_{h,i,j}) / (Σ_k exp(z_{h,i,k}) + exp(sink_logits[h]))
-```
+`enable_gqa=True` lets SDPA broadcast the 8 KV heads across the 24
+query heads (8 groups of 3) without materialising repeated heads, and
+flash never
+builds the `(B, H, S, total_len)` score matrix — the property that
+keeps seq-8192 in memory (§6.6).
 
-Allows attention scores per head to sum to <1. Prevents the model
-from being forced to attend somewhere when no relevant context exists.
-
-### 6.7 Scaled dot-product attention
-
-Standard formulation with the modifications above:
-```
-scores = (Q_head @ K_head.T) / √64
-scores += causal_mask  # -inf above diagonal
-attn_weights = softmax_with_sink(scores)
-attn_output = attn_weights @ V_head  # V grouped to match heads
-```
+When (and only when) `attention_sink=True`, the manual
+`_attention_with_sink` path is used instead: it materialises the score
+matrix, applies the same causal mask the SDPA path uses, and rescales
+each head's output by `sigmoid(lse − sink[h])` — the exact log-sum-exp
+equivalent of adding `exp(sink[h])` to the denominator. That path is
+OFF in the canonical preset (§6.6).
 
 ### 6.8 Output projection
 
@@ -534,8 +580,8 @@ token via top-2 routing).
 ### 7.4 Router
 
 ```
-W_route ∈ ℝ^(1536 × 12)        # 18,432 params per block
-b_route_bias ∈ ℝ^(12)          # per-expert bias for load balancing
+W_route ∈ ℝ^(1536 × 8)         # 12,288 params per block
+b_route_bias ∈ ℝ^(8)           # per-expert bias for load balancing
                                 # (not in gradient; nudged by load deviation)
 ```
 
@@ -554,7 +600,7 @@ normalized_weights = softmax(balanced_affinity[top_2_indices])
 For physical blocks 0 and 1 (first 2 of 3), routing is HASH-based,
 not learned:
 ```
-expert_id = hash(token_id) mod 12
+expert_id = hash(token_id) mod 8     # mod num_routed_experts
 # Always select this fixed expert, no learned router
 ```
 
@@ -592,11 +638,15 @@ extreme imbalance within single sequences.
 
 ### 7.6 Aux-loss-free load balancing
 
+> 🔧 **Duplicate heading** — this section repeats §7.6 above (8 experts);
+> kept as-is to preserve numbering. Numbers below corrected from the
+> stale 12-expert form.
+
 Per-expert balancing bias `b_route_bias[i]` accumulates per training
 step:
 ```
-mean_load = (1/12) × total_tokens_in_batch
-for i in range(12):
+mean_load = (1/8) × total_tokens_in_batch
+for i in range(8):
     deviation = expert_load[i] - mean_load
     if deviation > 0:
         b_route_bias[i] -= γ              # nudge down
@@ -614,6 +664,31 @@ extreme imbalance within single sequences.
 ```
 moe_output(x) = shared_output(x) + Σ_{i ∈ top2} weight_i × routed_output_i(x)
 ```
+
+> ✅ **DISPATCH: grouped-GEMM (B4), loop retained as fallback.** Two
+> dispatch implementations compute the routed sum, selected by
+> `config.moe_grouped_gemm` (canonical preset: **True**; config default:
+> False). Both produce identical weights, so checkpoints load under
+> either path.
+>
+> - **`_dispatch_loop` (fallback):** the original per-expert
+>   `(assign == ei).nonzero()` gather → run expert → `index_add` scatter,
+>   with the capacity cap. Correct, but the data-dependent `.nonzero()`
+>   is **the only `torch.compile` graph break in the model**
+>   (`model.py`/`config.py` comments), so the model can't compile
+>   fullgraph with it.
+> - **`_dispatch_grouped` (B4, canonical):** flatten the (token, rank)
+>   pairs, `argsort` by chosen expert, `bincount`→`cumsum` to per-expert
+>   END offsets, one grouped SwiGLU over the sorted tokens
+>   (`_grouped_ffn`), gate, then `index_add` scatter back per token. It
+>   is **dropless** (no capacity cap — keeps every token in training) and
+>   uses only fixed-shape ops (`argsort`/`bincount`/`cumsum`/`index_add`),
+>   removing the lone graph break so the model compiles **fullgraph**.
+>   The grouped matmul is `torch._grouped_mm` on CUDA (fused) and a
+>   `_ref_grouped_mm` loop-of-matmuls reference on CPU (the kernel's CPU
+>   backward is broken). Measured ~9-12% faster steady-state on H100
+>   (gated by the gradient-checkpointing recompute), loss tracking the
+>   loop path.
 
 ### 7.8 SwiGLU Clamping (stability)
 
@@ -1188,22 +1263,36 @@ results on Qwen1.5-MoE; our 8-experts-per-block is a similar regime).
 
 ## 15. Total compute and memory math
 
-### 15.1 Training compute
+### 15.1 Training compute and budget
 
 Per token, per forward pass: ~810M FLOPs (§2.3)
 Backward is ~2× forward: ~1.6B FLOPs
 Total per token per training step: ~2.4 BFLOPs
 
-For 12B training tokens (the $280 budget):
+**Base-pretrain budget (`train_config.py::PretrainConfig`):** the LR
+cosine horizon is sized to a **~$100 Modal H100 run** (≈ $3.95/hr ≈ 25
+H100-hr):
 ```
-total_train_flops = 12e9 × 2.4e9 = 2.88e19 FLOPs
-on H100 (~989 TFLOPs/s effective for bf16):
-total_time = 2.88e19 / 9.89e14 = ~29,000 seconds
-              = ~8 hours
+total_steps  = 3,500          # LR-anneal target; cosine self-terminates here
+warmup_steps = 400            # ~11% — spins up Muon + the MoE balance bias
+peak_lr      = 6e-4  →  min_lr = 6e-5    # one continuous cosine, no re-warm
 ```
+At ~5k tok/s on the seq-2048 foundation phase (131K tok/step) that is
+**~455M tokens** by step 3,500, when the cosine has fully decayed
+peak→min_lr and the run self-terminates at the budget with a clean,
+annealed base. Long-context (4096/8192) phases and SFT/RL are separate
+chunks layered on top (`PretrainExtendConfig`, `SFTConfig`, etc.).
 
-Plus overhead (data loading, gradient accumulation, etc): **~50
-H100-hours** to pretrain 12B tokens. Matches the §12 cost estimate.
+**Memory (80GB H100):** gradient (activation) checkpointing is required
+to fit (the trainer flips the private `OSRTModel._osrt_grad_ckpt` gate),
+and the fused linear-CE for the aux/MTP heads is **available** to cut
+the (B, S, vocab) fp32 logit peak (`fused_cross_entropy_chunks`,
+routed through `osrt.fused_ce` in `train.py`; default 0 = off, opt-in
+per stage). With the canonical preset, seq-8192/batch-2 sits at
+**~35.9GB** (the flash SDPA path — the dropped attention sink's manual
+path OOMed here, §6.6). The knowledge phase (seq-4096) runs batch-6 at
+~59GB. `torch.compile` is on by default in the trainer
+(`compile_enabled`, default True).
 
 ### 15.2 Inference compute per token (generation)
 
@@ -1234,6 +1323,19 @@ to function as designed. Violating any of these is a bug.
 - `aux_loop_loss_weight > 0` during training keeps the recursion
   meaningful; if 0, training MUST monitor for loop collapse
 
+> ✅ **Collapse telemetry (implemented).** The model records, per
+> effective layer (loop × block, 18 of them), the relative residual
+> update `||Δx|| / ||x||` and the hidden norm `||x||`
+> (`OSRTModel.last_loop_update_norm` / `last_loop_hidden_norm`,
+> `model.py`). A deep loop whose update → 0 has collapsed to a no-op.
+> The trainer (`train.py::_collect_moe_metrics`) emits these to W&B and
+> stdout as `loop/update_norm_l{0..17}`, `loop/hidden_norm_l{0..17}`
+> (plus `loop/update_norm_{mean,min,last}`), alongside a routed-expert
+> health count `moe/dead_experts_total`. All of it is gated on
+> `telemetry_enabled` (toggled per-step by `set_moe_telemetry`), so the
+> `.item()` syncs never run on normal compiled steps — keeping the B4
+> fullgraph clean (§7.7).
+
 ### 16.2 mHC stability
 
 - `B_l` MUST satisfy `||B_l||_2 ≤ 1` at every step (doubly stochastic)
@@ -1243,7 +1345,9 @@ to function as designed. Violating any of these is a bug.
 ### 16.3 Routing correctness
 
 - Per training step, `Σ_i b_route_bias[i]` MUST remain bounded
-- Block 0 and Block 1 MUST use hash routing (not learned)
+- Blocks with `block_idx < hash_routing_blocks` use hash routing; the
+  canonical preset sets `hash_routing_blocks=0` so EVERY block uses the
+  learned router (hash routing is an off-by-default A/B knob — §7.5)
 - Aux-loss-free bias `b_route_bias` MUST NOT receive gradient
 - `affinity = sqrt(softplus(W_route @ x))` — NEVER negative
 
@@ -1252,7 +1356,9 @@ to function as designed. Violating any of these is a bug.
 - QK-Norm MUST apply per-head, not flattened
 - Partial RoPE applies to LAST 64 dims only
 - V derivation MUST use `V = W_V_FROM_K @ K + b_V` (not from x)
-- Attention sink logits added to denominator, not numerator
+- Canonical path MUST be flash SDPA (`attention_sink=False`); the sink
+  is removed (§6.6). IF `attention_sink=True` is ever re-enabled, the
+  sink logits MUST be added to the denominator, not the numerator
 
 ### 16.5 KV cache correctness
 
@@ -1465,6 +1571,19 @@ clear.
   path), not the early 87/132 guesses (§2.4).
 - **Loss naming** — distinct knobs exist: `aux_loop_loss_weight`,
   `router_aux_loss_coeff`, `router_z_loss_coeff` (§11 / `config.py`).
+- **HF (transformers) compliance** — `model.py`: `OSRTConfig` and
+  `OSRTForCausalLM` are registered with `AutoConfig` /
+  `AutoModelForCausalLM` (+ `register_for_auto_class`) so
+  `from_pretrained` / `from_config` work without naming the class; a
+  bit-exact `from_pretrained` round-trip is verified; `rope_cos`/
+  `rope_sin` are `persistent=True` buffers (saved in the checkpoint —
+  fixes meta-init garbage on reload); `_no_split_modules =
+  ["RecursiveBlock"]` for device-map sharding; and a custom `generate`
+  is retained. Gradient checkpointing deliberately uses a **private**
+  runtime gate (`OSRTModel._osrt_grad_ckpt`, flipped by the trainer)
+  rather than HF's mechanism, so `supports_gradient_checkpointing =
+  False` (the HF name would collide with our custom recursion — see
+  `config.py` note).
 
 ### ⚠ Partially resolved
 
@@ -1483,11 +1602,21 @@ clear.
 - **mHC stability under sustained training** — flagged NaN-prone on
   CPU pre-flight; profile on GPU before trusting (see `presets.py`
   comment + `review/architecture-optimization-2026-06-08.md` B5).
-- **GPU-phase optimizations** — fused linear-CE (B2) + flex-attention
-  sink (B1) built on branch `b1b2-attn-sink-fused-ce` (default OFF,
-  parity-tested CPU-eager only); grouped-GEMM MoE (B4), MLA decode
-  V-recompute (B3) remain recommendations. See
-  `review/architecture-optimization-2026-06-08.md`.
+- **GPU-phase optimizations — mostly LANDED (2026-06-08/09).**
+  - **B4 grouped-GEMM MoE** — landed and ON in the canonical preset
+    (`moe_grouped_gemm=True`); removes the lone graph break → fullgraph
+    compile, dropless, ~9-12% faster. Loop path retained as fallback
+    (§7.7).
+  - **B2 fused linear-CE** — landed and available for the aux/MTP heads
+    (`fused_cross_entropy_chunks`, routed through `osrt.fused_ce` in
+    `train.py`); default 0 = off, opt-in per stage (§15.1).
+  - **B1 flex-attention sink** — superseded: the attention sink itself
+    was **dropped** (`attention_sink=False`) for OOM at seq-8192;
+    canonical path is plain flash SDPA (§6.6).
+  - **B3 MLA decode V-recompute** — already implemented in `_attention`
+    (V is recomputed from the cached un-rotated latent every step; §6.2,
+    §13.4).
+  See `review/architecture-optimization-2026-06-08.md`.
 
 ---
 
@@ -1515,3 +1644,25 @@ clear.
   DECISION MADE with the implemented choice. §18 rewritten as a
   resolved/partial/open status list. §1 reframed from spec to
   implemented.
+- **2026-06-09** — **synced to the 2026-06-08/09 code changes.**
+  Attention sink DROPPED (§6.6 reframed as removed-behind-flag with the
+  seq-8192 OOM reasoning; §6.7 reframed to flash SDPA; §16.4 invariant
+  updated; §2.1/§2.5 physical & active both −72 → 601,444,393 /
+  278,217,769, "attn sink" dropped from the misc line, table hand-
+  adjusted pending a compute_budget.py regen). MoE dispatch documented
+  as grouped-GEMM B4 (canonical, fullgraph, dropless) with the
+  `.nonzero()` loop as fallback (§7.7); stale 12-expert numbers fixed in
+  §7.4/§7.5 and the duplicate §7.6. Collapse telemetry
+  (`loop/update_norm_l*`, `loop/hidden_norm_l*`, `moe/dead_experts_total`)
+  added to §16.1. HF-compliance (Auto* registration, bit-exact round-
+  trip, persistent rope buffers, `_no_split_modules`,
+  `supports_gradient_checkpointing=False` + private gate) added to §18
+  Resolved; §18 Open updated (B4 landed+ON, B2 fused-CE landed+available
+  opt-in, B1 superseded by the sink drop, B3 already implemented).
+  Budget/config refreshed in §15.1
+  (~$100, total_steps 3,500, warmup 400, cosine 6e-4→6e-5, ~455M
+  foundation tokens; seq-8192/b2 ~35.9GB). NOTE: the new data mix
+  (`train_config.py`: FineWeb-Edu / Nemotron-CC-Math / Nemotron-Code /
+  Cosmopedia etc., dropped CodeParrot + Wikipedia) is a TRAINING config,
+  not an architecture spec, so it has no home in this doc — see
+  `train_config.py::PretrainConfig.phases`.

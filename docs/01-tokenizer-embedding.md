@@ -59,10 +59,16 @@ The tokenizer is **byte-level Byte-Pair Encoding (BPE)**. Two ideas stacked:
 The trainer is in `scripts/train_tokenizer.py`: it builds a
 `Tokenizer(models.BPE())` with a `ByteLevel` pre-tokenizer and decoder
 (`scripts/train_tokenizer.py:233-237`), trained on a ~2 GB sample of the
-pre-training mix — 55 % FineWeb-Edu, 30 % CodeParrot-clean, 15 % Wikipedia
-(`scripts/train_tokenizer.py:68-88`). Training the tokenizer on the *same*
-distribution the model will see keeps the merges optimal for that data (good
-code coverage, good English coverage).
+pre-training mix — 45 % FineWeb-Edu, 20 % OpenWebMath, 20 % CodeParrot-clean,
+15 % Wikipedia (`scripts/train_tokenizer.py:83-108`). Training the tokenizer on
+the *same* distribution the model will see keeps the merges optimal for that
+data; the math-dense OpenWebMath share is deliberate — the model is math-first,
+so LaTeX/symbols/numerics must tokenize well rather than fall back to near
+byte-level (`train_tokenizer.py:76-82`). Note this is the **tokenizer's own**
+training corpus, which is distinct from (and frozen relative to) the model's
+pre-training data mix; the latter is configured in `train_config.py`
+(`PretrainConfig.phases`) and has since moved to a FineWeb-Edu + NVIDIA Nemotron
+(math/code/STEM, gated) + Cosmopedia blend.
 
 ### Why 65,536 (and why the on-disk 32,768 is a discrepancy)
 
@@ -395,7 +401,7 @@ the vocabulary — the actual token-embedding matrix is exactly **100,663,296**.
 
 Against the preset's **~601M physical** parameters
 ([`00-overview.md`](00-overview.md), from `compute_budget.py`), the token
-embedding is **≈ 16.6 %** of the model (`100,663,296 / 601,444,465`). (The
+embedding is **≈ 16.6 %** of the model (`100,663,296 / 601,444,393`). (The
 "embedding" *budget line*, 100,690,944, is ~16.7 %; ARCHITECTURE.md §4.1 quotes
 16.9 % against an older total. The spread is just numerator/denominator choice.)
 

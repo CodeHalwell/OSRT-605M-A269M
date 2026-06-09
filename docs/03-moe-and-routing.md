@@ -388,13 +388,81 @@ deterministic router (`model.py:585-588`). Two consequences:
 
 ---
 
-## 7. Capacity and token dropping (train) vs drop-free eval
+## 7. Dispatch: grouped-GEMM (default) vs the per-expert loop (fallback)
 
-Each expert can only process so many tokens per batch. OSRT enforces a
-**capacity cap** in training and disables it entirely at eval:
+Once the top-2 experts and their renormalised gates are chosen, the tokens
+have to actually be *run through* the chosen experts. OSRT ships **two
+numerically-equivalent dispatch implementations**, selected by the
+`moe_grouped_gemm` flag (`config.py:88`). The canonical preset turns the
+grouped-GEMM path **on** (`moe_grouped_gemm=True`, `presets.py:60`):
 
 ```python
-# model.py:623-629
+# model.py:849-856
+if self.grouped_gemm:
+    moe_out, total_dropped = self._dispatch_grouped(x_flat, top_idx, top_probs)
+else:
+    moe_out, total_dropped = self._dispatch_loop(
+        x_flat, top_idx, top_probs, capacity)
+```
+
+### 7.1 The grouped-GEMM dispatch (B4, the preset default)
+
+`_dispatch_grouped` (`model.py:594-627`) runs **all** experts in a single
+grouped matmul instead of looping expert-by-expert. The recipe:
+
+1. **Flatten** the `(token, rank)` pairs into three parallel `(N·K,)` vectors:
+   the chosen expert id, the gate, and the source token index
+   (`model.py:609-613`).
+2. **Argsort by expert** (stable, so it's deterministic) so every expert's
+   tokens form one contiguous span (`model.py:616`).
+3. **`bincount` → `cumsum`** to get per-expert cumulative *end* offsets
+   (`model.py:619-620`).
+4. **One grouped SwiGLU** over the sorted tokens via `_grouped_ffn`
+   (`model.py:550-592`): the per-expert `w_gate`/`w_up`/`w_down` are stacked
+   into `(E, D, H)`/`(E, H, D)` and run as three grouped matmuls. On CUDA this
+   is the fused `torch._grouped_mm` kernel; on CPU (tests, and as the parity
+   oracle) it falls back to a loop-of-matmuls reference, `_ref_grouped_mm`
+   (`model.py:164-185`), because the kernel's CPU *backward* is broken in
+   torch 2.10.
+5. **Apply the gate** (in fp32, like the loop) and **`index_add` scatter**
+   back to per-token outputs (`model.py:622-626`).
+
+The grouped path is **dropless by construction** — it has *no* capacity cap
+and keeps every token (`model.py:597-604`). This is the key behavioural
+difference from the loop path (§7.3): there is no `capacity` argument, nothing
+is ever dropped, and `total_dropped` is always `0`.
+
+The motivation is `torch.compile`. The old per-expert loop's data-dependent
+`.nonzero()` was the **only `torch.compile` graph break in the whole model**;
+replacing it with the fixed-shape grouped ops (argsort, bincount, cumsum,
+index_add) lets the model compile as a single **fullgraph — 0 breaks vs 12**
+for the loop path, worth **~9–12% steady-state** throughput (`presets.py:56-59`,
+verified on H100). The grouped kernel needs two extra Dynamo flags —
+`capture_scalar_outputs` and `capture_dynamic_output_shape_ops` — which the
+trainer sets only when *both* compile and grouped are on (`train.py:757-761`).
+
+**Weights are identical to the loop path.** The grouped dispatch is a pure
+rearrangement of the same per-expert SwiGLU math, so a checkpoint trained with
+one dispatch loads and runs bit-compatibly under the other
+(`presets.py:58-59`).
+
+### 7.2 The per-expert loop dispatch (retained fallback)
+
+`_dispatch_loop` (`model.py:508-548`) is the original implementation, kept as a
+fallback (`moe_grouped_gemm=False`). For each expert it `.nonzero()`-gathers
+every token that picked it at *any* top-k rank, runs that expert, and
+scatter-adds the gated output — so a token that chose the same expert at two
+ranks contributes twice via `index_add_`. Unlike the grouped path, **this one
+enforces a capacity cap and drops tokens** (§7.3). Its `.nonzero()` is the lone
+graph break that motivated B4.
+
+### 7.3 Capacity and token dropping (loop path only) vs drop-free eval
+
+The **capacity cap lives only on the loop path.** In training it limits each
+expert; at eval it is disabled entirely:
+
+```python
+# model.py:782-788 (capacity computed before dispatch)
 if self.training:
     capacity = max(1, int(math.ceil(
         self.capacity_factor * self.top_k * N / self.num_routed)))
@@ -402,30 +470,30 @@ else:
     capacity = N * self.top_k  # effectively unlimited
 ```
 
-With `router_capacity_factor=2.0` (`config.py:238`), each expert may take up
+With `router_capacity_factor=2.0` (`config.py:267`), each expert may take up
 to `2×` its uniform share. Tokens beyond that are **dropped** for that
 expert — they simply skip its branch this batch. Dropping is not just an
 efficiency measure: it creates *balancing pressure*. An overloaded expert
 loses tokens (and their gradient), which together with the bias controller
 pushes the router toward a flatter distribution.
 
-Two careful details:
+Two careful details (both specific to the loop path):
 
 - **Drops are shuffled before truncation.** `nonzero()` returns indices in
   token-major order, so a naïve `[:capacity]` would always drop the *tail* of
   every sequence and keep prefix positions — training the model to ignore
   late tokens under overload. OSRT permutes the (token, rank) pairs first so
-  every position has equal survival probability (`model.py:699-714`).
+  every position has equal survival probability (`model.py:526-537`).
 - **Eval is drop-free by construction.** Setting `capacity = N·top_k` means
   nothing is ever dropped at inference. This is deliberate: a documented v4
   failure mode was *chunk-instability* — prefill-then-decode producing
   different routing than a single full forward because capacity drops differed
-  across chunk boundaries. Drop-free eval makes generation chunk-stable
-  (`model.py:618-622`).
+  across chunk boundaries. Drop-free eval makes generation chunk-stable.
 
-Dispatch itself is a per-expert gather → run → scatter-add, so a token that
-chose the same expert at two ranks contributes twice via `index_add_`
-(`model.py:685-726`).
+The **grouped path sidesteps this entirely** by never dropping at all (§7.1) —
+it is dropless in both train and eval — so when it is enabled (the preset
+default) capacity dropping never happens. The loop path's drops are the only
+source of `drop_rate` telemetry.
 
 ---
 
@@ -524,12 +592,25 @@ if not self.telemetry_enabled:
 ```
 
 The trainer flips `telemetry_enabled = False` on non-logging steps via
-`OSRTForCausalLM.set_moe_telemetry(False)` (`model.py:1616`), which delegates
-to `OSRTModel.set_moe_telemetry` (`model.py:1548`); that method loops over the
-blocks and sets each `blk.moe.telemetry_enabled` (`model.py:1562-1563`). The `last_*`
+`OSRTForCausalLM.set_moe_telemetry(False)` (`model.py:1798-1800`), which delegates
+to `OSRTModel.set_moe_telemetry` (`model.py:1729-1745`); that method loops over the
+blocks and sets each `blk.moe.telemetry_enabled` (`model.py:1744-1745`) — and the
+*same* method also gates the recursive-loop collapse hook (chapter 06 §4.4). The `last_*`
 attributes simply retain their previous-logging-step values; that is safe
-because the consumers only read them on logging steps too (`model.py:740-747`).
-Default is `True` so downstream tools work without opt-in (`model.py:262-270`).
+because the consumers only read them on logging steps too (`model.py:870-879`).
+Default is `True` so downstream tools work without opt-in (`model.py:294-297`).
+
+### Dead-expert collapse signal
+
+On logging steps the trainer's `_collect_moe_metrics` (`train.py:305`) reads the
+gated per-loop expert-fraction telemetry and derives a **dead-expert count**: per
+`(block, loop)` it counts experts whose load fell below **10% of the uniform
+share** `1/E` (`train.py:409-414`), then accumulates a global
+`moe/dead_experts_total` (`train.py:465`). A rising total is the single clearest
+sign the router is collapsing onto a handful of experts (§13) — it is surfaced in
+W&B and in the stdout `collapse:` line alongside `bias_abs_max`
+(`train.py:1222-1227`). Because it is built purely from the already-gated
+telemetry, it never runs on the compiled fast path.
 
 ---
 
@@ -586,8 +667,8 @@ cfg: dim=1536 vocab=65536 blocks=3 loops=6 kv_heads=8
   routed_experts      424,673,280
   router                   36,867
   ...
-  TOTAL PHYSICAL      601,444,465  (~601M)
-  ACTIVE / TOKEN      278,217,841  (~278M, 46.3% of physical, excl. MTP)
+  TOTAL PHYSICAL      601,444,393  (~601M)
+  ACTIVE / TOKEN      278,217,769  (~278M, 46.3% of physical, excl. MTP)
 ```
 
 Takeaways:
@@ -614,10 +695,13 @@ The MoE block is shaped by hard lessons from earlier OSRT iterations
 
 - **Router collapse** (a few experts win everything). Guarded by the
   *combination* of the non-learned balance bias (§5.1–5.2), the Switch
-  balance loss (§5.3), the z-loss (§5.4), capacity-driven drops (§7), and
-  Gumbel exploration (§6). The redundancy is deliberate — each handles a
-  different regime (controller vs gradient, magnitude vs distribution,
-  warm-up vs steady-state).
+  balance loss (§5.3), the z-loss (§5.4), Gumbel exploration (§6), and — on the
+  loop dispatch path only — capacity-driven drops (§7; the grouped-GEMM default
+  is dropless, so it leans on the other four). The redundancy is deliberate —
+  each handles a different regime (controller vs gradient, magnitude vs
+  distribution, warm-up vs steady-state). **Detected** at runtime by the
+  dead-expert count (§10, `moe/dead_experts_total`): experts whose load drops
+  below 10% of the uniform share, accumulated across all blocks and loops.
 
 - **Expert starvation / under-utilisation** (cold experts that never learn).
   Guarded by Gumbel exploration keeping losers warm (§6), orthogonal init
@@ -631,7 +715,9 @@ The MoE block is shaped by hard lessons from earlier OSRT iterations
   never cross zero (§11, `model.py:953-959`).
 
 - **Chunk-instability at inference** (prefill vs decode routing mismatch from
-  capacity drops). Guarded by **drop-free eval** (§7, `model.py:618-622`).
+  capacity drops). Guarded by **drop-free eval** on the loop path
+  (`model.py:782-788`) and, by construction, by the dropless grouped-GEMM
+  dispatch the preset uses (§7).
 
 - **Loop-depth collapse** — the project's single biggest discovery: probing
   showed one recursive loop was doing ~90% of the cross-entropy reduction
