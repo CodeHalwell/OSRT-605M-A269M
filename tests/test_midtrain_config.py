@@ -58,10 +58,13 @@ def test_midtrain_config_values():
     from osrt.train_config import MidtrainConfig
 
     cfg = MidtrainConfig()
-    assert cfg.total_steps == 9_000
+    assert cfg.total_steps == 8_000
     assert cfg.peak_lr == 2e-4
     assert cfg.min_lr == 2e-5
     assert cfg.warmup_steps == 150
+    assert cfg.eval_interval == 500          # eval every 500 (16 evals)
+    # cosine anneals over the full total_steps (lr_anchor_step=0)
+    assert cfg.phases["extend"]["end"] == 8_000
     assert cfg.lr_anchor_step == 0
     # native + trainable HRA
     assert cfg.hra_native is True

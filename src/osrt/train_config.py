@@ -1069,11 +1069,15 @@ class MidtrainConfig(PretrainConfig):
     """
 
     # ── Schedule (fresh re-warm cosine) ──────────────────────────────
-    total_steps: int = 9_000
+    # total_steps drives the cosine: with lr_anchor_step=0 the LR anneals
+    # peak_lr → min_lr over the full total_steps (see _set_param_group_lrs:
+    # eff_total = total_steps - anchor). 8000 steps × 66 seqs × 4096 tok ≈
+    # 2.16B tokens for the ~$150 budget.
+    total_steps: int = 8_000
     warmup_steps: int = 150          # re-warm from the annealed base
     lr_anchor_step: int = 0          # fresh cosine (foundation already cooled)
     peak_lr: float = 2e-4            # ~33% of foundation's 6e-4
-    min_lr: float = 2e-5
+    min_lr: float = 2e-5             # cosine floor at step 8000
     weight_decay: float = 0.1        # softer than foundation's 0.3
     grad_clip: float = 1.0
 
@@ -1082,8 +1086,8 @@ class MidtrainConfig(PretrainConfig):
     muon_min_lr: float = 6.6e-4
 
     log_interval: int = 50
-    ckpt_interval: int = 500         # ~18 ckpts; bounds Modal-kill loss
-    eval_interval: int = 750         # ported eval (run_pretrain_extend)
+    ckpt_interval: int = 500         # 16 ckpts over 8000; bounds Modal-kill loss
+    eval_interval: int = 500         # held-out eval every 500 (16 evals)
     eval_steps: int = 20
 
     # ── Router exploration: off (router is well-formed) ──────────────
@@ -1129,7 +1133,7 @@ class MidtrainConfig(PretrainConfig):
     phases: dict = {  # noqa: RUF012
         "extend": {
             "start": 0,
-            "end": 9_000,
+            "end": 8_000,
             "seq_len": 4096,
             "batch_size": 6,         # knowledge-phase sizing; sanity-gated
             "grad_accum_steps": 11,
