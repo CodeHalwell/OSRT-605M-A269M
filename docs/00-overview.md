@@ -38,7 +38,7 @@ config change.
 | quantity | value |
 |---|---|
 | **Physical parameters** | **601,444,393 (~601M)** |
-| **Active per token (inference)** | **278,217,841 (~278M, 46.3%)** |
+| **Active per token (inference)** | **278,217,769 (~278M, 46.3%)** |
 | Hidden dim `d_model` | 1,536 |
 | Vocab | 65,536 (byte-level BPE) |
 | Physical blocks × loops | 3 × 6 = **18 effective layers** |
