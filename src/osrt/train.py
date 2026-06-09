@@ -1037,23 +1037,19 @@ def run_training(
         router_gumbel_tau = get_router_gumbel_tau(step, train_cfg)
         set_router_gumbel_tau(model, router_gumbel_tau)
 
-        # Gradient checkpointing: on only for very long seq_len. The
-        # original threshold was 4096 (Phase 2's seq_len) but H100 80GB
-        # only fills ~14 GB at Phase 2 sizes (batch 4 × accum 16 ×
-        # seq 4096), so checkpointing was throwing away ~50% of
-        # throughput for memory headroom we don't need. Bumped to 8192
-        # so Phase 3 still gets the memory relief while Phase 2 runs at
-        # full speed. If activation memory ever crowds the H100 budget
-        # at seq_len 4096 (e.g. larger batch on H200 141GB), raise
-        # batch_size in train_config first; only revert this threshold
-        # if that doesn't fit either.
-        # Force activation checkpointing on for very long seq (Phase 3,
-        # seq 8192) even if the config didn't request it. The model's only
-        # gate is _osrt_grad_ckpt (model.py use_ckpt); HF's
-        # `gradient_checkpointing` name is deliberately unwired
-        # (supports_gradient_checkpointing=False), so write OUR gate — and
-        # only ever raise it (never clobber a config-forced True down to
-        # False at shorter seq).
+        # Gradient checkpointing: force ON for very long seq (Phase 3,
+        # seq 8192) even if the config didn't request it. The threshold is
+        # 8192 (not Phase 2's 4096) because H100 80GB only fills ~14 GB at
+        # Phase 2 sizes (batch 4 × accum 16 × seq 4096) — checkpointing
+        # there would throw away ~50% throughput for headroom we don't
+        # need; Phase 3 genuinely needs the memory relief. If activation
+        # memory ever crowds the budget at seq 4096 (e.g. bigger batch on
+        # H200 141GB), raise batch_size in train_config first; only lower
+        # this threshold if that doesn't fit. The model's ONLY gate is
+        # _osrt_grad_ckpt (model.py use_ckpt); HF's `gradient_checkpointing`
+        # name is deliberately unwired (supports_gradient_checkpointing=
+        # False), so write OUR gate — and only ever RAISE it (never clobber
+        # a config-forced True down to False at shorter seq).
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         base = inner.model if hasattr(inner, "model") else inner
         if current_seq_len >= 8192 and not base._osrt_grad_ckpt:
