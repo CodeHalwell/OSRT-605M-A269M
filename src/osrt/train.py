@@ -1700,15 +1700,21 @@ def run_pretrain_extend(
     # the v6 model (MTP + mHC 4-stream + 8 experts) is heavier than the v5
     # extend model this loop was written for. Drive from the config when
     # set, else trigger at seq>=4096 (was 8192 — too high for v6).
+    # NB: the model's ONLY checkpointing gate is _osrt_grad_ckpt (model.py
+    # use_ckpt); HF's `gradient_checkpointing` name is deliberately not wired
+    # up (supports_gradient_checkpointing=False). Set our private gate like
+    # run_training does, NOT base.gradient_checkpointing (which the model
+    # never reads).
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     base = inner.model if hasattr(inner, "model") else inner
     need_ckpt = bool(
         getattr(extend_cfg, "gradient_checkpointing", seq_len >= 4096)
     )
-    if (hasattr(base, "gradient_checkpointing")
-            and base.gradient_checkpointing != need_ckpt):
-        base.gradient_checkpointing = need_ckpt
-    print(f"    Gradient checkpointing: {need_ckpt} (seq_len={seq_len})")
+    base._osrt_grad_ckpt = need_ckpt
+    print(
+        f"    Gradient checkpointing: {'ENABLED' if need_ckpt else 'disabled'} "
+        f"(_osrt_grad_ckpt={need_ckpt}, seq_len={seq_len})"
+    )
 
     # Gumbel buffer fill (no-op since extend_cfg sets tau init = 0).
     set_router_gumbel_tau(model, extend_cfg.router_gumbel_tau_init)
