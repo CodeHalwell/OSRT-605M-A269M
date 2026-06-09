@@ -1160,9 +1160,17 @@ class MidtrainConfig(PretrainConfig):
         },
     }
 
-    # DataLoader: 7 streams. Keep workers modest to stay under HF Hub's
-    # per-client connection ceiling (extend2 hit resets at 4x9=36 conns).
-    dataloader_num_workers: int = 2
+    # DataLoader: ONE worker. Each worker independently opens ALL 7 streams
+    # and fills a 5k-example shuffle buffer per stream before yielding, so
+    # cold-start cost scales as num_workers × n_streams. Probe #3 set this to
+    # 2 (=14 stream-opens) and never assembled the first batch in ~6 min on a
+    # cold container; the W&B GPU monitor logged zero rows (stuck in data
+    # assembly, not OOM/compute). Foundation reached step 0 fine at
+    # num_workers=1 / 4 streams, and PretrainExtend2Config sets =1 with the
+    # same "many concurrent HF streams cascade" rationale. One worker = 7
+    # stream-opens, comparable to foundation. Throughput cost is negligible
+    # vs the gradient-checkpointed seq-4096 step time.
+    dataloader_num_workers: int = 1
     dataloader_prefetch_factor: int = 2
     compile_enabled: bool = True
 
