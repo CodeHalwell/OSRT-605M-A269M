@@ -51,3 +51,61 @@ def test_inject_hra_on_native_model_breaks_load():
         load_model_state_or_raise(
             injected, native_state, context="inject-breaks-load test"
         )
+
+
+def test_midtrain_config_values():
+    """MidtrainConfig encodes the locked decisions (spec §2/§4.4)."""
+    from osrt.train_config import MidtrainConfig
+
+    cfg = MidtrainConfig()
+    assert cfg.total_steps == 9_000
+    assert cfg.peak_lr == 2e-4
+    assert cfg.min_lr == 2e-5
+    assert cfg.warmup_steps == 150
+    assert cfg.lr_anchor_step == 0
+    # native + trainable HRA
+    assert cfg.hra_native is True
+    assert cfg.hra_frozen is False
+    assert cfg.hra_enabled is True
+    # router exploration off
+    assert cfg.router_gumbel_tau_init == 0.0
+    # gate disabled
+    assert cfg.early_stop_check_step > 9_000
+    # resume + prefix
+    assert cfg.pretrained_checkpoint.endswith("osrt_v5_final.pt")
+    assert cfg.stage_prefix == "midtrain"
+    assert cfg.gradient_checkpointing is True
+
+
+def test_midtrain_phase_is_seq4096_math_mix():
+    """The single 'extend' phase is seq 4096 with the knowledge mix."""
+    from osrt.train_config import MidtrainConfig
+
+    phase = MidtrainConfig().phases["extend"]
+    assert phase["seq_len"] == 4096
+    names = {d["name"] for d in phase["datasets"]}
+    assert "nemotron-cc-math-4plus" in names
+    assert "fineweb-edu" in names           # general anchor retained
+    assert "cosmopedia-openstax" in names
+    # weights: math/STEM/reasoning should dominate (~0.65)
+    math_sci = sum(
+        d["weight"] for d in phase["datasets"]
+        if d["name"] in {
+            "nemotron-cc-math-4plus", "nemotron-stem",
+            "nemotron-math-textbooks", "nemotron-reasoning",
+        }
+    )
+    assert 0.60 <= math_sci <= 0.70
+
+
+def test_midtrain_sanity_writes_no_final():
+    """Sanity config is a short probe that won't clobber a real final."""
+    from osrt.train_config import MidtrainSanityConfig
+
+    cfg = MidtrainSanityConfig()
+    assert cfg.total_steps == 30
+    assert cfg.save_final_checkpoint is False
+    assert cfg.stage_prefix == "midtrain-sanity"
+    assert cfg.compile_enabled is False
+    # inherits the real seq/mix so VRAM is measured at production size
+    assert cfg.phases["extend"]["seq_len"] == 4096

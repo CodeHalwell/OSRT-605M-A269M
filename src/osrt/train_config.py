@@ -1049,6 +1049,131 @@ class SystemSFTConfig(MOPDConfig):
     wandb_run_id: str = ""
 
 
+class MidtrainConfig(PretrainConfig):
+    """v6 mid-training: continued PRETRAINING on the foundation base.
+
+    Resumes from the annealed v6 foundation checkpoint (step 3500),
+    re-warms a fresh cosine at a real continued-pretraining LR (2e-4),
+    doubles context to seq 4096, and trains the math-heavy knowledge mix.
+
+    Unlike the v5 PretrainExtend* stages this does NOT resume from an
+    SFT/GRPO checkpoint, so there is no chat-format investment to protect:
+    HRA stays TRAINABLE and the LR is ~33% of foundation peak, not the
+    2.5% the v5 stages used.
+
+    HRA is NATIVE here (built inline from the preset's adapter_rank=256
+    and already present in the foundation checkpoint), so hra_native=True
+    skips inject_hra — see run_pretrain_extend.
+
+    See docs/superpowers/specs/2026-06-09-v6-midtraining-design.md.
+    """
+
+    # ── Schedule (fresh re-warm cosine) ──────────────────────────────
+    total_steps: int = 9_000
+    warmup_steps: int = 150          # re-warm from the annealed base
+    lr_anchor_step: int = 0          # fresh cosine (foundation already cooled)
+    peak_lr: float = 2e-4            # ~33% of foundation's 6e-4
+    min_lr: float = 2e-5
+    weight_decay: float = 0.1        # softer than foundation's 0.3
+    grad_clip: float = 1.0
+
+    optimizer_name: str = "muon"
+    muon_lr: float = 6.6e-3          # proportional: (2e-4/6e-4) * 0.02
+    muon_min_lr: float = 6.6e-4
+
+    log_interval: int = 50
+    ckpt_interval: int = 500         # ~18 ckpts; bounds Modal-kill loss
+    eval_interval: int = 750         # ported eval (run_pretrain_extend)
+    eval_steps: int = 20
+
+    # ── Router exploration: off (router is well-formed) ──────────────
+    router_gumbel_tau_init: float = 0.0
+    router_gumbel_tau_final: float = 0.0
+    router_gumbel_anneal_steps: int = 1
+
+    # ── Early-stop gate: disabled (cold-start gate doesn't apply) ────
+    early_stop_check_step: int = 9_999_999
+
+    # ── HRA: native + trainable ──────────────────────────────────────
+    hra_enabled: bool = True
+    hra_rank: int = 256
+    hra_scale: float = 1.0
+    hra_native: bool = True          # skip inject_hra (run_pretrain_extend)
+    hra_frozen: bool = False         # trainable
+
+    # ── Resume / lineage ─────────────────────────────────────────────
+    # Foundation final ckpt (run_training writes osrt_v5_final.pt; the
+    # 500-step interval also leaves osrt_v5_step_3500.pt). If a run was
+    # killed before the final save, repoint at osrt_v5_step_3500.pt.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_final.pt"
+    gradient_checkpointing: bool = True
+
+    # Distinct prefix — osrt_v5_midtrain_step_*.pt, no collision with
+    # foundation's osrt_v5_step_*.pt resume scan.
+    stage_prefix: str = "midtrain"
+
+    wandb_run_name: str = "osrt-v6-midtrain"
+    wandb_run_id: str = ""
+
+    # ── Data mix: the knowledge phase (seq 4096, math-heavy) ─────────
+    # Single phase keyed "extend" (run_pretrain_extend reads
+    # phases["extend"]). Content mirrors PretrainConfig.phases["knowledge"].
+    phases: dict = {  # noqa: RUF012
+        "extend": {
+            "start": 0,
+            "end": 9_000,
+            "seq_len": 4096,
+            "batch_size": 6,         # knowledge-phase sizing; sanity-gated
+            "grad_accum_steps": 11,
+            "datasets": [
+                {"name": "nemotron-cc-math-4plus",
+                 "hf_id": "nvidia/Nemotron-CC-Math-v1",
+                 "hf_config": "4plus", "weight": 0.25},
+                {"name": "nemotron-stem",
+                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                 "hf_config": "Nemotron-Pretraining-STEM-SFT", "weight": 0.15},
+                {"name": "nemotron-math-textbooks",
+                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                 "hf_config": "Nemotron-Pretraining-Math-Textbooks",
+                 "weight": 0.15},
+                {"name": "nemotron-reasoning",
+                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                 "hf_config": "Nemotron-Pretraining-InfiniByte-Reasoning",
+                 "weight": 0.10},
+                {"name": "fineweb-edu",
+                 "hf_id": "HuggingFaceFW/fineweb-edu", "weight": 0.15},
+                {"name": "nemotron-code-syn-qa",
+                 "hf_id": "nvidia/Nemotron-Pretraining-Code-v2",
+                 "hf_config": "Synthetic-Question-Answering", "weight": 0.10},
+                {"name": "cosmopedia-openstax",
+                 "hf_id": "HuggingFaceTB/cosmopedia",
+                 "hf_config": "openstax", "weight": 0.10},
+            ],
+        },
+    }
+
+    # DataLoader: 7 streams. Keep workers modest to stay under HF Hub's
+    # per-client connection ceiling (extend2 hit resets at 4x9=36 conns).
+    dataloader_num_workers: int = 2
+    dataloader_prefetch_factor: int = 2
+    compile_enabled: bool = True
+
+
+class MidtrainSanityConfig(MidtrainConfig):
+    """30-step VRAM/throughput probe at the REAL seq/batch before the
+    $150 launch. Writes no final checkpoint, distinct prefix, eager mode
+    so step events appear immediately."""
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    ckpt_interval: int = 9_999_999
+    eval_interval: int = 9_999_999
+    save_final_checkpoint: bool = False
+    stage_prefix: str = "midtrain-sanity"
+    wandb_run_name: str = "osrt-v6-midtrain-sanity"
+    compile_enabled: bool = False
+
+
 class SFTConfig:
     """Balanced SFT config for v5 — math + code + STEM + general."""
 
