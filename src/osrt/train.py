@@ -1696,13 +1696,19 @@ def run_pretrain_extend(
     loader_iter = iter(loader)
     print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
 
-    # Activation checkpointing only for very long seq.
+    # Activation checkpointing: foundation needs it at seq 2048 (39.5GB);
+    # the v6 model (MTP + mHC 4-stream + 8 experts) is heavier than the v5
+    # extend model this loop was written for. Drive from the config when
+    # set, else trigger at seq>=4096 (was 8192 — too high for v6).
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     base = inner.model if hasattr(inner, "model") else inner
-    need_ckpt = seq_len >= 8192
+    need_ckpt = bool(
+        getattr(extend_cfg, "gradient_checkpointing", seq_len >= 4096)
+    )
     if (hasattr(base, "gradient_checkpointing")
             and base.gradient_checkpointing != need_ckpt):
         base.gradient_checkpointing = need_ckpt
+    print(f"    Gradient checkpointing: {need_ckpt} (seq_len={seq_len})")
 
     # Gumbel buffer fill (no-op since extend_cfg sets tau init = 0).
     set_router_gumbel_tau(model, extend_cfg.router_gumbel_tau_init)
