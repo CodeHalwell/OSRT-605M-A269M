@@ -78,9 +78,9 @@ def test_midtrain_config_values():
     # resume + prefix
     assert cfg.pretrained_checkpoint.endswith("osrt_v5_final.pt")
     assert cfg.stage_prefix == "midtrain"
-    # Checkpointing OFF — throughput bet, gated by the sanity probe (if it
-    # OOMs at seq 4096, flip to True before the paid run).
-    assert cfg.gradient_checkpointing is False
+    # Checkpointing ON — REQUIRED at seq 4096. The OFF throughput bet was
+    # tested and OOM'd (78.4/79.2GB) on the sanity probe, so it's back on.
+    assert cfg.gradient_checkpointing is True
 
 
 def test_midtrain_phase_is_seq4096_math_mix():

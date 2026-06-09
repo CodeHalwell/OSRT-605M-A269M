@@ -1106,15 +1106,15 @@ class MidtrainConfig(PretrainConfig):
     # 500-step interval also leaves osrt_v5_step_3500.pt). If a run was
     # killed before the final save, repoint at osrt_v5_step_3500.pt.
     pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_final.pt"
-    # Checkpointing OFF to buy ~25-30% throughput (no activation recompute
-    # on the 18 effective layers) — more tokens for the $150 budget. This
-    # is a BET: foundation fit 39.5GB at seq 2048 *with* checkpointing, and
-    # seq 4096 + storing all 18 loops' activations may not fit 80GB. The
-    # midtrain_sanity probe (30 steps, real seq 4096 / batch 6) is the gate:
-    # if it OOMs, flip this back to True (and/or drop batch_size to 4) before
-    # the paid run. run_pretrain_extend reads this via getattr; False here
-    # means the seq>=4096 auto-trigger is overridden off (explicit wins).
-    gradient_checkpointing: bool = False
+    # Checkpointing ON — REQUIRED at seq 4096. We tested the throughput bet
+    # (checkpointing OFF buys ~25-30% by skipping activation recompute on the
+    # 18 effective layers) with the midtrain_sanity probe: it OOM'd at
+    # 78.36GB/79.18GB on the H100 (storing all 18 loops' activations at seq
+    # 4096 / batch 6 doesn't fit 80GB). So the bet lost — back to True. The
+    # foundation run also used checkpointing (app.py:419) at seq 2048/39.5GB.
+    # run_pretrain_extend reads this via getattr and sets the real
+    # _osrt_grad_ckpt gate (model.py use_ckpt).
+    gradient_checkpointing: bool = True
 
     # Distinct prefix — osrt_v5_midtrain_step_*.pt, no collision with
     # foundation's osrt_v5_step_*.pt resume scan.
