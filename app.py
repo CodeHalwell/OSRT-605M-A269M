@@ -641,6 +641,99 @@ def pretrain_extend():
 
 
 # =============================================================================
+# MIDTRAIN — v6 mid-training (continued pretraining, seq 4096, math mix)
+# =============================================================================
+# Generalizes run_pretrain_extend via hra_native=True (skip inject_hra: v6
+# HRA is native + already in the foundation ckpt). See MidtrainConfig and
+# docs/superpowers/specs/2026-06-09-v6-midtraining-design.md.
+
+
+def _run_midtrain(cfg_cls):
+    """Shared body for midtrain + midtrain_sanity (differ only by config)."""
+    from transformers import AutoTokenizer
+
+    from osrt.presets import build_config
+    from osrt.train import run_pretrain_extend
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    print(f"Tokenizer loaded: vocab_size={len(tok)}")
+
+    model_config = build_config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
+    )
+    cfg = cfg_cls()
+    print(
+        f"{cfg.__class__.__name__}: {cfg.total_steps} steps @ seq "
+        f"{cfg.phases['extend']['seq_len']}, peak LR {cfg.peak_lr}, "
+        f"HRA native+trainable, resume {cfg.pretrained_checkpoint}"
+    )
+    run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def midtrain():
+    """v6 mid-training: continued pretraining from the foundation base,
+    seq 4096, math-heavy mix, ~9k steps. See MidtrainConfig."""
+    from osrt.train_config import MidtrainConfig
+    _run_midtrain(MidtrainConfig)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def midtrain_sanity():
+    """30-step VRAM/throughput probe at real seq 4096 / batch 6 before
+    the $150 launch. See MidtrainSanityConfig."""
+    from osrt.train_config import MidtrainSanityConfig
+    _run_midtrain(MidtrainSanityConfig)
+
+
+@app.local_entrypoint()
+def run_midtrain():
+    """Spawn v6 mid-training (fire-and-forget)."""
+    call = midtrain.spawn()
+    print(f"Spawned v6 midtrain — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_midtrain_sanity():
+    """Spawn the 30-step v6 midtrain VRAM/throughput sanity probe."""
+    call = midtrain_sanity.spawn()
+    print(f"Spawned v6 midtrain sanity — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+# =============================================================================
 # PRETRAIN_EXTEND2 — broadened mid-training pass
 # =============================================================================
 # Reuses run_pretrain_extend (the training loop is config-driven). Resumes
