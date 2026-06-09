@@ -336,8 +336,8 @@ class TokenStream(IterableDataset):
         # The ablate stage hit this exact failure: cell A worked but
         # cell B's load_dataset raised "Cannot send a request, as the
         # client has been closed" before yielding a single batch.
-        def _cycling_iter(ds, ds_name: str, ds_seed: int):
-            """Wrap a (shuffled) streaming dataset in an infinite cycle.
+        def _cycling_iter(base_ds, ds_name: str, ds_seed: int):
+            """Wrap an UNSHUFFLED streaming dataset in an infinite cycle.
 
             Small datasets like Magicoder (110K rows), OpenThoughts
             (114K), and BBH (250) exhaust their streaming iterators
@@ -353,11 +353,25 @@ class TokenStream(IterableDataset):
             small datasets where repeated exposure to the same
             template is the whole point (e.g. BBH's 250 logic puzzles
             teach reasoning structure, not specific puzzles).
+
+            CRITICAL: we shuffle the UNSHUFFLED `base_ds` fresh each
+            cycle — NOT the previous cycle's shuffled view. The old code
+            did `ds = ds.shuffle(...)`, wrapping the already-shuffled
+            dataset in another ShuffledIterableDataset every cycle. A
+            tiny dataset (e.g. nemotron-math-textbooks) cycles many times
+            per deficit-fill, nesting wrappers until iteration blew the
+            Python recursion limit — "RecursionError: maximum recursion
+            depth exceeded" → reconnect → repeat forever, never reaching
+            a forward pass. Shuffling the base keeps exactly ONE shuffle
+            layer no matter how many cycles. (Caught by the v6 midtrain
+            knowledge-mix probe; foundation's mix never streamed these
+            small Specialized-v1 configs. See scripts/repro_cycling_recursion.py.)
             """
             cycles = 0
             current_seed = ds_seed
             while True:
-                for ex in ds:
+                shuffled = base_ds.shuffle(buffer_size=5_000, seed=current_seed)
+                for ex in shuffled:
                     yield ex
                 cycles += 1
                 if cycles == 1:
@@ -368,12 +382,6 @@ class TokenStream(IterableDataset):
                         flush=True,
                     )
                 current_seed += 1
-                try:
-                    ds = ds.shuffle(buffer_size=5_000, seed=current_seed)
-                except Exception:
-                    # Some shuffled IterableDatasets refuse double-
-                    # shuffle. Just re-iterate without re-shuffling.
-                    pass
 
         def _open_stream(stream_idx: int, seed_offset: int = 0):
             ds_cfg = self.dataset_configs[stream_idx]
@@ -391,12 +399,16 @@ class TokenStream(IterableDataset):
                     if skip_n > 0:
                         ds = ds.skip(skip_n)
                     ds_seed = seed + seed_offset
-                    shuffled = ds.shuffle(buffer_size=5_000, seed=ds_seed)
+                    # Pass the UNSHUFFLED ds — _cycling_iter shuffles the
+                    # base fresh each cycle (one shuffle layer, always).
+                    # Shuffling here first and passing `shuffled` would make
+                    # the first cycle double-shuffled and reintroduce the
+                    # nesting that the cycle loop now avoids.
                     # Return an infinite-cycle wrapper so small
                     # streaming datasets (Magicoder, OpenThoughts,
                     # BBH) never trigger the StopIteration → reconnect
                     # path that deadlocks the debt-based sampler.
-                    return _cycling_iter(shuffled, ds_cfg["hf_id"], ds_seed)
+                    return _cycling_iter(ds, ds_cfg["hf_id"], ds_seed)
                 except Exception as exc:
                     last_exc = exc
                     print(
