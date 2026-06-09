@@ -1047,12 +1047,22 @@ def run_training(
         # at seq_len 4096 (e.g. larger batch on H200 141GB), raise
         # batch_size in train_config first; only revert this threshold
         # if that doesn't fit either.
+        # Force activation checkpointing on for very long seq (Phase 3,
+        # seq 8192) even if the config didn't request it. The model's only
+        # gate is _osrt_grad_ckpt (model.py use_ckpt); HF's
+        # `gradient_checkpointing` name is deliberately unwired
+        # (supports_gradient_checkpointing=False), so write OUR gate — and
+        # only ever raise it (never clobber a config-forced True down to
+        # False at shorter seq).
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         base = inner.model if hasattr(inner, "model") else inner
-        need_ckpt = current_seq_len >= 8192
-        if (hasattr(base, "gradient_checkpointing")
-                and base.gradient_checkpointing != need_ckpt):
-            base.gradient_checkpointing = need_ckpt
+        if current_seq_len >= 8192 and not base._osrt_grad_ckpt:
+            base._osrt_grad_ckpt = True
+            print(
+                f"    Gradient checkpointing: ENABLED for seq "
+                f"{current_seq_len} (_osrt_grad_ckpt=True)",
+                flush=True,
+            )
 
         optimizer.zero_grad(set_to_none=True)
         accum_task_loss = torch.tensor(0.0, device=device)
