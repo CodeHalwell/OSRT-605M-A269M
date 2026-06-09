@@ -1422,12 +1422,11 @@ def run_pretrain_extend(
          so they don't collide with base pretrain checkpoints under
          the resume scanner.
 
-    Held-out validation pass is intentionally skipped for this stage —
-    the run is short (1,800 steps), training task_loss + MoE telemetry
-    give continuous monitoring, and the held-out cache builder eats
-    10-20 min of first-call time we don't want to burn here. If a
-    longer extend run is ever needed, lift the validation block from
-    run_training.
+    Held-out eval is OPT-IN via `eval_interval`: when set (e.g. the v6
+    MidtrainConfig uses 750), the loop runs run_eval on that cadence and
+    logs eval/loss + eval/perplexity. v5 extend stages set eval_interval
+    to 9_999_999 to skip it — the held-out cache builder eats 10-20 min
+    of first-call time, which can trip Modal's heartbeat on short runs.
     """
     device = torch.device("cuda")
 

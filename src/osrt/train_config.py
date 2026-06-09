@@ -394,7 +394,7 @@ class PretrainExtendConfig(PretrainConfig):
     weight_decay: float = 0.1       # softer wd than pretrain (0.3)
     grad_clip: float = 1.0
     log_interval: int = 25
-    eval_interval: int = 250
+    eval_interval: int = 9_999_999  # skip in-run eval (heartbeat risk; see extend2)
     eval_steps: int = 20
     ckpt_interval: int = 200        # ~14 ckpts over the 2,800-step run
 
