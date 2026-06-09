@@ -1940,6 +1940,31 @@ def run_pretrain_extend(
                 sys.stdout.write(f" [step {step}]\n")
                 sys.stdout.flush()
 
+        # ── Periodic held-out eval ──────────────────────────────────
+        # Ported from run_training. Required for a 9k-step run: the
+        # pre->midtrain gate (review/learnings-scratchpad.md) needs an
+        # eval trend. No-op for v5 stages (eval_interval defaults to
+        # 9_999_999 there).
+        eval_interval = getattr(extend_cfg, "eval_interval", 0)
+        if eval_interval and step > 0 and step % eval_interval == 0:
+            eval_metrics = run_eval(
+                model,
+                tokenizer_name,
+                seq_len,
+                batch_size,
+                getattr(extend_cfg, "eval_steps", 20),
+                device,
+                model_config.real_vocab_size,
+            )
+            print(
+                f"  EVAL step {step} | "
+                f"loss {eval_metrics['eval/loss']:.4f} | "
+                f"ppl {eval_metrics['eval/perplexity']:.1f}",
+                flush=True,
+            )
+            if use_wandb:
+                wandb.log(eval_metrics, step=step)
+
         # ── Numbered checkpoints ───────────────────────────────────
         if step > 0 and step % extend_cfg.ckpt_interval == 0:
             path = f"{ckpt_dir}/osrt_v5_{prefix}_step_{step}.pt"
