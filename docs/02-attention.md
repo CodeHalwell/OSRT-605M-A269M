@@ -12,7 +12,7 @@ The whole attention stack costs **17,308,032 parameters across the 3 blocks** (`
 
 ---
 
-## 2. Why GQA + V-from-K (the memory motivation)
+## 2. Why GQA + KDV (Key-Derived Value, the memory motivation)
 
 Attention's parameter cost is modest; its *memory* cost at inference is not. During autoregressive decode the model must keep, for every past token and every layer, the keys and values it attended to — the KV cache. For OSRT-605M that cache is multiplied by **18 effective layers** (3 physical blocks × 6 recursive loops; see §7 and `ARCHITECTURE.md` §13.2), so anything that shrinks the per-token, per-layer footprint pays off 18×.
 
@@ -20,7 +20,7 @@ Two design choices attack this:
 
 1. **GQA (grouped-query attention).** Full multi-head attention would give every one of the 24 query heads its own K and V head. Instead 24 query heads share **8** KV heads — groups of `group_size = 3` queries point at the same KV head (`src/osrt/model.py:903-907`). That alone cuts the K/V width from `24×64 = 1536` to `8×64 = 512`, a 3× reduction.
 
-2. **V-from-K (MLA-inspired latent).** Even with GQA, the textbook approach caches both K (512) and V (512) = 1024 floats/token/layer. OSRT instead caches **one** 512-dim latent and reconstructs both K and V from it (`ARCHITECTURE.md` §6.2-6.3). K is read directly off the latent; V is a learned linear function of it. That halves the cache again, to 512 floats/token/layer.
+2. **KDV (Key-Derived Value, MLA-inspired latent).** Even with GQA, the textbook approach caches both K (512) and V (512) = 1024 floats/token/layer. OSRT instead caches **one** 512-dim latent and reconstructs both K and V from it (`ARCHITECTURE.md` §6.2-6.3). K is read directly off the latent; V is a learned linear function of it — hence **Key-Derived Value (KDV)**: the value at each token is *derived from* its key (the cached latent) by a single learned `Linear(512→512)+bias`. That halves the cache again, to 512 floats/token/layer.
 
 The combined effect (`ARCHITECTURE.md` §13.2): **512 floats/token/layer**, ~18 KB/token across all 18 layers, ~72 MB raw at 4K context in bf16 — versus 144 MB for a standard GQA K+V cache. Further deployment compression (int4 + sliding window) is described in `ARCHITECTURE.md` §13.3; here we only care about the architectural halving.
 
@@ -47,7 +47,7 @@ With the locked `OSRT_605M_A288M` preset (`src/osrt/presets.py:22-47`): `dim = 1
 |---|---|---|---|
 | `q_proj` | `1536 → 1536` (`24×64`), no bias | `(B, S, 24, 64)` | full query projection |
 | `kv_down` | `1536 → 512`, no bias | `(B, S, 512)` | compress hidden → the **one cached latent** `c_kv` |
-| `v_from_k` | `512 → 512`, **bias=True** | `(B, S, 512)` | derive V from the latent: `V = W·c_kv + b` |
+| `v_from_k` | `512 → 512`, **bias=True** | `(B, S, 512)` | **KDV (Key-Derived Value):** derive V from the latent: `V = W·c_kv + b` |
 | `out_proj` | `1536 → 1536`, no bias | `(B, S, 1536)` | mix concatenated heads back to model dim |
 
 Note the asymmetry that is the heart of the design: there is **no separate `k_proj`**. K is not projected — it is the latent itself, merely reshaped (§4). Only V gets a learned transform, and it is the *only* attention projection with a bias term, because the affine `W·c + b` form is what gives V a degree of freedom K does not have.
@@ -64,8 +64,9 @@ This is the subtlest part of the block. The relevant code is `_attention`, `src/
 c_kv_new = self.kv_down(h)            # (B, S, kv_dim) — un-rotated latent
 
 # The cache holds ONLY the un-rotated latent. K and V are recomputed
-# from the full latent every step: RoPE is positional and V-from-K
-# must operate on un-rotated K, so neither may be cached rotated.
+# from the full latent every step: RoPE is positional and KDV
+# (Key-Derived Value) must operate on un-rotated K, so neither may
+# be cached rotated.
 if past_key_value is not None:
     c_kv = torch.cat([past_key_value, c_kv_new], dim=1)  # (B, L+S, kv_dim)
 else:
@@ -74,7 +75,7 @@ present_kv = c_kv if use_cache else None
 total_len = c_kv.shape[1]
 past_len = total_len - S
 
-# Derive K and V from the same latent (both linear in c_kv).
+# Derive K and V from the same latent (K = identity reshape; V = KDV).
 k = c_kv.view(B, total_len, self.kv_heads, self.head_dim)
 v = self.v_from_k(c_kv).view(B, total_len, self.kv_heads, self.head_dim)
 ```
@@ -83,11 +84,11 @@ v = self.v_from_k(c_kv).view(B, total_len, self.kv_heads, self.head_dim)
 
 **How K is recovered:** `k = c_kv.view(B, total_len, self.kv_heads, self.head_dim)` (`src/osrt/model.py:1014`). This is an **identity reshape** — no matmul, no parameters. The 512 latent dims *are* the 8 KV heads × 64 head-dim. K is the latent, viewed as heads. (RoPE is then applied to it, §5.)
 
-**How V is recovered:** `v = self.v_from_k(c_kv)...` (`src/osrt/model.py:1015`) — the one learned transform, `Linear(512→512)+bias`, reshaped the same way. This is the *only* place a projection touches the cached latent to produce attention values.
+**How V is recovered:** `v = self.v_from_k(c_kv)...` (`src/osrt/model.py:1015`) — the one learned transform, `Linear(512→512)+bias`, reshaped the same way. This is the *only* place a projection touches the cached latent to produce attention values, and it implements the **Key-Derived Value (KDV)** contract: V at every token is a fixed learned affine map of the *same* latent that defines K.
 
 **Why un-rotated:** RoPE (§5) is position-dependent — it multiplies each head vector by a rotation matrix that depends on the *absolute* position of the token. If we cached K *after* rotation, two things break:
 
-1. We could not re-derive V correctly, because `v_from_k` is a fixed linear map that must see the *content* latent, not a position-rotated one. Rotating first would feed a position-warped vector into a transform that was never meant to absorb position. The linear K→V relationship would be broken (`ARCHITECTURE.md` §6.2 callout, §13.4).
+1. We could not re-derive V correctly, because `v_from_k` is a fixed linear map that must see the *content* latent, not a position-rotated one — the KDV (Key-Derived Value) contract is `V = W·c_kv + b` with `c_kv` un-rotated. Rotating first would feed a position-warped vector into a transform that was never meant to absorb position. The linear K→V relationship would be broken (`ARCHITECTURE.md` §6.2 callout, §13.4).
 2. RoPE in this codebase is applied relative to a token's position in the full sequence. Caching the raw latent and rotating at attention time means a token's cached representation is position-agnostic and reusable; the rotation is re-applied fresh against the current `total_len` every step.
 
 So the cache is deliberately the *pre-rotation, pre-V-transform* latent, and both K and V are rebuilt from it on every forward — cheap, because K is a reshape and V is one small matmul.

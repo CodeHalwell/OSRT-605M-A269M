@@ -2,9 +2,9 @@
 
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
 > the trained model actually turns a prompt into text: the two phases of
-> generation (prefill and decode), the unusual *latent-only* KV cache, the
-> CPU-GPU-sync-aware standard decode loop, sampling, and a **greedy-only**
-> speculative-decode accelerator. It cross-references
+> generation (prefill and decode), the unusual *latent-only* KV cache (KDV,
+> Key-Derived Value), the CPU-GPU-sync-aware standard decode loop, sampling,
+> and a **greedy-only** speculative-decode accelerator. It cross-references
 > `docs/02-attention.md` (the attention sub-block / MLA latent),
 > `docs/06-recursion.md` (the 3-blocks-×-6-loops depth recurrence),
 > `ARCHITECTURE.md` §12 (inference) and §13 (KV cache), and the shipping
@@ -40,8 +40,10 @@ transformer, and both get their own section below:
 1. **The cache stores only a compressed latent, not K and V.** OSRT uses an
    MLA-inspired attention where K and V are both *linear functions of one cached
    latent* `c_kv` (see `docs/02-attention.md` and `ARCHITECTURE.md` §6.2-6.3).
-   We cache `c_kv` and rebuild K (with RoPE) and V on the fly. That is ~half a
-   normal GQA cache.
+   We cache `c_kv` and rebuild K (with RoPE) and V on the fly. V in particular
+   is the **Key-Derived Value (KDV)**: a single learned
+   `Linear(512→512)+bias` (`v_from_k`) reading the cached latent and producing
+   V. That is ~half a normal GQA cache.
 2. **Depth comes from recursion, not distinct layers.** The model runs 3
    physical decoder blocks 6 times (`docs/06-recursion.md`). Each
    *(loop, block)* pair is an **effective layer** with its own cache slot, so the
@@ -155,8 +157,9 @@ every step (`src/osrt/model.py:1002-1004`):
 
 ```python
 # The cache holds ONLY the un-rotated latent. K and V are recomputed
-# from the full latent every step: RoPE is positional and V-from-K
-# must operate on un-rotated K, so neither may be cached rotated.
+# from the full latent every step: RoPE is positional and KDV
+# (Key-Derived Value) must operate on un-rotated K, so neither may
+# be cached rotated.
 ```
 
 There are two reasons, and they compound:
@@ -165,9 +168,11 @@ There are two reasons, and they compound:
   at position *p*. If we cached rotated K we could not re-derive anything; storing
   the un-rotated latent lets us apply RoPE freshly over the whole span at
   attention time.
-- **V is a linear function of the un-rotated latent.** OSRT does not store V at
+- **V is a linear function of the un-rotated latent — the KDV (Key-Derived Value) contract.** OSRT does not store V at
   all. It derives V from the latent with a learned affine map
-  `v_from_k` (`src/osrt/model.py:921`, `1015`):
+  `v_from_k` (`src/osrt/model.py:921`, `1015`); this is what we call
+  **Key-Derived Value (KDV)**: V at each token is *derived from* its
+  cached key latent by a single `Linear(512→512)+bias`:
 
 ```python
 k = c_kv.view(B, total_len, self.kv_heads, self.head_dim)
@@ -176,10 +181,11 @@ v = self.v_from_k(c_kv).view(B, total_len, self.kv_heads, self.head_dim)
 (`src/osrt/model.py:1013-1015`)
 
 K is just the latent reshaped (then QK-normed and RoPE'd at attention time); V is
-`W·c_kv + b` over the same latent. Because both K and V are linear in `c_kv`, the
-single cached latent loses no expressivity relative to caching K and V separately
-— it's the same trick as DeepSeek MLA's shared `c_KV`
-(`src/osrt/model.py:909-917`; see `docs/02-attention.md` §"V derived from K").
+`W·c_kv + b` over the same latent (the **KDV / Key-Derived Value** affine map).
+Because both K and V are linear in `c_kv`, the single cached latent loses no
+expressivity relative to caching K and V separately — it's the same trick as
+DeepSeek MLA's shared `c_KV` (`src/osrt/model.py:909-917`; see
+`docs/02-attention.md` §"V derived from K / KDV").
 
 The cache update itself is a concatenation along the sequence axis
 (`src/osrt/model.py:1005-1009`):
@@ -611,7 +617,7 @@ text as greedy decode, fewer expensive forwards.
 
 ### Cross-references
 
-- `docs/02-attention.md` — GQA + MLA latent, V-from-K, RoPE, attention sink.
+- `docs/02-attention.md` — GQA + MLA latent, KDV (Key-Derived Value), RoPE, attention sink.
 - `docs/06-recursion.md` — 3 blocks × 6 loops, loop embeddings, per-loop aux head.
 - `ARCHITECTURE.md` §6 (attention), §12 (inference), §13 (KV cache).
 - `src/osrt/model.py` — `generate()` (1841), `_generate_speculative()` (2075),

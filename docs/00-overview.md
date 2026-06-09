@@ -83,7 +83,7 @@ input_ids
    │   for block b in 0..2 (3 physical blocks):              │
    │     ┌──────────────────────────────────────────────┐   │
    │     │ Attention sub-block                            │   │
-   │     │   GQA + V-from-K latent cache                  │   │ → ch.02
+   │     │   GQA + KDV (Key-Derived Value) latent cache   │   │ → ch.02
    │     │   QK-Norm, RoPE, flash SDPA (no sink)          │   │
    │     │   + HRA rank-256 adapter (this effective layer)│   │ → ch.05
    │     │ mHC mixes the contribution into the streams    │   │ → ch.04
@@ -119,7 +119,7 @@ shrinks it for deployment.
 | # | chapter | covers |
 |---|---|---|
 | 01 | [Tokenizer & Embedding](01-tokenizer-embedding.md) | byte-level BPE, the 21-token contract (14 built / 7 missing), tied embedding ↔ LM head |
-| 02 | [Attention](02-attention.md) | GQA via flash `F.scaled_dot_product_attention`, the V-from-K latent KV cache, RoPE, QK-Norm (attention sink dropped) |
+| 02 | [Attention](02-attention.md) | GQA via flash `F.scaled_dot_product_attention`, the KDV (Key-Derived Value) latent KV cache, RoPE, QK-Norm (attention sink dropped) |
 | 03 | [MoE & Routing](03-moe-and-routing.md) | shared + 8 routed experts, sqrt(softplus) router, aux-loss-free balancing, hash routing, SwiGLU clamp |
 | 04 | [mHC](04-mhc.md) | the n_hc=4 residual stream, Birkhoff/Sinkhorn doubly-stochastic mixing, the collapse head |
 | 05 | [HRA Adapters](05-hra-adapters.md) | the 18 rank-256 attention-path adapters (+ the separate injected retrofit path) |

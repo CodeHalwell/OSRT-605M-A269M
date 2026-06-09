@@ -198,10 +198,10 @@ the last dim into blocks, then `blocked @ r`. On dequant it is undone with
 > **The rotation is internal to the round-trip — it never touches the cache
 > layout.** Do not confuse it with RoPE. `ARCHITECTURE.md §13.4` stores the
 > *un-rotated* K_DOWN in the cache (RoPE is applied at attention time so the
-> linear V-from-K relationship survives). The TurboQuant Hadamard rotation lives
-> *entirely inside* `quantize_kv_latent` → `dequantize_kv_latent`; the
-> dequantized latent comes back in the original basis. The cache stores int4
-> codes, not "rotated K".
+> linear KDV (Key-Derived Value) K→V relationship survives). The TurboQuant
+> Hadamard rotation lives *entirely inside* `quantize_kv_latent` →
+> `dequantize_kv_latent`; the dequantized latent comes back in the original
+> basis. The cache stores int4 codes, not "rotated K".
 
 ### 3c. The symmetric int4 grid [−7, 7] and why −8 is dropped
 

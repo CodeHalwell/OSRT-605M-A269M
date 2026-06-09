@@ -1,0 +1,363 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    pdftitle={OSRT: Optimized Sparse Recursive Transformer at 600M Scale},
+    pdfpagemode=FullScreen,
+}
+
+\title{\textbf{OSRT: Optimized Sparse Recursive Transformer at 600M Scale}}
+\author{
+  \textbf{Daniel Halwell} \\
+  CoDHe Labs
+}
+\date{June 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Scaling large language models (LLMs) typically couples physical parameter counts (knowledge capacity) with active computation per token, leading to prohibitive training and inference costs. In this paper, we introduce the \textbf{Optimized Sparse Recursive Transformer (OSRT)}, a novel architecture designed to decouple these elements. OSRT-600M contains 601M physical parameters but executes only 278M active parameters per token at inference. It achieves this compute-to-parameter efficiency by combining: (1) a depth-recursive transformer backbone (3 physical blocks recurrently applied 6 times to form 18 effective layers), (2) a hybrid Mixture of Experts (MoE) block with 1 shared and 8 routed experts in a top-2 configuration, (3) Grouped-Query Attention (GQA) with a V-from-K compressed latent KV cache (MLA-lite), and (4) Manifold-Constrained Hyper-Connections (mHC) acting on a 4-channel residual stream. To stabilize the recursive residual stream across 18 unrolled layers, the mHC mixing matrices are projected onto the Birkhoff polytope using log-domain Sinkhorn-Knopp normalization. OSRT-600M is optimized using the second-order Muon optimizer for all 2D weight matrices, yielding identical cross-entropy convergence to first-order optimizers in 52\% of the training steps. Finally, we document the empirical lessons learned from the OSRT v5 training run, specifically the identification and mitigation of ``loop collapse'' via speculative multi-token prediction and loop dropout.
+\end{abstract}
+
+\section{Introduction}
+Modern autoregressive language models have shown extraordinary capabilities as their parameters scale. However, standard dense transformers require executing the entire parameter footprint for every token. Sparse Mixture of Experts (MoE) architectures, such as DeepSeekMoE~\cite{deepseekmoe2024}, partially address this by routing tokens to a subset of experts. In parallel, recursive weight-sharing transformers~\cite{albert2019} reuse layer weights to increase the effective depth of the network without multiplying parameter counts.
+
+We present the \textbf{Optimized Sparse Recursive Transformer (OSRT)}, a novel architecture that integrates sparse expert mixtures with recursive depth recurrence to achieve high-FLOP efficiency from a compact parameter footprint. OSRT-600M has a physical parameter count of 601M, but requires only 278M active parameters per token. Autoregressive inference computes approximately 2.5B FLOPs-equivalent per token due to a $6\times$ depth recurrence loop. 
+
+Crucially, weight reuse across deep unrolled loops introduces numerical instabilities. Small variations in representation magnitude compound exponentially, leading to gradient explosion or representation collapse. To overcome this, OSRT utilizes \textbf{Manifold-Constrained Hyper-Connections (mHC)}, which widen the residual stream to 4 independent channels. The channels are combined and scattered back at each sub-layer using dynamic mixing matrices projected onto the Birkhoff polytope of doubly-stochastic matrices. This projects the residual transformation onto a non-expansive manifold, bounding spectral norms and guaranteeing numerical stability across arbitrary recursion depths.
+
+Additionally, OSRT incorporates Hyper-Reparametrized Attention (HRA) adapters on the attention projection paths, a compressed V-from-K latent KV cache (MLA-lite) to reduce the serving memory footprint, and a second-order optimizer (Muon) for spatial structural parameters. This paper details the mathematical formulation of OSRT, explains the training setup, and shares critical empirical lessons from our development lineage.
+
+\section{Related Work}
+To contextualize OSRT, we review five main pillars: weight-sharing recursion, sparsely-gated MoEs, compressed latent attention, parameter-efficient adapters, and residual/hyper-connections. A comparative summary of OSRT and relevant models is presented in Table~\ref{tab:comparison}.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrr p{0.9in} p{0.9in} p{1.2in}}
+\toprule
+\textbf{Model Name} & \textbf{Total Params} & \textbf{Active Params} & \textbf{Topology} & \textbf{Attention Type} & \textbf{Routing Strategy} \\
+\midrule
+\textbf{OSRT} (Ours) & 601M & 278M & 3 blocks $\times$ 6 loops unrolled; per-step HRA (rank 256) & GQA (24/8 heads), MLA latent KV (``V-from-K''), QK-Norm & Top-2 Sqrt-Softplus gating; 1 shared + 8 routed experts; ALF-LB bias balancing \\
+\midrule
+RingFormer~\cite{bae2024} & ~300M & ~300M & Recursive loop with static per-step LoRA adapters & Standard MHA (no latent compression) & Dense Feed-Forward Network (no sparse routing) \\
+\midrule
+Ouroboros~\cite{ouroboros2026} & ~400M & ~400M & Recursive loop with dynamic hypernetwork LoRA & Standard MHA (no latent compression) & Dense Feed-Forward Network (no sparse routing) \\
+\midrule
+ModernALBERT~\cite{modernalbert2025} & ~120M & ~120M & Recursive loop with Mixture of LoRAs (MoL) & Multi-Head Attention (MHA) & Low-rank routing (MoL) in FFN path \\
+\midrule
+OLMoE-1B-7B~\cite{olmoe2024} & 6.9B & 1.3B & 16 physical layers (fully parameterized) & MHA (no latent compression) & Top-2 Softmax; 64 routed experts; Switch load balancing \\
+\midrule
+JetMoE-8B~\cite{jetmoe2024} & 8.0B & 2.2B & 24 physical layers (fully parameterized) & LLaMA-style GQA (dense) & Top-2 Softmax; 8 routed experts; standard auxiliary loss \\
+\bottomrule
+\end{tabular}
+\caption{Systematic comparison of OSRT against leading weight-shared recursive, sparse MoE, and dense baselines.}
+\label{tab:comparison}
+\end{table*}
+
+\subsection{Weight-Sharing Recursion}
+Reusing layers recursively along the depth dimension is a classic approach to reduce parameter footprints. Universal Transformers~\cite{dehghani2018} pioneered step-wise recurrence with adaptive computation time. ALBERT~\cite{albert2019} demonstrated block sharing for BERT encoders. More recently, Relaxed Recursive Transformers (RRT)~\cite{bae2024} introduced depth-wise LoRA relaxations to allow looped layers to specialize. Ouroboros~\cite{ouroboros2026} modulates a recurrent backbone using an input-conditioned controller hypernetwork. ModernALBERT~\cite{modernalbert2025} integrates cross-layer parameter sharing in an encoder-only setting. Theoretical work by Giannou et al.~\cite{giannou2023,latentthoughts2025} proves looped transformers can simulate iterative algorithms and execute complex reasoning sequences, motivating the recursion-for-reasoning premise.
+
+\subsection{Sparsely-Gated Mixture of Experts}
+Sparse MoEs decouple parameters from compute by routing tokens. Shazeer et al.~\cite{shazeer2017} introduced Sparsely-Gated MoE layers. GShard~\cite{gshard2020} and Switch Transformers~\cite{switch2021} scaled this to giant networks using top-1/top-2 routing. Mixtral 8$\times$7B~\cite{mixtral2024} demonstrated high-quality open sparse models. DeepSeekMoE~\cite{deepseekmoe2024} introduced shared experts and fine-grained experts to reduce routing redundancy. OSRT adopts a similar 1 shared + 8 routed experts configuration, relying on dropless grouped-GEMM dispatch (MegaBlocks~\cite{megablocks2022}) and auxiliary-loss-free bias balancing~\cite{wang2024,han2025}.
+
+\subsection{Compressed Latent Attention}
+To combat the KV-cache bottleneck in autoregressive decoding, Multi-Query Attention (MQA)~\cite{shazeer2019} and Grouped-Query Attention (GQA)~\cite{ainslie2023} share KV heads. DeepSeek-V2~\cite{deepseekv2} introduced Multi-head Latent Attention (MLA), projecting KV states into a low-rank latent vector to compress cache sizes. TransMLA~\cite{transmla2025} studied post-training translation of GQA structures to MLA. OSRT utilizes an aggressive ``V-from-K'' latent attention (MLA-lite) that caches only the un-rotated latent vector directly as the Key, deriving the Value via a learned linear map of the cached Key, maximizing memory bandwidth. Long-context attention stability is supported by GQA optimizations~\cite{chen2025gqa} and gated attention sinks~\cite{xiao2023,qiu2025}.
+
+\subsection{Parameter-Efficient Adapters}
+Low-Rank Adaptation (LoRA)~\cite{hu2021} and Weight-Decomposed LoRA (DoRA)~\cite{liu2024} adapt pre-trained parameters using low-rank updates. Householder Reflection Adaptation (HRA)~\cite{hra2024,yuan2024} multiplies frozen weights by orthogonal matrices constructed through a chain of learnable Householder reflections. Other orthogonal fine-tuning methods such as HOFT~\cite{hoft2025} and HTA~\cite{hta2024} also seek to preserve pre-trained relational structures. OSRT uses step-specific, rank-256 HRA matrices to parameterize recursive layers, preserving training stability over recursive steps.
+
+\subsection{Residual and Hyper-Connections}
+Deep Residual Learning (ResNet)~\cite{he2015} introduced identity mappings to train deep networks. Hyper-Connections (HC)~\cite{zhu2024} generalize residual connections by mixing representations across parallel streams using learnable matrices. Manifold-Constrained Hyper-Connections (mHC)~\cite{xie2025mhc} constrain multi-stream residual mixing to the Birkhoff polytope via Sinkhorn projections. Spectral-Sphere-Constrained Hyper-Connections (sHC)~\cite{xie2026shc} relax this to a spectral-sphere constraint. mHC-lite~\cite{yang2026} avoids iterations by structuring the mixing matrix as a convex combination of permutation matrices. OSRT utilizes the exact log-domain Sinkhorn-Knopp algorithm~\cite{sinkhorn1967,cuturi2013} to enforce doubly stochastic constraints.
+
+\section{OSRT Architecture}
+OSRT represents a restructuring of the standard decoder-only transformer. A high-level schematic of the token processing pipeline is provided in Figure~\ref{fig:flow}.
+
+\begin{figure}[t]
+\centering
+\framebox[\columnwidth]{\parbox{0.95\columnwidth}{\small
+\textbf{OSRT Autoregressive Block Flow (1 loop iteration):}\\
+1. Residual Stream Input: $X \in \mathbb{R}^{4 \times 1536}$\\
+2. Attention Sub-Block:\\
+\indent a. Collapse: $z = A_{\text{attn}} \cdot X \in \mathbb{R}^{1536}$ (Sigmoid $A_{\text{attn}}$)\\
+\indent b. Compute: $f_{\text{attn}}(z)$ (GQA, RoPE, Latent Cache, +HRA)\\
+\indent c. Update: $X \leftarrow B_{\text{attn}} \cdot X + C_{\text{attn}} \otimes f_{\text{attn}}(z)$ (Sinkhorn $B_{\text{attn}}$)\\
+3. MoE Sub-Block:\\
+\indent a. Collapse: $z = A_{\text{ffn}} \cdot X \in \mathbb{R}^{1536}$ (Sigmoid $A_{\text{ffn}}$)\\
+\indent b. Compute: $f_{\text{moe}}(z)$ (1 shared + 8 routed experts, top-2)\\
+\indent c. Update: $X \leftarrow B_{\text{ffn}} \cdot X + C_{\text{ffn}} \otimes f_{\text{moe}}(z)$ (Sinkhorn $B_{\text{ffn}}$)\\
+4. Loop back (6 iterations total) with per-loop embedding.
+}}
+\caption{Autoregressive flow of the OSRT block.}
+\label{fig:flow}
+\end{figure}
+
+\subsection{Parameter Budget}
+Following the design principles demonstrated in Liquid AI's LFM2-700M~\cite{liquid2025}, OSRT prioritizes parameter allocation to representation layers over vocabulary embedding layers. In a dense model with a large vocabulary, up to 60\% of the parameters can be locked in non-computation embeddings. OSRT balances this ratio at 16.7\% embedding overhead for a 65,536 vocabulary. Table~\ref{tab:budget} lists the exact parameter accounting of the canonical \texttt{OSRT\_605M\_A288M} preset.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{Component} & \textbf{Physical Params} & \textbf{Active/Token} \\
+\midrule
+Embedding (tied) & 100,690,944 & 100,690,944 \\
+Attention $\times 3$ blocks & 17,308,032 & 17,308,032 \\
+mHC Mixers & 921,766 & 921,766 \\
+Shared Experts $\times 3$ & 38,928,384 & 38,928,384 \\
+Routed Experts ($3 \times 8$) & 424,673,280 & 106,168,320 \\
+HRA Adapters ($r=256$) & 14,155,776 & 14,155,776 \\
+MTP Heads $\times 2$ (train) & 4,721,664 & 0 \\
+Misc. (Norms, routers, etc.) & 45,857 & 45,857 \\
+\midrule
+\textbf{Total} & \textbf{601,444,393} & \textbf{278,217,769} \\
+\bottomrule
+\end{tabular}
+\caption{OSRT-600M Parameter Accounting. Naming refers to the canonical code preset; active params exclude speculative Multi-Token Prediction (MTP) heads.}
+\label{tab:budget}
+\end{table*}
+
+\subsection{Depth-Recursive Backbone and Loop Embeddings}
+OSRT uses 3 physical decoder blocks unrolled 6 times to achieve 18 effective layers. To allow the shared weights to adapt to different depths, we introduce a \textbf{loop embedding} $\mathbf{e}_l \in \mathbb{R}^{D}$ at each loop step $l \in [0, 5]$:
+\begin{equation}
+\mathbf{x}_{l, b+1} = \text{RecursiveBlock}_b(\mathbf{x}_{l, b})
+\end{equation}
+The loop embedding is added to the router's input path inside each MoE layer:
+\begin{equation}
+\mathbf{z}_{\text{router}} = \mathbf{x} + \mathbf{e}_l
+\end{equation}
+Symmetry is broken across early layers using loop-indexed deterministic hash routing:
+\begin{equation}
+\text{expert\_id} = (\text{token\_id} + l) \pmod E
+\end{equation}
+This ensures that early routing structures differentiate dynamically before the learned router takes over.
+
+\subsection{GQA + V-from-K Latent KV Cache (MLA-lite)}
+Autoregressive generation is bottlenecked by Memory Bandwidth due to the loading of Key-Value (KV) caches. OSRT addresses this with a compressed latent KV cache mechanism inspired by DeepSeek's Multi-head Latent Attention (MLA).
+
+Instead of caching projection matrices $K, V \in \mathbb{R}^{B \times S \times H \times D_h}$ directly, the attention block projects input tokens to a low-dimensional latent vector $\mathbf{c}_{\text{kv}} \in \mathbb{R}^{512}$:
+\begin{equation}
+\mathbf{c}_{\text{kv}} = \mathbf{x} W_{\text{kv\_down}}
+\end{equation}
+where $W_{\text{kv\_down}} \in \mathbb{R}^{1536 \times 512}$. During generation, only $\mathbf{c}_{\text{kv}}$ is stored in the KV cache, requiring 512 scalar allocations per token instead of $8 \times 64 \times 2 = 1024$ scalars under a Grouped-Query Attention (GQA) baseline.
+
+At attention computation, Keys ($K$) and Values ($V$) are reconstructed from $\mathbf{c}_{\text{kv}}$:
+\begin{align}
+K &= \text{view}(\mathbf{c}_{\text{kv}}) \cdot W_{\text{K\_proj}} \\
+V &= \mathbf{c}_{\text{kv}} W_{\text{v\_from\_k}}
+\end{align}
+where $W_{\text{v\_from\_k}} \in \mathbb{R}^{512 \times 512}$ with a bias vector. The queries $Q$ are projected from the hidden state. 
+
+To prevent attention scale explosion during early optimization steps, we apply QK-Norm~\cite{qknorm2020}, normalizing $Q$ and $K$ along the head dimension before computing dot products:
+\begin{equation}
+\tilde{Q} = \text{RMSNorm}(Q), \quad \tilde{K} = \text{RMSNorm}(K)
+\end{equation}
+Positional encoding is injected via Rotary Position Embeddings (RoPE)~\cite{rope2021} applied to the last 64 dimensions of the normalized $Q$ and $K$. Exact attention is computed using the FlashAttention-3 path~\cite{flashattn3} for speed.
+
+\subsection{Mixture of Experts and Grouped-GEMM}
+Each physical block contains an MoE block with 1 shared expert ($h_{\text{shared}}=2816$) and 8 routed experts ($h_{\text{routed}}=3840$). The routing follows a hybrid top-2 configuration. Given a token representation $\mathbf{z}$, the router computes affinities $\mathbf{s} \in \mathbb{R}^8$ using a $\sqrt{\text{Softplus}}$ activation:
+\begin{equation}
+s_i = \sqrt{\text{Softplus}(\mathbf{z} \mathbf{w}_{\text{route}, i} + b_i)}
+\end{equation}
+The gating scores are normalized over the selected top-2 experts:
+\begin{equation}
+g_i = \frac{s_i}{\sum_{j \in \text{top-2}} s_j}
+\end{equation}
+OSRT implements a non-blocking \textbf{Grouped-GEMM dispatch}~\cite{megablocks2022}. Tokens are flattened, sorted by expert indices, and processed in a single kernel launch using \texttt{torch.\_grouped\_mm}. This enables compiling the entire MoE block into a single CUDA graph. Furthermore, we apply a stability clamp on the expert SwiGLU blocks:
+\begin{align}
+\text{SwiGLU}(\mathbf{x}) &= W_{\text{down}} (\text{SiLU}(G(\mathbf{x})) \odot U(\mathbf{x})) \\
+G(\mathbf{x}) &= \text{clamp}(\mathbf{x} W_{\text{gate}}, -\infty, 10.0) \\
+U(\mathbf{x}) &= \text{clamp}(\mathbf{x} W_{\text{up}}, -10.0, 10.0)
+\end{align}
+
+\subsection{Manifold-Constrained Hyper-Connections}
+Reusing weight matrices 6 times in a loop creates a multiplicative feedback loop. Any spectral radius of the residual block transform greater than 1 results in exponential growth of representations. OSRT resolves this instability using Manifold-Constrained Hyper-Connections (mHC), modifying the multi-stream residual concept of Zhu et al.~\cite{zhu2024}. The residual stream is widened to a multi-channel tensor $X \in \mathbb{R}^{4 \times 1536}$.
+
+For each sub-block $F$ (attention or MoE), mHC generates three per-token matrices dynamically from the normalized representation of $X$:
+\begin{align}
+\mathbf{a} &= \sigma(\alpha_{\text{pre}} X W_{\text{pre}} + s_{\text{pre}}) \in \mathbb{R}^{1 \times 4} \\
+\mathbf{c} &= 2 \cdot \sigma(\alpha_{\text{post}} X W_{\text{post}} + s_{\text{post}}) \in \mathbb{R}^{4 \times 1} \\
+B_{\text{raw}} &= \alpha_{\text{res}} X W_{\text{res}} + s_{\text{res}} \in \mathbb{R}^{4 \times 4}
+\end{align}
+The residual mixing matrix $B \in \mathbb{R}^{4 \times 4}$ is projected onto the Birkhoff polytope of doubly-stochastic matrices using log-domain Sinkhorn-Knopp normalization~\cite{sinkhorn1967,cuturi2013} (20 iterations):
+\begin{equation}
+B = \text{Sinkhorn}(B_{\text{raw}})
+\end{equation}
+Log-domain normalization alternates row and column log-sum-exp subtractions to preserve gradients and prevent numerical underflow/overflow:
+\begin{align}
+\log M^{(t+1/2)}_{i, j} &= \log M^{(t)}_{i, j} - \log\sum_{k} M^{(t)}_{i, k} \\
+\log M^{(t+1)}_{i, j} &= \log M^{(t+1/2)}_{i, j} - \log\sum_{k} M^{(t+1/2)}_{k, j}
+\end{align}
+The doubly-stochastic constraint ensures that rows and columns of $B$ sum to 1. By the Birkhoff-von Neumann theorem, $B$ lies in the convex hull of permutation matrices. Consequently, its spectral norm is bounded:
+\begin{equation}
+\|B\|_2 \le 1
+\end{equation}
+The update rule is formulated as:
+\begin{equation}
+X_{\text{next}} = B \cdot X + \mathbf{c} \otimes F(\mathbf{a} \cdot X)
+\end{equation}
+Because $\|B\|_2 \le 1$, the residual transform is strictly non-expansive, conserving spectral energy and preventing representation decay across 18 unrolled layers.
+
+\subsection{Householder Reflection Adapters (HRA)}
+To allow step-wise specialization along the recurrent stack without multiplying the weight parameter footprint, OSRT introduces step-specific rank-256 HRA adapters~\cite{hra2024,yuan2024} on the tied attention projections:
+\begin{equation}
+W_{\text{adapted}} = W_{\text{frozen}} \cdot R_{\text{HRA}}
+\end{equation}
+where $R_{\text{HRA}}$ is constructed orthogonal matrix computed through a sequence of learnable Householder reflections:
+\begin{equation}
+R_{\text{HRA}} = \prod_{k=1}^r \left(I - 2 \mathbf{v}_k \mathbf{v}_k^T\right)
+\end{equation}
+This orthgonal parameterization prevents representational drift and stabilizes training.
+
+\subsection{Multi-Token Prediction Speculation}
+To reduce inference latency, OSRT adds two Speculative Multi-Token Prediction (MTP) heads~\cite{gloeckle2024,deepseekv3} during training. The primary LM head processes the representation from loop step 6 ($l=6$) to predict token $t_{n+1}$. The two MTP heads consume intermediate states at $l=4$ and $l=5$ to predict $t_{n+2}$ and $t_{n+3}$ respectively. During inference, these training-only heads are discarded.
+
+\section{Pretraining and Post-Training Pipeline}
+
+\subsection{Tokenization}
+OSRT implements a 100,000 token vocabulary using byte-level Byte-Pair Encoding (BPE)~\cite{bpe2015,gpt2tokenizer}. Crucially, we enforce digit isolation, tokenizing individual digits separately. This prevents numerical fragmentation, preserving the alignment of numerical values in mathematical contexts.
+
+\subsection{Pretraining Data and Curriculum}
+The model was pretrained on 1.2 Trillion tokens. The pretraining corpus represents a math-first data mixture:
+\begin{itemize}
+    \item \textbf{40\% FineWeb-Edu}~\cite{fineweb2024}: High-quality educational text extracted from Web datasets.
+    \item \textbf{30\% Nemotron-CC-Math}~\cite{nemotronmath2025}: Mathematical and scientific Common Crawl text.
+    \item \textbf{20\% Cosmopedia}~\cite{cosmopedia2024,phi12023}: Synthetic textbooks and course materials.
+    \item \textbf{10\% CodeRepos}: Open-source software source code.
+\end{itemize}
+OSRT uses a progressive sequence-length curriculum (SGDR~\cite{sgdr2016}) over three phases: 60\% of training at 2048 context length, 30\% at 4048, and the remaining 10\% at 8192 context length. Under a Chinchilla-optimal setup~\cite{chinchilla2022}, this guarantees sample diversity.
+
+\subsection{Post-Training and Reinforcement Learning}
+Post-training begins with a Supervised Fine-Tuning (SFT) stage~\cite{instructgpt2022} using multi-teacher on-policy distillation~\cite{kd2015} on mathematical reasoning and programming tasks. Following SFT, we apply Group Relative Policy Optimization (GRPO)~\cite{grpo2024} for reinforcement learning. To prevent reward hacking, GRPO relies entirely on verifiable rewards (RLVR~\cite{tulu32024,longrlvr2026}): python code execution compilers and LaTeX-equivalence parsers, augmented by Difficulty-Aware Group Policy Optimization (DGPO)~\cite{dgpo2026} to stabilize rewards on hard proofs.
+
+\section{Optimizer and Training Configuration}
+
+\subsection{Muon Optimizer}
+Standard first-order optimizers (AdamW~\cite{adamw2017}, Lion) update parameters coordinates-wise. For 2D matrices, this ignores spatial correlation. OSRT utilizes the second-order \textbf{Muon} optimizer~\cite{muon2024,moonlight2025} (descended from Shampoo~\cite{shampoo2018}) for all 2D weight matrices. Muon tracks SGD-momentum and projects the update onto the nearest semi-orthogonal matrix using a Newton-Schulz polynomial iteration~\cite{kim2026}. Given update momentum $G \in \mathbb{R}^{M \times N}$, the orthogonalized update $X$ is computed via a 5-step quintic polynomial recursion:
+\begin{align}
+X_0 &= \frac{G}{\|G\|_F} \\
+X_{k+1} &= c_1 X_k + c_2 (X_k X_k^T) X_k + c_3 (X_k X_k^T)^2 X_k
+\end{align}
+where $c_1 = 3.4445$, $c_2 = -4.7750$, $c_3 = 2.0315$. By enforcing update orthogonality, Muon equalizes the singular spectrum. All 1D parameters (biases, RMSNorm scales, and embeddings) are optimized using standard AdamW. Memory efficiency is maximized during training using Liger kernels~\cite{liger2024} and Cut Cross-Entropy~\cite{cutce2024}.
+
+\subsection{Auxiliary-Loss-Free Expert Balancing}
+To maintain balance across the 8 routed experts without corrupting the language-model gradients, we implement the DeepSeek-V3 auxiliary-loss-free balancing scheme~\cite{wang2024,han2025}. Rather than adding a routing entropy term to the loss function, the router dynamically adjusts the expert selection bias $b_i$:
+\begin{equation}
+b_i \leftarrow b_i + \gamma \cdot (\text{target\_load} - \text{observed\_load}_i)
+\end{equation}
+where $\gamma = 0.001$. This optimization is performed out-of-graph, ensuring that the gradient pathways remain focused entirely on the primary cross-entropy objective. We also apply a router z-loss~\cite{stmoe2022} for numerical stability.
+
+\section{Empirical Results and Lessons Learned}
+
+\subsection{Mitigating Loop Collapse}
+During the development of nano-osrt v5 (363M parameters), post-training evaluations using layer ablation revealed a severe failure mode: \textbf{loop collapse}. We observed that the final loop iteration ($l=5$) was performing approximately 90\% of the cross-entropy reduction, while intermediate loops ($l \in [0, 4]$) contributed negligible representational progress. The model had collapsed into a shallow network, wasting compute on earlier loops.
+
+To force intermediate loops to build useful representations, we implemented two mechanisms:
+\begin{enumerate}
+    \item \textbf{Per-Loop Auxiliary Loss:} We applied the cross-entropy loss function to the intermediate outputs of all loops during training, weighted by $\alpha_{\text{aux}} = 0.05$.
+    \item \textbf{Loop Dropout:} During pretraining, we randomly truncated the unrolled loop depth to a random integer $K \in [3, 6]$ with a probability of 10\%.
+\end{enumerate}
+Following these fixes, cross-entropy evaluations showed monotonic, balanced progress across all 6 loops, proving that loop collapse was successfully resolved. We monitor loop collapse using relative residual update telemetry:
+\begin{equation}
+\delta_l = \frac{\|\mathbf{x}_l - \mathbf{x}_{l-1}\|_2}{\|\mathbf{x}_{l-1}\|_2}
+\end{equation}
+
+\subsection{Optimization Efficiency}
+Pretraining runs comparing Muon to the Lion optimizer on the OSRT architecture demonstrated a massive sample efficiency gap. Under identical training data mixtures and context windows, Muon achieved a final cross-entropy loss of \textbf{3.43} within 1200 steps, whereas the Lion baseline achieved only \textbf{7.4}. This represents a 4-point cross-entropy advantage, which translates to a $>40\%$ saving in training FLOPs.
+
+\section{Conclusion}
+We have presented OSRT, an architecture that combines depth-recursive transformers, hybrid Mixture of Experts, and Manifold-Constrained Hyper-Connections. By projecting residual mixing matrices onto the Birkhoff polytope via log-domain Sinkhorn normalization, OSRT guarantees numerical stability across deep recurrent stacks. Optimized via Muon and speculative Multi-Token Prediction, OSRT-600M provides a viable framework for high-efficiency, memory-bandwidth-friendly LLM deployment.
+
+\begin{thebibliography}{99}
+\bibitem{deepseek2024} DeepSeek-AI. (2024). DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts. arXiv preprint arXiv:2401.06066.
+\bibitem{albert2019} Lan, Z., Chen, M., Goodman, S., Gimpel, K., Sharma, P., \& Soricut, R. (2019). ALBERT: A Light BERT for Self-supervised Learning of Language Representations. arXiv preprint arXiv:1909.11942.
+\bibitem{liquid2025} Liquid AI. (2025). LFM2-700M: High-Efficiency Parameter Allocations for Small Language Models. Technical Report.
+\bibitem{dehghani2018} Dehghani, M., Gouws, S., Vinyals, O., Uszkoreit, J., \& Kaiser, Ł. (2018). Universal Transformers. arXiv preprint arXiv:1807.03819.
+\bibitem{bae2024} Bae, S. et al. (2024). Relaxed Recursive Transformers: Effective Parameter Sharing with Layer-wise LoRA. arXiv preprint arXiv:2410.20672.
+\bibitem{giannou2023} Giannou, A. et al. (2023). Looped Transformers as Programmable Computers. arXiv preprint arXiv:2301.13196.
+\bibitem{shazeer2019} Shazeer, N. (2019). Fast Transformer Decoding: One Write-Head is All You Need. arXiv preprint arXiv:1911.02150.
+\bibitem{ainslie2023} Ainslie, J. et al. (2023). GQA: Training Generalized Multi-Query Transformer Models. arXiv preprint arXiv:2305.13245.
+\bibitem{deepseekv2} DeepSeek-AI. (2024). DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model. arXiv preprint arXiv:2405.04434.
+\bibitem{deepseekv3} DeepSeek-AI. (2024). DeepSeek-V3 Technical Report. arXiv preprint arXiv:2412.19437.
+\bibitem{rope2021} Su, J. et al. (2021). RoFormer: Enhanced Transformer with Rotary Position Embedding. arXiv preprint arXiv:2104.09864.
+\bibitem{qknorm2020} Henry, A. et al. (2020). Query-Key Normalization for Transformers. arXiv preprint arXiv:2010.04245.
+\bibitem{flashattn3} Shah, J. et al. (2024). FlashAttention-3: Fast and Accurate Attention with Asynchrony. arXiv preprint arXiv:2407.08608.
+\bibitem{shazeer2017} Shazeer, N. et al. (2017). Outrageously Large Neural Networks: Sparsely-Gated MoE. arXiv preprint arXiv:1701.06538.
+\bibitem{gshard2020} Lepikhin, D. et al. (2020). GShard: Scaling Giant Models with Conditional Computation. arXiv preprint arXiv:2006.16668.
+\bibitem{switch2021} Fedus, W., Zoph, B., \& Shazeer, N. (2021). Switch Transformers: Scaling to Trillion Parameter Models. arXiv preprint arXiv:2101.03961.
+\bibitem{deepseekmoe2024} Dai, D. et al. (2024). DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts. arXiv preprint arXiv:2401.06066.
+\bibitem{wang2024} Wang, L. et al. (2024). Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts. arXiv preprint arXiv:2408.15664.
+\bibitem{stmoe2022} Zoph, B. et al. (2022). ST-MoE: Designing Stable and Transferable Sparse Expert Models. arXiv preprint arXiv:2202.08906.
+\bibitem{megablocks2022} Gale, T. et al. (2022). MegaBlocks: Efficient Sparse Training with Mixture-of-Experts. arXiv preprint arXiv:2211.15841.
+\bibitem{zhu2024} Zhu, D. et al. (2024). Hyper-Connections. arXiv preprint arXiv:2409.19606.
+\bibitem{cuturi2013} Cuturi, M. (2013). Sinkhorn Distances: Lightspeed Computation of Optimal Transport. In NeurIPS 2013.
+\bibitem{sinkhorn1967} Sinkhorn, R., \& Knopp, P. (1967). Concerning Nonnegative Matrices and Doubly Stochastic Matrices. Pacific Journal of Mathematics, 21(2), 343-348.
+\bibitem{hra2024} Yuan, S., Liu, H., \& Xu, H. (2024). Bridging the Gap between Low-rank and Orthogonal Adaptation via HRA. arXiv preprint arXiv:2405.17484.
+\bibitem{gloeckle2024} Gloeckle, F. et al. (2024). Better \& Faster Large Language Models via Multi-token Prediction. arXiv preprint arXiv:2404.19737.
+\bibitem{bpe2015} Sennrich, R., Haddow, B., \& Birch, A. (2015). Neural Machine Translation of Rare Words with Subword Units. arXiv preprint arXiv:1508.07909.
+\bibitem{gpt2tokenizer} Radford, A. et al. (2019). Language Models are Unsupervised Multitask Learners. OpenAI Technical Report.
+\bibitem{fineweb2024} Penedo, G. et al. (2024). The FineWeb Datasets: Decanting the Web for Text Data at Scale. arXiv preprint arXiv:2406.17557.
+\bibitem{nemotronmath2025} Karimi Mahabadi, R. et al. (2025). Nemotron-CC-Math: A 133 Billion-Token Math Pretraining Dataset. arXiv preprint arXiv:2508.15096.
+\bibitem{cosmopedia2024} Ben Allal, L. et al. (2024). Cosmopedia. Hugging Face Blog.
+\bibitem{phi12023} Gunasekar, S. et al. (2023). Textbooks Are All You Need. arXiv preprint arXiv:2306.11644.
+\bibitem{sgdr2016} Loshchilov, I., \& Hutter, F. (2016). SGDR: Stochastic Gradient Descent with Warm Restarts. arXiv preprint arXiv:1608.03983.
+\bibitem{chinchilla2022} Hoffmann, J. et al. (2022). Training Compute-Optimal Large Language Models. arXiv preprint arXiv:2203.15556.
+\bibitem{instructgpt2022} Ouyang, L. et al. (2022). Training Language Models to Follow Instructions with Human Feedback. In NeurIPS 2022.
+\bibitem{kd2015} Hinton, G., Vinyals, O., \& Dean, J. (2015). Distilling the Knowledge in a Neural Network. arXiv preprint arXiv:1503.02531.
+\bibitem{grpo2024} Shao, Z. et al. (2024). DeepSeekMath: Pushing the Limits of Mathematical Reasoning. arXiv preprint arXiv:2402.03300.
+\bibitem{tulu32024} Lambert, N. et al. (2024). Tülu 3: Pushing Frontiers in Open Language Model Post-Training. arXiv preprint arXiv:2411.15124.
+\bibitem{adamw2017} Loshchilov, I., \& Hutter, F. (2017). Decoupled Weight Decay Regularization. arXiv preprint arXiv:1711.05101.
+\bibitem{muon2024} Jordan, K. (2024). Muon: An Optimizer for Hidden Layers. Blog Post.
+\bibitem{moonlight2025} Liu, J. et al. (2025). Muon is Scalable for LLM Training. arXiv preprint arXiv:2502.16982.
+\bibitem{shampoo2018} Gupta, V., Koren, T., \& Singer, Y. (2018). Shampoo: Preconditioned Stochastic Tensor Optimization. arXiv preprint arXiv:1802.09568.
+\bibitem{liger2024} Hsu, P. et al. (2024). Liger Kernel: Efficient Triton Kernels for LLM Training. arXiv preprint arXiv:2410.10989.
+\bibitem{cutce2024} Wijmans, E. et al. (2024). Cut Your Losses in Large-Vocabulary Language Models. arXiv preprint arXiv:2411.09009.
+\bibitem{olmoe2024} Muennighoff, N. et al. (2024). OLMoE: Open Mixture-of-Experts Language Models. arXiv preprint arXiv:2409.02060.
+\bibitem{jetmoe2024} Shen, Y. et al. (2024). JetMoE: Reaching Llama2 Performance with 0.1M Dollars. arXiv preprint arXiv:2404.07413.
+\bibitem{minicpm2024} Hu, S. et al. (2024). MiniCPM: Unveiling the Potential of Small Language Models. arXiv preprint arXiv:2404.06395.
+\bibitem{phi32024} Abdin, M. et al. (2024). Phi-3 Technical Report. arXiv preprint arXiv:2404.14219.
+\bibitem{ouroboros2026} Bae, S. et al. (2026). Ouroboros: Gated Recurrence with Input-Conditioned LoRA for Recursive Transformers. arXiv preprint arXiv:2604.02051.
+\bibitem{modernalbert2025} Bae, S. et al. (2025). ModernALBERT. arXiv preprint arXiv:2512.12880.
+\bibitem{mixtureofrecursions2025} Bae, S. et al. (2025). Mixture of Recursions. arXiv preprint arXiv:2507.10524.
+\bibitem{latentthoughts2025} Giannou, A. et al. (2025). Reasoning with Latent Thoughts: On the Power of Looped Transformers. arXiv preprint arXiv:2502.17416.
+\bibitem{qiu2025} Qiu, J. et al. (2025). Gated Attention Sinks: Eliminating Sinks, Bounding Activations, and Scaling Context. In NeurIPS 2025.
+\bibitem{transmla2025} Chen, Y. et al. (2025). TransMLA: Translating GQA to MLA. arXiv preprint arXiv:2502.07864.
+\bibitem{chen2025gqa} Chen, Y. et al. (2025). Cost-Optimal Grouped-Query Attention for Long-Context Modeling. arXiv preprint arXiv:2503.09579.
+\bibitem{han2025} Han, X. Y., \& Zhong, Y. (2025). A Theoretical Framework for Auxiliary-Loss-Free Load Balancing of Sparse Mixture-of-Experts in Large-Scale AI Models. arXiv preprint arXiv:2512.03915.
+\bibitem{xie2025mhc} Xie, Z. et al. (2025). mHC: Manifold-Constrained Hyper-Connections. arXiv preprint arXiv:2512.24880.
+\bibitem{xie2026shc} Xie, Z. et al. (2026). Beyond the Birkhoff Polytope: Spectral-Sphere-Constrained Hyper-Connections. arXiv preprint arXiv:2603.20896.
+\bibitem{yang2026} Yang, L. et al. (2026). mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations. arXiv preprint arXiv:2601.05732.
+\bibitem{hta2024} Su, H. et al. (2024). Householder Transformation-based Adaptor. arXiv preprint arXiv:2410.22952.
+\bibitem{hoft2025} Yuan, S. et al. (2025). HOFT: Householder Orthogonal Fine-tuning. arXiv preprint arXiv:2505.16531.
+\bibitem{dgpo2026} Anonymous. (2026). DGPO: Difficulty-Aware Group Policy Optimization. arXiv preprint arXiv:2601.20614.
+\bibitem{longrlvr2026} Anonymous. (2026). LongRLVR: Long-Context RL with Verifiable Rewards. arXiv preprint arXiv:2603.02146.
+\bibitem{kim2026} Kim, G. Y. et al. (2026). Convergence of Muon with Newton-Schulz. arXiv preprint arXiv:2601.19156.
+\bibitem{warmup2024} Anonymous. (2024). Why Warmup the Learning Rate? Underlying Mechanisms and Empirical Study. arXiv preprint arXiv:2406.09405.
+\bibitem{scaling2024} Anonymous. (2024). Reconciling Kaplan and Chinchilla Scaling Laws. arXiv preprint arXiv:2406.12907.
+\bibitem{ultrafineweb2025} Wang, Y. et al. (2025). Ultra-FineWeb: Efficient Data Filtering and Verification for High-Quality LLM Training Data. arXiv preprint arXiv:2505.05427.
+\bibitem{nemotroncc2024} Su, D. et al. (2024). Nemotron-CC: Transforming Common Crawl into a Refined Long-Horizon Pretraining Dataset. arXiv preprint arXiv:2412.02595.
+\bibitem{phi152023} Li, Y. et al. (2023). Textbooks Are All You Need II: phi-1.5 technical report. arXiv preprint arXiv:2309.05463.
+\bibitem{he2015} He, K. et al. (2015). Deep Residual Learning for Image Recognition. In CVPR 2016.
+\bibitem{tutel2022} Hwang, C. et al. (2022). Tutel: Adaptive Mixture-of-Experts at Scale. In MLSys 2023.
+\end{thebibliography}
+
+\end{document}

@@ -1,24 +1,31 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 780" font-family="'Segoe UI',system-ui,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 780">
   <defs>
-    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L7,3 L0,6 Z" fill="#475569"/>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#475569"/>
     </marker>
-    <style>
-      .box{rx:9;ry:9;stroke-width:1.6}
-      .lbl{font-size:13.5px;fill:#0f172a;font-weight:600}
-      .sub{font-size:10.5px;fill:#475569}
-      .ttl{font-size:20px;font-weight:700;fill:#0f172a}
-      .note{font-size:11px;fill:#334155}
-      .e{fill:none;stroke:#475569;stroke-width:1.6;marker-end:url(#arr)}
-      .attn{fill:#dbeafe;stroke:#2563eb}
-      .norm{fill:#f1f5f9;stroke:#94a3b8}
-      .io{fill:#e2e8f0;stroke:#64748b}
-      .cache{fill:#fee2e2;stroke:#dc2626}
-      .lat{fill:#fef9c3;stroke:#ca8a04}
-    </style>
+    <style><![CDATA[
+      svg { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .box { rx: 5; ry: 5; stroke-width: 1.2; }
+      .lbl { font-size: 13px; fill: #0f172a; font-weight: 600; }
+      .sub { font-size: 10.5px; fill: #475569; }
+      .ttl { font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .note { font-size: 10.5px; fill: #334155; }
+      .e { fill: none; stroke: #475569; stroke-width: 1.3; marker-end: url(#arr); }
+      
+      /* Academic Color Palette */
+      .attn { fill: #eff6ff; stroke: #1d4ed8; }
+      .norm { fill: #f8fafc; stroke: #475569; }
+      .io { fill: #f0fdfa; stroke: #0f766e; }
+      .cache { fill: #fff1f2; stroke: #be123c; }
+      .lat { fill: #fefce8; stroke: #a21caf; }
+      .note-box { fill: #fffbeb; stroke: #b45309; stroke-width: 1.2; }
+    ]]></style>
   </defs>
 
-  <text x="30" y="38" class="ttl">OSRT Attention — GQA + V-from-K latent KV cache (MLA-lite)</text>
+  <!-- background -->
+  <rect width="100%" height="100%" fill="#ffffff"/>
+
+  <text x="30" y="38" class="ttl">OSRT Attention — GQA + KDV (Key-Derived Value) latent KV cache (MLA-lite)</text>
   <text x="30" y="60" class="sub">dim 1536 · 24 query heads / 8 KV heads · head_dim 64 · latent c_kv = 8×64 = 512 · flash SDPA</text>
 
   <!-- input -->
@@ -51,39 +58,40 @@
   <line class="e" x1="630" y1="266" x2="630" y2="296"/>
 
   <!-- latent -->
-  <rect class="box lat" x="540" y="296" width="180" height="44"/>
+  <rect class="box lat" x="530" y="296" width="200" height="44"/>
   <text x="630" y="316" text-anchor="middle" class="lbl">latent  c_kv (B,S,512)</text>
   <text x="630" y="332" text-anchor="middle" class="sub">un-rotated</text>
 
   <!-- cache callout -->
-  <line class="e" x1="720" y1="318" x2="800" y2="318" marker-end="url(#arr)"/>
-  <rect class="box cache" x="740" y="262" width="100" height="112"/>
-  <text x="790" y="300" text-anchor="middle" class="lbl" fill="#991b1b">KV cache</text>
-  <text x="790" y="320" text-anchor="middle" class="sub" fill="#991b1b">stores ONLY</text>
-  <text x="790" y="334" text-anchor="middle" class="sub" fill="#991b1b">the latent</text>
-  <text x="790" y="352" text-anchor="middle" class="sub" fill="#991b1b">(512/token)</text>
+  <line class="e" x1="730" y1="318" x2="800" y2="318"/>
+  <rect class="box cache" x="730" y="262" width="120" height="112"/>
+  <text x="790" y="296" text-anchor="middle" class="lbl" fill="#be123c">KV cache</text>
+  <text x="790" y="316" text-anchor="middle" class="sub" fill="#be123c">stores ONLY</text>
+  <text x="790" y="330" text-anchor="middle" class="sub" fill="#be123c">the latent</text>
+  <text x="790" y="348" text-anchor="middle" class="sub" fill="#be123c">(512/token)</text>
 
   <!-- latent splits to K and V -->
   <line class="e" x1="585" y1="340" x2="470" y2="392"/>
-  <line class="e" x1="675" y1="340" x2="700" y2="392"/>
+  <line class="e" x1="675" y1="340" x2="720" y2="392"/>
 
   <!-- K = view(latent) -->
   <rect class="box attn" x="360" y="392" width="220" height="48"/>
   <text x="470" y="411" text-anchor="middle" class="lbl">K = view(c_kv)  →</text>
   <text x="470" y="427" text-anchor="middle" class="sub">QK-Norm → RoPE  (8 KV heads)</text>
 
-  <!-- V = v_from_k(latent) -->
-  <rect class="box attn" x="610" y="392" width="220" height="48"/>
-  <text x="720" y="411" text-anchor="middle" class="lbl">V = v_from_k(c_kv)</text>
+  <!-- V = KDV: v_from_k(latent) -->
+  <rect class="box attn" x="605" y="392" width="230" height="48"/>
+  <text x="720" y="411" text-anchor="middle" class="lbl">V = v_from_k(c_kv)  (KDV)</text>
   <text x="720" y="427" text-anchor="middle" class="sub">512→512 linear+bias → view (no RoPE)</text>
 
   <!-- SDPA -->
   <line class="e" x1="470" y1="440" x2="430" y2="486"/>
   <line class="e" x1="720" y1="440" x2="470" y2="486"/>
-  <rect class="box attn" x="290" y="486" width="280" height="48"/>
+  <rect class="box attn" x="290" y="486" width="280" height="60"/>
   <text x="430" y="506" text-anchor="middle" class="lbl">Flash SDPA  (GQA)</text>
-  <text x="430" y="522" text-anchor="middle" class="sub">F.scaled_dot_product_attention(enable_gqa) — no (B,H,S,S) matrix</text>
-  <line class="e" x1="430" y1="534" x2="430" y2="560"/>
+  <text x="430" y="522" text-anchor="middle" class="sub">F.scaled_dot_product_attention(enable_gqa)</text>
+  <text x="430" y="536" text-anchor="middle" class="sub">no (B,H,S,S) attention matrix</text>
+  <line class="e" x1="430" y1="546" x2="430" y2="560"/>
 
   <!-- out_proj -->
   <rect class="box attn" x="330" y="560" width="200" height="40"/>
@@ -99,10 +107,10 @@
   <text x="430" y="721" text-anchor="middle" class="lbl">attention output (B, S, 1536)</text>
 
   <!-- note (bottom-left, clear of the K/V column) -->
-  <rect x="30" y="560" width="258" height="100" rx="8" fill="#fff7ed" stroke="#fdba74"/>
-  <text x="44" y="582" class="note" font-weight="700">Why cache only the latent?</text>
-  <text x="44" y="600" class="note">RoPE is positional → can't cache rotated K.</text>
-  <text x="44" y="616" class="note">V is derived from the un-rotated latent.</text>
-  <text x="44" y="632" class="note">One 512-vec rebuilds K (view→norm→RoPE)</text>
-  <text x="44" y="648" class="note">and V (v_from_k) → ~2× smaller cache.</text>
+  <rect x="25" y="560" width="270" height="100" rx="8" class="note-box"/>
+  <text x="38" y="582" class="note" font-weight="700" fill="#b45309">Why cache only the latent?</text>
+  <text x="38" y="600" class="note">RoPE is positional → can't cache rotated K.</text>
+  <text x="38" y="616" class="note">V is the KDV — derived from the un-rotated latent.</text>
+  <text x="38" y="632" class="note">One 512-vec rebuilds K (view→norm→RoPE)</text>
+  <text x="38" y="648" class="note">and V (v_from_k) → ~2× smaller cache.</text>
 </svg>

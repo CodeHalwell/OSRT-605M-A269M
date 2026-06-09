@@ -45,7 +45,7 @@ the technical details, then `src/osrt/` for the ground truth.
 recursive Mixtral-style sparse MoE transformer with **3 physical
 decoder blocks applied 6 times via depth recurrence** (giving 18
 effective layers), using **HRA adapters (high-rank, rank 256)**,
-**GQA attention with a V-from-K compressed KV cache**,
+**GQA attention with a KDV (Key-Derived Value) compressed KV cache**,
 **manifold-constrained hyper-connections**, and **Muon-optimized
 weights** — totaling **601M physical params, 278M active per token
 at inference** (46.3% active fraction; see §2.1 for full breakdown),
@@ -89,10 +89,10 @@ COMPONENT                                       PHYSICAL        ACTIVE / TOKEN (
 Embedding (65,536 × 1,536, tied with LM head)   100,690,944    100,690,944
   -- one row per token at lookup; full matrix touched at the tied LM head
 
-Attention × 3 blocks (GQA + V-from-K, §6)        17,308,032     17,308,032
+Attention × 3 blocks (GQA + KDV, §6)            17,308,032     17,308,032
   -- per block: q_proj (1536×1536) + kv_down (1536×512)
      + v_from_k (512×512 +b) + out_proj (1536×1536) + QK/attn norms
-  -- ~5.77M/block; the V-from-K latent is what makes attention this lean
+  -- ~5.77M/block; the KDV (Key-Derived Value) latent is what makes attention this lean
 
 mHC mixers (Sinkhorn/Birkhoff, §8)                  921,766        921,766
   -- per-sub-block A/B/C generators; shared across loop iterations
@@ -415,38 +415,44 @@ during RL (HRA-only training in GRPO stage).
 ```
 W_Q ∈ ℝ^(1536 × 1536)        # 2.36M params
 W_K_DOWN ∈ ℝ^(1536 × 512)    # 0.79M params — to latent K
-W_V_FROM_K ∈ ℝ^(512 × 512)   # 0.26M params — derive V from K
+W_V_FROM_K ∈ ℝ^(512 × 512)   # 0.26M params — KDV: derive V from K
 b_V ∈ ℝ^(512)                # bias for V derivation
 W_O ∈ ℝ^(1536 × 1536)        # 2.36M params
 ```
 
 Per block: ~5.76M params; across 3 blocks: ~17.3M. Plus HRA adapters.
 
-> ✅ **DECISION MADE — V-from-K (constraint accepted).** Of the three
+> ✅ **DECISION MADE — KDV (Key-Derived Value, constraint accepted).** Of the three
 > options once on the table (a: accept the V=f(K) constraint; b: widen
 > latent then split; c: full DeepSeek MLA), the implementation chose
 > **(a)** — `model.py` caches a single 512-dim un-rotated latent
 > (`kv_down`), reads K straight off it, and derives V via
-> `v_from_k` (a learned `Linear(512→512)+bias`). One cached tensor,
-> ~half the KV cache of storing K and V separately. The expressivity
-> note still holds in principle but was judged acceptable at this scale;
-> revisit only if attention quality stalls. (`review/SYNTHESIS.md`
-> Tier 1 #7.)
+> `v_from_k` (a learned `Linear(512→512)+bias`). The name for that
+> contract — *Value derived from the Key latent* — is **KDV (Key-Derived
+> Value)**. One cached tensor, ~half the KV cache of storing K and V
+> separately. The expressivity note still holds in principle but was
+> judged acceptable at this scale; revisit only if attention quality
+> stalls. (`review/SYNTHESIS.md` Tier 1 #7.)
 >
-> **Implemented correctly: V-from-K operates on the UN-rotated latent.**
+> **Implemented correctly: KDV (Key-Derived Value) operates on the UN-rotated latent.**
 > RoPE is position-dependent, so the cache holds the un-rotated `c_kv`;
 > both K (RoPE'd) and V (`v_from_k(c_kv)`) are recomputed from it at
 > attention time. See `model.py::_attention` lines ~1000-1015.
 
-### 6.3 V derived from K (MLA-inspired)
+### 6.3 V derived from K (Key-Derived Value / KDV, MLA-inspired)
 
 ```
 K = W_K_DOWN @ x_normed          # [batch, seq, 512]
-V = W_V_FROM_K @ K + b_V         # [batch, seq, 512] — derived from K
+V = W_V_FROM_K @ K + b_V         # [batch, seq, 512] — KDV: derived from K
 ```
 
 **Cache only K** (not K and V separately) to halve KV cache. V is
-recomputed at decode time via the learnable transform.
+recomputed at decode time via the learnable transform — the **Key-Derived
+Value (KDV)** contract: at every token, V is a fixed learned affine
+function of that token's cached key latent. The single cached latent
+loses no expressivity relative to caching K and V separately (both
+are linear in `c_kv`); this is the same trick as DeepSeek MLA's
+shared `c_KV`.
 
 ### 6.4 QK-Norm
 
@@ -1156,7 +1162,7 @@ kv_cache: dict
 
 ### 13.3 Compression stack at deployment
 
-The §13.1 baseline already excludes V (K-only), so the V-from-K row
+The §13.1 baseline already excludes V (K-only), so the KDV row
 in earlier drafts was double-counting. Corrected table — apply
 compression *once* against the K-only baseline:
 
@@ -1176,7 +1182,7 @@ state both assumptions when quoting it.
 
 After each new token, append the **un-rotated** K_DOWN to all 18 caches.
 RoPE is applied at attention time, NOT before caching (otherwise the
-linear K→V relationship in V-from-K is broken — see §6.2 callout):
+linear K→V relationship in KDV is broken — see §6.2 callout):
 
 ```
 for r in range(6):
@@ -1187,7 +1193,7 @@ for r in range(6):
 
 # At attention time:
 #   K_unrot = kv_cache[(r, b)]          # cached un-rotated K
-#   V       = W_V_FROM_K[b] @ K_unrot + b_V[b]   # derive V from un-rotated K
+#   V       = W_V_FROM_K[b] @ K_unrot + b_V[b]   # KDV: derive V from un-rotated K
 #   K       = apply_rope(K_unrot, position_ids)  # then rotate K for QK math
 #   Q       = apply_rope(W_Q[b] @ x_new, position_ids)
 #   attn    = softmax(Q @ K.T / sqrt(d)) @ V
@@ -1558,8 +1564,8 @@ clear.
 
 - **Repo / package** — `src/osrt/` exists (the package was renamed
   `nano_osrt` → `osrt`); `pytest` collects and 144 tests pass.
-- **V-from-K vs MLA** (§6.2) — chose V-from-K: cache one un-rotated
-  512-d latent, K read off it, V = `v_from_k(latent)`.
+- **KDV (Key-Derived Value) vs MLA** (§6.2) — chose KDV: cache one
+  un-rotated 512-d latent, K read off it, V = `v_from_k(latent)`.
 - **mHC final collapse** (§8/§10) — dedicated learnable `mhc_collapse`
   head, not a reused `A_l`. mHC dimensional bugs fixed (einsum +
   `.repeat`). `use_mhc=True` in the preset, pending GPU stability test.
@@ -1666,3 +1672,10 @@ clear.
   Cosmopedia etc., dropped CodeParrot + Wikipedia) is a TRAINING config,
   not an architecture spec, so it has no home in this doc — see
   `train_config.py::PretrainConfig.phases`.
+- **2026-06-09** — **named the V-from-K contract: KDV (Key-Derived
+  Value).** §6.2 callout, §6.3 heading, §13.4 code comment, §15
+  decision log, and the top-level blurb all adopt the formal name; the
+  `v_from_k` projection is now annotated as "**KDV: derive V from K**"
+  in `docs/02-attention.md` §3, with a one-line contract: `V = W·c_kv + b`
+  on the un-rotated cached latent. Doc-only — no model code or
+  parameter naming changes (the `v_from_k` attribute stays as is).
