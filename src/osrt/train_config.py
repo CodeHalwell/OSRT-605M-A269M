@@ -101,18 +101,19 @@ class PretrainConfig:
     # Training
     batch_size: int = 8
     grad_accum_steps: int = 8
-    # Realistic step horizon for the available compute budget. The
-    # original 300_000 was the "complete the full curriculum" target
-    # but that requires ~$1700+ on Modal H100. With the realistic
-    # multi-account budget (~$77 across 3 accounts) we're aiming for
-    # roughly Chinchilla-optimal on active params (~3.8B tokens =
-    # step ~21000 at Phase 2 sizes). 25_000 leaves headroom past that
-    # so the cosine taper hits ~12% of peak LR by step 21000 — proper
-    # cooked training rather than running at peak forever.
-    # Bumped from 300_000 mid-run to fix the cosine being effectively
-    # a constant LR at this horizon.
-    total_steps: int = 25_000
-    warmup_steps: int = 3_000
+    # Cosine horizon sized to the base-pretrain budget (~$100 on Modal H100,
+    # $3.95/hr ≈ 25 H100-hr ≈ ~3,500 steps at ~5k tok/s, seq-2048 foundation
+    # @ 131K tok/step ≈ ~455M tokens). total_steps is the LR-anneal target, and
+    # the step counter persists across resumes, so chunked runs toward a FIXED
+    # total_steps are one continuous cosine (no re-warm between chunks). The
+    # cosine fully decays peak→min_lr by step 3,500, so the run self-terminates
+    # at the budget with a clean, annealed base. Long-context (4096/8192) and
+    # math specialisation happen in the SEPARATE mid-training/extend stages,
+    # which re-warm from this checkpoint — so annealing the base to min here is
+    # correct. To train a longer base, raise this BEFORE the first chunk and
+    # keep it fixed across resumes (changing it mid-run reshapes the cosine).
+    total_steps: int = 3_500
+    warmup_steps: int = 400          # ~11% — spins up Muon + the MoE balance bias
     peak_lr: float = 6e-4
     min_lr: float = 6e-5
     weight_decay: float = 0.3
