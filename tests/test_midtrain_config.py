@@ -69,8 +69,12 @@ def test_midtrain_config_values():
     assert cfg.hra_enabled is True
     # router exploration off
     assert cfg.router_gumbel_tau_init == 0.0
-    # gate disabled
+    # computed Muon LR: (peak_lr / foundation_peak 6e-4) * foundation muon 0.02
+    assert cfg.muon_lr == 6.6e-3
+    assert cfg.muon_min_lr == 6.6e-4
+    # gate disabled — fully disabled (not just "high")
     assert cfg.early_stop_check_step > 9_000
+    assert cfg.early_stop_check_step == 9_999_999
     # resume + prefix
     assert cfg.pretrained_checkpoint.endswith("osrt_v5_final.pt")
     assert cfg.stage_prefix == "midtrain"
@@ -96,6 +100,13 @@ def test_midtrain_phase_is_seq4096_math_mix():
         }
     )
     assert 0.60 <= math_sci <= 0.70
+    # per-phase sizing (the loop reads these, not the inherited top-level batch)
+    assert phase["batch_size"] == 6
+    assert phase["grad_accum_steps"] == 11
+    # all dataset weights sum to ~1.0 — guards against a typo'd weight
+    total_weight = sum(d["weight"] for d in phase["datasets"])
+    assert abs(total_weight - 1.0) < 1e-9
+    assert len(phase["datasets"]) == 7
 
 
 def test_midtrain_sanity_writes_no_final():
