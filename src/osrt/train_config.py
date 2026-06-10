@@ -1071,13 +1071,16 @@ class MidtrainConfig(PretrainConfig):
     # ── Schedule (fresh re-warm cosine) ──────────────────────────────
     # total_steps drives the cosine: with lr_anchor_step=0 the LR anneals
     # peak_lr → min_lr over the full total_steps (see _set_param_group_lrs:
-    # eff_total = total_steps - anchor). 8000 steps × 66 seqs × 4096 tok ≈
-    # 2.16B tokens for the ~$150 budget.
-    total_steps: int = 8_000
+    # eff_total = total_steps - anchor). REDUCED 8000 → 5500 mid-run after
+    # the wallet check ($147 left, 8000 needed ~$213): at ~27.6s/step,
+    # 5500 lands ~$140 total with margin, and the cosine reshapes on
+    # resume so the checkpoint is properly ANNEALED to min_lr at 5500
+    # rather than dying mid-cool at a budget kill. ~1.49B tokens.
+    total_steps: int = 5_500
     warmup_steps: int = 150          # re-warm from the annealed base
     lr_anchor_step: int = 0          # fresh cosine (foundation already cooled)
     peak_lr: float = 2e-4            # ~33% of foundation's 6e-4
-    min_lr: float = 2e-5             # cosine floor at step 8000
+    min_lr: float = 2e-5             # cosine floor at step 5500
     weight_decay: float = 0.1        # softer than foundation's 0.3
     grad_clip: float = 1.0
 
@@ -1133,7 +1136,7 @@ class MidtrainConfig(PretrainConfig):
     phases: dict = {  # noqa: RUF012
         "extend": {
             "start": 0,
-            "end": 8_000,
+            "end": 5_500,
             "seq_len": 4096,
             "batch_size": 6,         # knowledge-phase sizing; sanity-gated
             "grad_accum_steps": 11,
