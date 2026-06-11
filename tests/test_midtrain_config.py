@@ -125,3 +125,82 @@ def test_midtrain_sanity_writes_no_final():
     assert cfg.compile_enabled is False
     # inherits the real seq/mix so VRAM is measured at production size
     assert cfg.phases["extend"]["seq_len"] == 4096
+
+
+# ── SFT v1 tests (system-prompt instruction tuning) ──────────────────────
+
+def test_reasoning_pools_split():
+    from osrt.system_prompts import (
+        REASONING_ON, REASONING_OFF, SYSTEM_PROMPTS, sample_system_prompt,
+    )
+    assert len(REASONING_ON) == 12
+    assert len(REASONING_OFF) >= 6
+    assert SYSTEM_PROMPTS is REASONING_ON  # back-compat
+    import random
+    r = random.Random(0)
+    assert sample_system_prompt(r, "on") in REASONING_ON
+    assert sample_system_prompt(r, "off") in REASONING_OFF
+    # default mode is "on" (preserves old single-pool callers)
+    assert sample_system_prompt(r) in REASONING_ON
+    import pytest
+    with pytest.raises(ValueError):
+        sample_system_prompt(r, "bogus")
+
+
+def test_format_tulu_single_vs_multi_turn():
+    from osrt.sft_data import format_tulu, FORMAT_FN
+    assert "tulu" in FORMAT_FN
+    single = {"messages": [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4"},
+    ]}
+    assert format_tulu(single) == ("What is 2+2?", "", "4")
+    # multi-turn (>1 user turn) is skipped → empties → SFTStream drops it
+    multi = {"messages": [
+        {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"}, {"role": "assistant", "content": "d"},
+    ]}
+    assert format_tulu(multi) == ("", "", "")
+    # malformed
+    assert format_tulu({"messages": []}) == ("", "", "")
+
+
+def test_sft_system_turn_masking():
+    """The <|system|> turn joins the MASKED prefix; the response is trained."""
+    from transformers import AutoTokenizer
+    from osrt.sft_data import IGNORE_INDEX
+    from osrt.system_prompts import sample_system_prompt
+    import random
+    tok = AutoTokenizer.from_pretrained("v6_tokenizer_export")
+    _, persona = sample_system_prompt(random.Random(0), "off")
+    prompt = f"<|system|>{persona}<|user|>Q?<|assistant|>"
+    resp = f"<|think|><|/think|><|answer|>A<|/answer|>{tok.eos_token}"
+    pids = tok.encode(prompt, add_special_tokens=False)
+    rids = tok.encode(resp, add_special_tokens=False)
+    labels = [IGNORE_INDEX] * len(pids) + rids
+    # system token (id 13) is in the masked prefix
+    assert 13 in pids
+    assert all(x == IGNORE_INDEX for x in labels[:len(pids)])
+    assert all(x != IGNORE_INDEX for x in labels[len(pids):])
+
+
+def test_sftv1_config_values():
+    from osrt.train_config import SFTv1Config
+    from osrt.sft_data import FORMAT_FN
+    c = SFTv1Config()
+    assert c.pretrained_checkpoint.endswith("osrt_v5_midtrain_final.pt")
+    assert c.seq_len == 2048
+    assert c.stage_prefix == "sft_v1"
+    assert c.system_tag == "<|system|>"
+    assert c.min_response_tokens == 150
+    assert c.hra_native is True
+    assert c.hra_enabled is True
+    ds = c.datasets
+    assert abs(sum(d["weight"] for d in ds) - 1.0) < 1e-9
+    # every dataset has a registered format + a valid reasoning_mode
+    for d in ds:
+        assert d["format"] in FORMAT_FN
+        assert d["reasoning_mode"] in ("on", "off")
+    # ~35% reasoning-on (math)
+    on = sum(d["weight"] for d in ds if d["reasoning_mode"] == "on")
+    assert 0.30 <= on <= 0.40

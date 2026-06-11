@@ -22,7 +22,7 @@ import random
 # ── The pool ──
 # Each entry is a (name, prompt_text) tuple. Name is for logging.
 
-SYSTEM_PROMPTS: list[tuple[str, str]] = [
+REASONING_ON: list[tuple[str, str]] = [
     (
         "minimal_format",
         "You are a helpful assistant. Think step by step inside "
@@ -130,15 +130,85 @@ SYSTEM_PROMPTS: list[tuple[str, str]] = [
 ]
 
 
-def sample_system_prompt(rng: random.Random | None = None) -> tuple[str, str]:
-    """Uniform-random sample. Returns (name, text)."""
+# ── REASONING-OFF pool ──
+# Personas that instruct the model to answer DIRECTLY — used for SFT data
+# without real reasoning traces (general instruction-following, chat, code).
+# They still set the <|think|>/<|answer|> format, but tell the model the
+# think block is optional/brief, so a thin think block (which the off-mode
+# format_fns sometimes emit) is CONSISTENT with the persona rather than a
+# contradiction. This is what makes "follow the system prompt" literally true
+# for non-reasoning data, and it builds the reasoning-on/off toggle (the
+# project's north-star metric) into SFT. See the SFT-v1 design spec.
+REASONING_OFF: list[tuple[str, str]] = [
+    (
+        "direct_concise",
+        "You are a helpful assistant. Answer directly. Put your final "
+        "answer inside <|answer|>...<|/answer|>. You may leave "
+        "<|think|>...<|/think|> empty or use it only briefly — do not "
+        "reason at length.",
+    ),
+    (
+        "no_reasoning",
+        "Respond directly without showing reasoning. Keep "
+        "<|think|>...<|/think|> empty and put the complete response inside "
+        "<|answer|>...<|/answer|>.",
+    ),
+    (
+        "assistant_plain",
+        "You are a helpful assistant. Give the answer straight away in "
+        "<|answer|>...<|/answer|>. A short <|think|>...<|/think|> is fine "
+        "but not required; don't pad it.",
+    ),
+    (
+        "instruction_direct",
+        "Follow the user's instruction and respond directly. The full "
+        "response goes in <|answer|>...<|/answer|>; <|think|>...<|/think|> "
+        "may be empty.",
+    ),
+    (
+        "code_direct",
+        "You are a coding assistant. Provide the solution directly inside "
+        "<|answer|>...<|/answer|> (use a ```language``` block for code). "
+        "Keep <|think|>...<|/think|> minimal or empty.",
+    ),
+    (
+        "chat_direct",
+        "Be a friendly, direct assistant. Put your reply in "
+        "<|answer|>...<|/answer|>. Only use <|think|>...<|/think|> if a "
+        "brief note helps; otherwise leave it empty.",
+    ),
+]
+
+
+# Back-compat: existing MOPD/GRPO call sites import SYSTEM_PROMPTS and expect
+# the reasoning-on personas. Keep the name pointing at REASONING_ON.
+SYSTEM_PROMPTS: list[tuple[str, str]] = REASONING_ON
+
+_POOLS = {"on": REASONING_ON, "off": REASONING_OFF}
+
+
+def sample_system_prompt(
+    rng: random.Random | None = None, mode: str = "on",
+) -> tuple[str, str]:
+    """Uniform-random sample from the reasoning-`mode` pool. Returns (name, text).
+
+    mode="on"  → REASONING_ON personas (think step by step) — for data with
+                 real reasoning traces (math, etc.).
+    mode="off" → REASONING_OFF personas (answer directly) — for general/chat/
+                 code data without reasoning. Default "on" preserves the old
+                 single-pool behaviour for existing call sites.
+    """
     r = rng or random
-    return r.choice(SYSTEM_PROMPTS)
+    pool = _POOLS.get(mode)
+    if pool is None:
+        raise ValueError(f"unknown reasoning mode {mode!r}; use 'on' or 'off'")
+    return r.choice(pool)
 
 
 def get_by_name(name: str) -> str:
-    """Look up a system prompt by its name (for reproducible probes)."""
-    for n, t in SYSTEM_PROMPTS:
-        if n == name:
-            return t
+    """Look up a system prompt by its name across both pools."""
+    for pool in (REASONING_ON, REASONING_OFF):
+        for n, t in pool:
+            if n == name:
+                return t
     raise KeyError(f"unknown system prompt: {name}")

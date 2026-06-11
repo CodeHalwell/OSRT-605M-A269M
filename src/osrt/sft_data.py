@@ -18,6 +18,8 @@ from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import PreTrainedTokenizerFast
 
+from osrt.system_prompts import sample_system_prompt
+
 IGNORE_INDEX = -100
 
 
@@ -195,6 +197,36 @@ def format_openhermes(example: dict) -> tuple[str, str, str]:
     return question, "", answer
 
 
+def format_tulu(example: dict) -> tuple[str, str, str]:
+    """Tülu-3 SFT mixture: `messages` chat-list schema.
+
+    Schema: [{"role": "user"/"assistant"/"system", "content": str}, ...].
+    SFT-v1 uses SINGLE-TURN only: take the first user message as the question
+    and the following assistant message as the answer. Multi-turn rows (>1 user
+    turn) are skipped (return empties → SFTStream drops them). reasoning_mode is
+    'off' for tulu, so reasoning is left empty (the answer carries the content).
+    """
+    messages = example.get("messages", [])
+    if not isinstance(messages, list) or len(messages) < 2:
+        return "", "", ""
+    # count user turns; v1 keeps single-turn only
+    user_turns = [m for m in messages if m.get("role") == "user"]
+    if len(user_turns) != 1:
+        return "", "", ""
+    question = ""
+    answer = ""
+    for m in messages:
+        role = m.get("role", "")
+        content = m.get("content", "") or ""
+        if role == "user" and not question:
+            question = content
+        elif role == "assistant" and question and not answer:
+            answer = content
+    if not question or not answer:
+        return "", "", ""
+    return question, "", answer
+
+
 def format_ifeval(example: dict) -> tuple[str, str, str]:
     """IFEval-like: prompt + response with constraints."""
     question = example.get("prompt", "")
@@ -348,6 +380,7 @@ FORMAT_FN = {
     "alpaca_code": format_alpaca_code,
     "alpaca": format_alpaca,
     "openhermes": format_openhermes,
+    "tulu": format_tulu,
     "ifeval": format_ifeval,
     "longform": format_longform,
     "nemotron": format_nemotron,
@@ -381,6 +414,8 @@ class SFTStream(IterableDataset):
         think_close: str = "<|/think|>",
         answer_open: str = "<|answer|>",
         answer_close: str = "<|/answer|>",
+        system_tag: str | None = None,
+        min_response_tokens: int = 0,
     ) -> None:
         self.dataset_configs = dataset_configs
         self.seq_len = seq_len
@@ -392,6 +427,13 @@ class SFTStream(IterableDataset):
         self.think_close = think_close
         self.answer_open = answer_open
         self.answer_close = answer_close
+        # When system_tag is set, each example is prefixed with a
+        # <|system|>{persona} turn, the persona sampled per-example from the
+        # reasoning-on/off pool selected by the dataset's `reasoning_mode`.
+        # None → legacy behaviour (no system turn), so existing callers are
+        # unaffected.
+        self.system_tag = system_tag
+        self.min_response_tokens = min_response_tokens
 
     def __iter__(self):  # noqa: ANN204
         from datasets import load_dataset
@@ -561,12 +603,23 @@ class SFTStream(IterableDataset):
             if not question or not answer:
                 continue
 
-            # Build token sequence with native tags
-            # Prompt (masked): <|user|>{question}<|assistant|>
+            # Build token sequence with native tags.
+            # Prompt (masked): [<|system|>{persona}]<|user|>{question}<|assistant|>
             # Response (trained):
             #   <|think|>{reasoning}<|/think|>
             #   <|answer|>{answer}<|/answer|><|end_of_text|>
-            prompt_text = f"{self.user_tag}{question}{self.assistant_tag}"
+            # Optional <|system|> turn: persona sampled per-example from the
+            # reasoning-on/off pool chosen by this dataset's reasoning_mode.
+            # It joins the MASKED prefix, so the model learns to FOLLOW the
+            # system prompt but is never trained to echo it.
+            system_prefix = ""
+            if self.system_tag is not None:
+                mode = self.dataset_configs[idx].get("reasoning_mode", "on")
+                _, persona = sample_system_prompt(rng, mode)
+                system_prefix = f"{self.system_tag}{persona}"
+            prompt_text = (
+                f"{system_prefix}{self.user_tag}{question}{self.assistant_tag}"
+            )
             response_text = (
                 f"{self.think_open}{reasoning}{self.think_close}"
                 f"{self.answer_open}{answer}{self.answer_close}"
@@ -575,6 +628,12 @@ class SFTStream(IterableDataset):
 
             prompt_ids = self.tok.encode(prompt_text, add_special_tokens=False)
             response_ids = self.tok.encode(response_text, add_special_tokens=False)
+
+            # "Not too short": skip examples whose trained response is below the
+            # floor (response_ids includes the format tags + eos, so the floor
+            # is on the full response block).
+            if len(response_ids) < self.min_response_tokens:
+                continue
 
             ex_ids = prompt_ids + response_ids
             ex_labels = [IGNORE_INDEX] * len(prompt_ids) + response_ids
@@ -618,6 +677,8 @@ def make_sft_loader(
     think_close: str = "<|/think|>",
     answer_open: str = "<|answer|>",
     answer_close: str = "<|/answer|>",
+    system_tag: str | None = None,
+    min_response_tokens: int = 0,
 ) -> DataLoader[tuple[Tensor, Tensor]]:
     """Build a streaming DataLoader for SFT.
 
@@ -645,6 +706,8 @@ def make_sft_loader(
         think_close=think_close,
         answer_open=answer_open,
         answer_close=answer_close,
+        system_tag=system_tag,
+        min_response_tokens=min_response_tokens,
     )
     # Single-threaded loader. We tried num_workers=4 + persistent_workers
     # + prefetch_factor=4 for SFT-ultralong launch on 2026-05-08 — workers

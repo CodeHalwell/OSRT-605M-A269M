@@ -1327,6 +1327,104 @@ class SFTConfig:
     ]
 
 
+class SFTv1Config(SFTConfig):
+    """v6 SFT v1 — system-prompt instruction tuning on the midtrain base.
+
+    Roadmap Stage 1: make the mid-trained base FOLLOW a <|system|> prompt and
+    emit the <|think|>/<|answer|> format. Each example is prefixed with a
+    <|system|>{persona} turn (set system_tag), the persona sampled per-example
+    from the reasoning-on/off pool chosen by each dataset's reasoning_mode —
+    so "follow the system prompt" is literally true in both directions AND the
+    reasoning-on/off toggle (the project's north-star metric) is built in.
+    See docs/superpowers/specs/2026-06-11-sft-v1-design.md.
+
+    NOT the long-reasoning stage. Moderate length (200-800 tok), seq 2048,
+    HRA trainable, on the fully-annealed midtrain_final base.
+    """
+
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain_final.pt"
+    stage_prefix: str = "sft_v1"
+    seq_len: int = 2048
+    total_steps: int = 2_000          # batch8 x accum8 x 2048 = 131K tok/step ≈ 260M tok
+    # peak_lr 1.5e-5 → min 1.5e-6, warmup 250, AdamW — inherited from SFTConfig.
+    eval_interval: int = 500
+    ckpt_interval: int = 500
+
+    # System turn + length floor (consumed by SFTStream/make_sft_loader).
+    system_tag: str = "<|system|>"
+    min_response_tokens: int = 150    # "not too short"
+
+    # HRA stays trainable but is NATIVE (built from config, already in the
+    # midtrain ckpt) — set hra_native so run_sft skips inject_hra (the v5
+    # HRALinear graft would break the load). With hra_native, hra_params is
+    # empty → run_sft trains ALL params (incl. native HRA) at the single SFT
+    # LR (no differential-LR split needed).
+    hra_native: bool = True
+
+    wandb_run_name: str = "osrt-v6-sft-v1"
+    wandb_run_id: str = ""
+
+    # Data mix (§5 of the spec). reasoning_mode selects the persona pool:
+    # 'on'  → math (real CoT), 'off' → general/chat/code (answer-direct).
+    datasets: list = [  # noqa: RUF012
+        {
+            "name": "tulu3-sft",
+            "hf_id": "allenai/tulu-3-sft-mixture",
+            "split": "train",
+            "weight": 0.30,
+            "format": "tulu",
+            "reasoning_mode": "off",
+        },
+        {
+            "name": "openhermes",
+            "hf_id": "teknium/OpenHermes-2.5",
+            "split": "train",
+            "weight": 0.25,
+            "format": "openhermes",
+            "reasoning_mode": "off",
+        },
+        {
+            "name": "gsm8k",
+            "hf_id": "openai/gsm8k",
+            "hf_config": "main",
+            "split": "train",
+            "weight": 0.20,
+            "format": "gsm8k",
+            "reasoning_mode": "on",
+        },
+        {
+            "name": "numina_math",
+            "hf_id": "AI-MO/NuminaMath-CoT",
+            "split": "train",
+            "weight": 0.15,
+            "format": "numina_math",
+            "reasoning_mode": "on",
+        },
+        {
+            "name": "evol_code",
+            "hf_id": "nickrosh/Evol-Instruct-Code-80k-v1",
+            "split": "train",
+            "weight": 0.10,
+            "format": "evol_code",
+            "reasoning_mode": "off",
+        },
+    ]
+
+
+class SFTv1SanityConfig(SFTv1Config):
+    """30-step SFT-v1 probe: verifies the <|system|> turn builds, native-HRA
+    loads clean, masking is right, and VRAM fits — before the paid run.
+    Writes no final, distinct prefix, skips the (slow) reasoning eval."""
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    ckpt_interval: int = 9_999_999
+    eval_interval: int = 9_999_999     # skip the generation eval in the probe
+    save_final_checkpoint: bool = False
+    stage_prefix: str = "sft_v1-sanity"
+    wandb_run_name: str = "osrt-v6-sft-v1-sanity"
+
+
 class SFTLongConfig(SFTConfig):
     """Long-context SFT — resumes from the seq-2048 SFT checkpoint and
     fine-tunes at seq_len 4096 with a Nemotron-heavy data mix.

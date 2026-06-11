@@ -60,9 +60,17 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
     print(f"HRA enabled         : {sft_cfg.hra_enabled}")
     print()
 
-    # HRA injection (before or after load depending on config)
+    # HRA injection (before or after load depending on config).
+    # hra_native=True: the checkpoint already carries native adapters_a/b
+    # (built inline from config — v6 midtrain/foundation). Injecting HRALinear
+    # would graft a mismatched layout and break load_model_state_or_raise. Skip
+    # injection entirely; the native HRA is already present and trainable.
+    # Same gate as run_pretrain_extend. (v5 SFT path: hra_native unset → False
+    # → inject as before.)
+    hra_native = getattr(sft_cfg, "hra_native", False)
     hra_params = []
-    if sft_cfg.hra_enabled and getattr(sft_cfg, "hra_before_load", False):
+    if (sft_cfg.hra_enabled and not hra_native
+            and getattr(sft_cfg, "hra_before_load", False)):
         from osrt.hra import inject_hra
         print(f"Injecting HRA before load (rank={sft_cfg.hra_rank})...")
         hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
@@ -86,11 +94,15 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
     )
     print("  Clean load: all keys matched.")
 
-    if sft_cfg.hra_enabled and not getattr(sft_cfg, "hra_before_load", False):
+    if (sft_cfg.hra_enabled and not hra_native
+            and not getattr(sft_cfg, "hra_before_load", False)):
         from osrt.hra import inject_hra
         print(f"Injecting HRA after load (rank={sft_cfg.hra_rank})...")
         hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
                                 freeze_pretrained=sft_cfg.hra_freeze_pretrained)
+    elif hra_native:
+        print("HRA is native (built from config) — skipping inject_hra; "
+              "checkpoint already carries adapters_a/adapters_b.")
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters    : {total_params:>12,}")
@@ -207,6 +219,8 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
         think_close=sft_cfg.think_close,
         answer_open=sft_cfg.answer_open,
         answer_close=sft_cfg.answer_close,
+        system_tag=getattr(sft_cfg, "system_tag", None),
+        min_response_tokens=getattr(sft_cfg, "min_response_tokens", 0),
     )
     loader_iter = iter(loader)
     print(f"DataLoader ready in {time.time() - load_t:.1f}s")
@@ -373,6 +387,28 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
             vol.commit()
             print(f"  -> Checkpoint saved: {path}")
 
+        # --- Reasoning-on/off GSM8K eval (the north-star metric) ---
+        # Gated on eval_interval; no-op for v5 SFT configs that don't set it.
+        sft_eval_interval = getattr(sft_cfg, "eval_interval", 0)
+        if sft_eval_interval and step > 0 and step % sft_eval_interval == 0:
+            from osrt.sft_eval import run_reasoning_eval
+            ev = run_reasoning_eval(
+                model, tokenizer, device,
+                n_problems=getattr(sft_cfg, "eval_n_problems", 50),
+                max_new_tokens=getattr(sft_cfg, "eval_max_new_tokens", 512),
+            )
+            print(
+                f"  SFT-EVAL step {step} | acc_on {ev['sft_eval/acc_on']:.3f} "
+                f"acc_off {ev['sft_eval/acc_off']:.3f} "
+                f"(Δ {ev['sft_eval/acc_delta_on_minus_off']:+.3f}) | "
+                f"len on/off {ev['sft_eval/resp_len_on']:.0f}/"
+                f"{ev['sft_eval/resp_len_off']:.0f} | "
+                f"fmt_ok {ev['sft_eval/format_ok_on']:.2f}",
+                flush=True,
+            )
+            if use_wandb:
+                wandb.log(ev, step=step)
+
         # --- 23h safety ---
         # Include step number in rescue filename so the resume scanner
         # can rank it alongside numbered checkpoints. Without this the
@@ -401,16 +437,19 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
         step += 1
 
     # --- Final ---
-    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    final_path = f"{ckpt_dir}/osrt_v5_{prefix}_final.pt"
-    torch.save({
-        "model_state_dict": inner.state_dict(),
-        "training_stage": prefix,
-        "total_steps": sft_cfg.total_steps,
-    }, final_path)
-    vol.commit()
     elapsed_total = time.time() - start_time
     print(f"\n{prefix.upper()} complete. {step:,} steps in {elapsed_total / 3600:.1f}h")
-    print(f"Final model: {final_path}")
+    if getattr(sft_cfg, "save_final_checkpoint", True):
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+        final_path = f"{ckpt_dir}/osrt_v5_{prefix}_final.pt"
+        torch.save({
+            "model_state_dict": inner.state_dict(),
+            "training_stage": prefix,
+            "total_steps": sft_cfg.total_steps,
+        }, final_path)
+        vol.commit()
+        print(f"Final model: {final_path}")
+    else:
+        print("Final checkpoint save skipped (save_final_checkpoint=False).")
     if use_wandb:
         wandb.finish()
