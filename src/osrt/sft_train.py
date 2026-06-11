@@ -356,12 +356,51 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
                 moe_metrics["moe/clean_assignment_entropy_mean"] = _mean(assign_ents)
                 moe_metrics["moe/drop_rate_mean"] = _mean(drop_rates)
                 moe_metrics["moe/moe_gate_mean"] = _mean(moe_gates)
+                # dead experts: an expert with ~0 routed fraction across ALL
+                # loops in a block. last_clean_expert_fraction is
+                # [recursive_loops][num_routed]; sum per expert over loops, count
+                # those that never get routed. Parity with pretrain telemetry.
+                dead = 0
+                for blk in base.blocks:
+                    frac = getattr(blk.moe, "last_clean_expert_fraction", None)
+                    if not frac:
+                        continue
+                    n_exp = len(frac[0])
+                    per_expert = [sum(loop[e] for loop in frac) for e in range(n_exp)]
+                    dead += sum(1 for tot in per_expert if tot <= 1e-8)
+                moe_metrics["moe/dead_experts_total"] = dead
+                # per-block moe_gate in the printed line (b0/b1/b2 asymmetry is
+                # a thing we watch).
+                gate_str = " ".join(f"b{i}={g:.2f}" for i, g in enumerate(moe_gates))
                 print(
                     f"           moe: pte={_mean(prob_ents):.3f} "
                     f"assn={_mean(assign_ents):.3f} "
-                    f"drop={_mean(drop_rates):.4f} "
-                    f"gate={_mean(moe_gates):.3f}"
+                    f"drop={_mean(drop_rates):.4f} dead={dead} "
+                    f"gate[{gate_str}]"
                 )
+
+                # --- Loop / recursion collapse telemetry ---
+                # The model populates last_loop_update_norm / _hidden_norm every
+                # forward (model.py), regardless of which training loop drives
+                # it. Same signal the pretrain/midtrain loops print: |Δx|/|x|
+                # per effective layer (a deep loop → 0 = collapsed to no-op).
+                loop_upd = list(getattr(base, "last_loop_update_norm", []) or [])
+                loop_hid = list(getattr(base, "last_loop_hidden_norm", []) or [])
+                if loop_upd:
+                    for i, v in enumerate(loop_upd):
+                        moe_metrics[f"loop/update_norm_l{i}"] = v
+                    for i, v in enumerate(loop_hid):
+                        moe_metrics[f"loop/hidden_norm_l{i}"] = v
+                    moe_metrics["loop/update_norm_mean"] = _mean(loop_upd)
+                    moe_metrics["loop/update_norm_min"] = min(loop_upd)
+                    moe_metrics["loop/update_norm_last"] = loop_upd[-1]
+                    upd_str = " ".join(
+                        f"L{i}={v:.2f}" for i, v in enumerate(loop_upd))
+                    print(f"           loop |dx|/|x|: {upd_str}")
+                    print(
+                        f"           collapse: upd min={min(loop_upd):.3f} "
+                        f"last={loop_upd[-1]:.3f} mean={_mean(loop_upd):.3f}"
+                    )
             except AttributeError:
                 pass
 
