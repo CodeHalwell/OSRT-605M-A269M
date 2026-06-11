@@ -211,3 +211,109 @@ Use these only if the gate or eval trend says they are needed.
   zero-yield stream holds max deficit and keeps getting picked. Only bites
   on a sustained outage (not this transient). Worth fixing if it ever
   recurs: skip/deprioritise a stream that returns None too many times.
+
+================================================================================
+PAPER-READY SUMMARY — v6 Mid-training stage (2026-06-09 → 06-11)
+================================================================================
+Use this section for the write-up. Numbers are from the production run
+(W&B run osrt-v6-midtrain) and the post-hoc local checkpoint probe.
+
+## Stage definition
+Continued pre-training ("mid-training") of the OSRT-605M v6 foundation model
+(601,444,393 physical params; ~278M active/token; 3 physical blocks × 6
+recursive loops = 18 effective layers; GQA-24/8 + KDV latent KV cache; MLA-lite;
+1 shared + 8 routed experts top-2; mHC 4-stream residual; rank-256 native HRA).
+- Resume: from the annealed foundation checkpoint (osrt_v5_final.pt, step 3500).
+- Objective: inject math/STEM/reasoning capability + double context 2048→4096.
+- Data mix (token-weighted, "knowledge phase"): Nemotron-CC-Math-v1 4plus 0.25,
+  Nemotron-Specialized STEM-SFT 0.15, Math-Textbooks 0.15, InfiniByte-Reasoning
+  0.10, FineWeb-Edu 0.15 (general anchor), Nemotron-Code-v2 Synthetic-QA 0.10,
+  Cosmopedia openstax 0.10. → ~65% math/STEM/reasoning, 10% code, 25% general.
+- Optimiser: Muon (149 matrix tensors, lr 6.6e-3→6.6e-4) + AdamW (72 tensors,
+  lr 2e-4→2e-5), hybrid. Fresh re-warm cosine, 150-step warmup, peak 2e-4
+  (~33% of foundation's 6e-4), annealed toward 2e-5. HRA native + trainable.
+- Compute: seq 4096, micro-batch 6 × grad-accum 11 = effective batch 66
+  (270,336 tokens/step). bf16, gradient checkpointing ON (required — see below),
+  torch.compile, single H100 (Modal). ~29.2s/step steady-state, ~9.3-9.7k tok/s.
+
+## Result — held-out eval (FineWeb-Edu held-out slice, seq 4096)
+  step      eval loss     ppl
+  ----      ---------     ---
+  base*       3.7605      43.0   (*foundation final, measured at seq 2048)
+  500         3.7845      44.0
+  1000        3.7367      42.0
+  1500        3.6600      38.9
+  2000        3.6154      37.2
+  3500        3.4754      32.3
+  (3978)      —           —      (final checkpoint; eval cadence was every 500)
+Monotonic decline, accelerating through the LR cooldown. loss 3.76→3.48,
+ppl 43→32.3 (−25%) over 3500 effective mid-training steps (~0.94B tokens at
+270k tok/step). Training task-loss fell ~2.23 → ~1.5.
+NOTE on comparability: the base 3.76 was measured at seq 2048; the mid-training
+evals are at the harder seq 4096. The model beats the base baseline despite the
+longer-context (harder) eval — so the true improvement is conservative here.
+
+## MoE / recursion health (held throughout)
+- dead experts: 0 of 8×18 layers, every logged step. drop rate: 0 (dropless).
+- per-token routing entropy ~1.78 ≪ marginal ln(8)=2.077 → genuine
+  specialisation, no collapse. Aux-loss-free balance-bias |max| settled ~0.013
+  (below the foundation's settled 0.028).
+- Recursive loop |Δx|/|x|: bounded; entry loop L0 rose 8→~14 then plateaued;
+  terminal loop L17 kept contributing (~0.4-0.8) — no loop collapse to no-op.
+
+## Final checkpoint validation (local, CPU/MPS, no Modal)
+osrt_v5_midtrain_rescue_step_3978.pt: clean state_dict load (native HRA, all
+keys matched). Held-out per-domain perplexity on hand-written snippets
+(coherence probe, not the eval set): code 3.88, STEM 9.32, math 13.96,
+general 15.80 (mean 10.74). Domain ordering tracks the math/code-heavy mix.
+Generation is fluent and on-distribution but NOT instruction-following (greedy
+locks onto high-frequency web/textbook templates; temp-0.7 sampling diversifies
+the template but still does not answer prompts) — the expected profile of a
+pre-SFT base model. Scripts: scripts/smoke_midtrain_ckpt.py,
+scripts/smoke_midtrain_probe.py.
+
+## Engineering notes worth a methods/limitations mention
+- The v6 model uses NATIVE inline HRA (adapters built from config), distinct
+  from the v5 inject_hra(HRALinear) path; the mid-training loop was generalised
+  with an hra_native flag to load the native layout cleanly.
+- gradient checkpointing is REQUIRED at seq 4096: an un-checkpointed batch-6
+  step OOMs at 84.97/79.18 GB on an 80GB H100; with checkpointing it fits at
+  ~58-61 GB. Activations for all 18 effective (weight-shared) loops must be
+  retained un-checkpointed — recursion makes the activation term ~6× a single
+  block, which is why checkpointing is non-optional despite the small param
+  count.
+- Streaming-data fragility was the dominant operational failure mode: the small
+  gated Nemotron Specialized-v1 / Code-v2 configs caused (i) a nested-shuffle
+  RecursionError, (ii) a first-batch dataloader stall (fixed by 1 worker), and
+  (iii) repeated cold-start HF-Hub connection storms on Modal relaunch.
+  Recommended fix for reproducibility: snapshot small/gated configs to a volume
+  and read locally rather than live-streaming.
+- The run was stopped at step ~3978/5500 on budget exhaustion (not a training
+  failure); the schedule had already been re-sized 8000→5500→(stopped) for
+  budget, and the cosine was ~73% annealed (LR ~5.5e-5) at the stopping point.
+
+## UPDATE 2026-06-11 — mid-training COMPLETED on Lightning AI (clean finish)
+The Modal run was budget-stopped at step 3978 (mid-anneal). Finished on a
+Lightning AI H100 ($3.50/hr) by resuming from osrt_v5_midtrain_rescue_step_3978
+with total_steps re-targeted to 4500 so the cosine anneals to min_lr (2e-5)
+EXACTLY at the stop — a properly cooled base. Modal-free via
+scripts/lightning_midtrain.py (a _LocalVol stub no-ops vol.commit(); native-HRA
+load; live-streamed the data — Lightning's network handled the gated Nemotron
+streams cleanly, first batch in 75s vs 443-518s on Modal, NO snapshot needed).
+One mid-run crash at the step-4000 eval boundary (transient HF 502 on a
+fineweb-edu shard collided with DataLoader-worker teardown -> PyGILState fatal);
+harmless — the eval+ckpt saved BEFORE the crash, relaunch resumed from step_4000
+and ran clean to 4500.
+
+FINAL eval staircase (seq-4096 held-out), ppl:
+  base(seq2048) 43.0 -> 1000:42.0 -> 1500:38.9 -> 2000:37.2 -> 3500:32.3 ->
+  4000:30.8 -> (4500 = final ckpt; eval cadence is every 500 so 4500 ppl not
+  logged, but task-loss bottomed at 1.3546 and LR annealed to 2.01e-5).
+loss 3.76 -> ~3.43, ppl 43 -> ~30 (-28%+) over 4500 effective mid-train steps.
+The 522-step finish ran 4.3h on Lightning.
+
+DELIVERABLE: checkpoints/v5/osrt_v5_midtrain_final.pt — the definitive, fully-
+annealed v6 mid-training base. THIS is the checkpoint for SFT (supersedes the
+step_3978 rescue ckpt the smoke-test validated; same model, properly cooled).
+Lives on the Lightning box at /teamspace/studios/this_studio/OSRT-605M-A269M/
+checkpoints/v5/. BACK IT UP OFF THE BOX — Lightning studios are ephemeral.
