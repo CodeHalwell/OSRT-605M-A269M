@@ -343,3 +343,36 @@ France" -> an electron-transport-chain article) — that's an instruction-follow
 gap SFT fixes, NOT a perplexity gap more pretraining touches. midtrain_final is
 already annealed to min LR (a finished ckpt); any further training should
 re-warm into SFT, not more mid-training. Mid-training well is tapped; SFT next.
+
+## SFT-v1 DATA DECISION (2026-06-11, probe-backed — scripts/probe_sft_datasets.py)
+Response-length is THE selection criterion for a 601M/278M-active student
+(long-CoT teaches surface-form mimicry, not capability). Probed candidates
+(median / p90 response tokens, chars/4 estimate, n=300 streamed):
+
+  dataset                          median   p90    601M fit
+  databricks-dolly-15k              ~46    ~257    SHORT  ✅ ideal (human-written)
+  allenai/tulu-3-sft-mixture       ~269    ~725    SHORT  ✅ decontaminated, documented
+  teknium/OpenHermes-2.5           ~231    ~792    SHORT  ✅ already in v5 pipeline
+  HuggingFaceTB/smoltalk [all]     ~585   ~2098    MEDIUM ⚠️ (numina-cot folded in → long)
+  nvidia/Nemotron-IF-Chat-v1 chat_if ~1706 ~7737   LONG   ✗ too long even for "chat"
+
+SURPRISE: smoltalk (expected to be the short SmolLM-scale winner) is the
+LONGEST of the general sets because config 'all' includes numina-cot-100k
+reasoning traces. Tülu-3 + OpenHermes are the better length fit for general chat.
+
+CHOSEN HYBRID for SFT v1 (on osrt_v5_midtrain_final.pt):
+  1. dolly-15k     — pipeline smoke-test + clean short-answer anchor
+  2. tulu-3-sft    — documented/decontaminated general-instruction core
+  3. OpenHermes-2.5 — general chat (format path already in train_config.py)
+  4. + cascade-generated short math/STEM (collect_distill_cascade.py, length-
+     capped at gen time) — targeted capability in the mid-train-strengthened
+     domains, generated SHORT rather than filtered from long.
+SKIP for v1: smoltalk-all (CoT-heavy), OpenThoughts3/OpenR1-Math (long reasoning
+— post-SFT/RL material), Nemotron flagship SFT blends (built for 30B+).
+RL LATER (GRPO infra fits): allenai/RLVR-GSM-MATH-IF, agentica/DeepScaleR,
+PRIME-RL/Eurus-2 (verifiable rewards); HelpSteer3 / ultrafeedback (DPO/RM).
+Reformatters needed: instruction/context/response (dolly), messages (tulu3),
+conversations/ShareGPT (openhermes) → osrt <|user|>/<|assistant|>/<|think|>/
+<|answer|> template (patterns exist in sft_data.py).
+NOTE: nvidia repos use custom split names (chat_if/structured_outputs, MCQ/RQA),
+not 'train' — always probe splits first.

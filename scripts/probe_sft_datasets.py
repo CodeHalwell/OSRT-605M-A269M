@@ -31,13 +31,12 @@ if _env.exists():
 # (key, repo, config-or-None, split) — the top-2 SFT candidates for a 601M
 # instruction-following + general-chat SFT v1.
 CANDIDATES = [
-    # corrected splits from the first probe run:
-    ("if-chat_if", "nvidia/Nemotron-Instruction-Following-Chat-v1", None, "chat_if"),
-    ("if-structured", "nvidia/Nemotron-Instruction-Following-Chat-v1", None, "structured_outputs"),
-    # HelpSteer3 is PREFERENCE data (context/response1/response2/preference) —
-    # a DPO/RM source, NOT SFT. Probed once; excluded from SFT-v1 here.
-    # A real SFT source to compare instead — short instruction/response:
-    ("science", "nvidia/Nemotron-Science-v1", None, "train"),
+    # Scale-appropriate SFT candidates (built for sub-2B models or human-written).
+    # The length probe decides fit for our 601M / 278M-active student.
+    ("smoltalk", "HuggingFaceTB/smoltalk", "all", "train"),
+    ("dolly-15k", "databricks/databricks-dolly-15k", None, "train"),
+    ("tulu3-sft", "allenai/tulu-3-sft-mixture", None, "train"),
+    ("openhermes2.5", "teknium/OpenHermes-2.5", None, "train"),
 ]
 
 # likely response/output field names to look for, in priority order
