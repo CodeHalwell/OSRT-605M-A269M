@@ -376,3 +376,42 @@ conversations/ShareGPT (openhermes) → osrt <|user|>/<|assistant|>/<|think|>/
 <|answer|> template (patterns exist in sft_data.py).
 NOTE: nvidia repos use custom split names (chat_if/structured_outputs, MCQ/RQA),
 not 'train' — always probe splits first.
+
+## PROJECT NORTH STAR (set 2026-06-11): coherent long reasoning that lifts accuracy
+TARGET: a 601M/278M-active model that generates LONG chain-of-thought (aim
+~8000 tok ceiling; validate at 2000-4000 first) where the reasoning MEASURABLY
+IMPROVES ANSWER ACCURACY — not decorative length.
+
+SUCCESS METRIC (falsifiable, the steering signal for every stage below):
+  On a verifiable benchmark (GSM8K / MATH-500), accuracy with reasoning ENABLED
+  must beat accuracy with reasoning DISABLED (same model, same prompts — the
+  reasoning:on vs off A/B). The CoT has to earn its tokens. If on<=off, the long
+  generation is performative and the goal is NOT met. Win condition is the
+  Δaccuracy(on - off), NOT the token count.
+
+FEASIBILITY (honest): length 8000 is reachable (context training + don't stop
+early). COHERENT+CORRECT reasoning over that length at 601M is AMBITIOUS — at/
+beyond the edge of the size class; small models drift/loop/contradict over long
+horizons. The recursive-MoE arch (depth-recurrence ≈ iterative refinement) is a
+defensible reason to think it MIGHT work here better than a vanilla 601M dense —
+but it's the central HYPOTHESIS being tested, not an assumed outcome. Frame it
+that way in the paper.
+
+ROADMAP (reordered around the goal; RL is the load-bearing stage):
+  0. [DONE] midtrain_final — math/STEM base, ppl ~30, seq 4096, fully annealed.
+  1. SHORT SFT (instruction-following + format) — model can't follow ANY prompt
+     yet. Data: dolly + tulu3 + openhermes (short) + cascade-gen short. Teaches
+     the <|user|>/<|assistant|>/<|think|>/<|answer|> structure + basic following.
+     NOT the long-reasoning stage — just makes it controllable.
+  2. SEQ-8192 EXTENSION — continued-pretrain at 8192 (the speced 'instruction'
+     phase; arch already built for it — sink dropped, flash fits ~36GB). Gives
+     the context window. Compute/$ cost, not a research risk.
+  3. REASONING-CoT SFT — teach long-CoT FORMAT with moderate-length traces
+     (OpenThoughts3 / OpenR1-Math — the long sets, which come BACK here vs the
+     short-SFT v1). Surface form of reasoning.
+  4. GRPO-VERIFIABLE (the payoff stage) — RL with rule-based rewards on
+     checkable math/code (RLVR-GSM-MATH, DeepScaleR, Eurus-2). This is what
+     makes reasoning CORRECT (instrumental) not decorative. Existing GRPO infra
+     (grpo_multi/grpo_v2) + the arch's recursion thesis get tested on exactly
+     what they were designed for. THE accuracy-lift is won or lost here.
+  Validate the reasoning-on>off metric at the END of 3 (baseline) and 4 (target).
