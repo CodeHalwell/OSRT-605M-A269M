@@ -1345,7 +1345,14 @@ class SFTv1Config(SFTConfig):
     pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain_final.pt"
     stage_prefix: str = "sft_v1"
     seq_len: int = 2048
-    total_steps: int = 2_000          # batch8 x accum8 x 2048 = 131K tok/step ≈ 260M tok
+    # The v6 model (601M, mHC, MTP, 8 experts) OOMs at batch8/seq2048
+    # un-checkpointed (the SFTConfig defaults were sized for the v5 363M).
+    # Enable gradient checkpointing (run_sft sets _osrt_grad_ckpt) AND split
+    # the effective-64 batch as 4x16 so the per-step activation peak is halved.
+    gradient_checkpointing: bool = True
+    batch_size: int = 4
+    grad_accum_steps: int = 16        # eff batch 64 (unchanged), lower peak mem
+    total_steps: int = 2_000          # 4 x 16 x 2048 = 131K tok/step ≈ 260M tok
     # peak_lr 1.5e-5 → min 1.5e-6, warmup 250, AdamW — inherited from SFTConfig.
     eval_interval: int = 500
     ckpt_interval: int = 500

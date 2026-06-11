@@ -107,6 +107,15 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters    : {total_params:>12,}")
 
+    # Gradient checkpointing: the v6 model (601M, mHC 4-stream, MTP, 8 experts)
+    # OOMs at batch8/seq2048 un-checkpointed — the v5 SFT loop was sized for the
+    # 363M model. Drive OUR real gate (_osrt_grad_ckpt, model.py use_ckpt); HF's
+    # `gradient_checkpointing` name is deliberately unwired. Set BEFORE compile.
+    gc_on = bool(getattr(sft_cfg, "gradient_checkpointing", False))
+    model.model._osrt_grad_ckpt = gc_on
+    print(f"Gradient checkpointing: {'ENABLED' if gc_on else 'disabled'} "
+          f"(_osrt_grad_ckpt={model.model._osrt_grad_ckpt})")
+
     print("\nCompiling model...")
     compile_t = time.time()
     model = torch.compile(model)

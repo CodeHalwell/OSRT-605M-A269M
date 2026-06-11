@@ -195,6 +195,10 @@ def test_sftv1_config_values():
     assert c.min_response_tokens == 150
     assert c.hra_native is True
     assert c.hra_enabled is True
+    # gradient checkpointing required at seq2048 for the v6 601M model
+    # (un-checkpointed batch8 OOM'd on the sanity gate); eff batch stays 64.
+    assert c.gradient_checkpointing is True
+    assert c.batch_size * c.grad_accum_steps == 64
     ds = c.datasets
     assert abs(sum(d["weight"] for d in ds) - 1.0) < 1e-9
     # every dataset has a registered format + a valid reasoning_mode
