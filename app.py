@@ -1999,6 +1999,97 @@ def sft():
 
 
 # =============================================================================
+# SFT v1 — v6 system-prompt instruction tuning (on midtrain_final)
+# =============================================================================
+# Builds from the OSRT_605M_A288M preset (NOT bare OSRTConfig, which falls back
+# to the v5 363M shape) + the v6 tokenizer + fused-CE. Native HRA (hra_native)
+# so run_sft skips inject_hra. See SFTv1Config and the SFT-v1 design spec.
+
+
+def _run_sft_v1(cfg_cls):
+    """Shared body for sft_v1 + sft_v1_sanity (differ only by config)."""
+    from transformers import AutoTokenizer
+
+    from osrt.presets import build_config
+    from osrt.sft_train import run_sft
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    print(f"Tokenizer loaded: vocab_size={len(tok)}")
+    model_config = build_config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
+    )
+    cfg = cfg_cls()
+    print(
+        f"{cfg.__class__.__name__}: {cfg.total_steps} steps @ seq {cfg.seq_len}, "
+        f"system_tag={cfg.system_tag}, hra_native={cfg.hra_native}, "
+        f"base={cfg.pretrained_checkpoint}"
+    )
+    run_sft(model_config, cfg, vol, tok)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v1():
+    """v6 SFT v1: system-prompt instruction tuning on midtrain_final.
+    seq 2048, reasoning-conditioned <|system|> turns, ~2000 steps."""
+    from osrt.train_config import SFTv1Config
+    _run_sft_v1(SFTv1Config)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v1_sanity():
+    """30-step SFT-v1 gate: native-HRA load + <|system|> build + VRAM, no eval."""
+    from osrt.train_config import SFTv1SanityConfig
+    _run_sft_v1(SFTv1SanityConfig)
+
+
+@app.local_entrypoint()
+def run_sft_v1():
+    """Spawn v6 SFT v1 (fire-and-forget)."""
+    call = sft_v1.spawn()
+    print(f"Spawned v6 sft_v1 — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_sft_v1_sanity():
+    """Spawn the 30-step SFT-v1 sanity gate."""
+    call = sft_v1_sanity.spawn()
+    print(f"Spawned v6 sft_v1 sanity — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+# =============================================================================
 # SFT-LONG (long-context follow-up SFT, seq_len 4096, Nemotron-heavy mix)
 # =============================================================================
 
