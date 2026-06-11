@@ -316,4 +316,30 @@ DELIVERABLE: checkpoints/v5/osrt_v5_midtrain_final.pt — the definitive, fully-
 annealed v6 mid-training base. THIS is the checkpoint for SFT (supersedes the
 step_3978 rescue ckpt the smoke-test validated; same model, properly cooled).
 Lives on the Lightning box at /teamspace/studios/this_studio/OSRT-605M-A269M/
-checkpoints/v5/. BACK IT UP OFF THE BOX — Lightning studios are ephemeral.
+checkpoints/v5/ AND backed up locally on the Mac (verified: 5.22GB, step 4500,
+602M params, native HRA present, loads clean).
+
+## Checkpoint probe comparison (local, MPS, scripts/smoke_midtrain_probe.py)
+Per-domain held-out perplexity on 4 hand-written snippets (COHERENCE probe, not
+the official eval set — the trustworthy signal is the MEAN and the math drop;
+individual stem/code wobble is within noise on ~30-token samples):
+
+  domain     step_3978    step_4500(final)   Δ
+  math         13.96        12.02           -1.94
+  stem          9.32        11.06           +1.74  (noise)
+  code          3.88         3.95           +0.07  (noise)
+  general      15.80        14.99           -0.81
+  MEAN         10.74        10.50           -0.24
+
+Net: the final 522 annealed steps gave a small but real mean-ppl gain (-0.24),
+math improving most — consistent with the official eval (ppl 30.8 @ step 4000,
+still falling) and the cosine consolidating the math-heavy mix during cooldown.
+
+DECISION — do NOT extend to 5500. The -0.24 above came from the STEEPEST part of
+the anneal; 4500→5500 would be 1000 more steps at LR floored ~2e-5 (flatter
+cooling, even less/step) for ~$30 + another session. More importantly, sampling
+on BOTH checkpoints shows the model still does NOT follow prompts ("capital of
+France" -> an electron-transport-chain article) — that's an instruction-following
+gap SFT fixes, NOT a perplexity gap more pretraining touches. midtrain_final is
+already annealed to min LR (a finished ckpt); any further training should
+re-warm into SFT, not more mid-training. Mid-training well is tapped; SFT next.

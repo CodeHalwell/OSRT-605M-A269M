@@ -24,7 +24,8 @@ from osrt.presets import build_config
 from osrt.model import OSRTForCausalLM
 from osrt.train import load_model_state_or_raise
 
-CKPT = "checkpoints/v5/osrt_v5_midtrain_rescue_step_3978.pt"
+CKPT = os.environ.get("PROBE_CKPT",
+                      "checkpoints/v5/osrt_v5_midtrain_final.pt")
 TOK = "v6_tokenizer_export"
 
 # (a) Held-out snippets — coherent natural text the model should assign
