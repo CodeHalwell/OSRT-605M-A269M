@@ -68,9 +68,42 @@ def _gen_one(model, tok, system_text: str, question: str, device,
     return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=False)
 
 
+@torch.no_grad()
+def _gen_batch(model, tok, prompts: list[str], device, max_new_tokens: int,
+               repetition_penalty: float = 1.0) -> list[str]:
+    """Left-pad a list of prompt strings into ONE batch and decode each
+    completion. Batched greedy is token-identical to per-prompt generation
+    (see tests/test_batched_generate.py), so this is a pure speedup.
+
+    NOTE: when repetition_penalty != 1.0 the pad token id is also penalised
+    (generate() scores the whole row incl. left pad); harmless for the default
+    greedy path and negligible otherwise.
+    """
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    enc = [tok.encode(p, add_special_tokens=False) for p in prompts]
+    width = max(len(e) for e in enc)
+    ids_rows, mask_rows = [], []
+    for e in enc:
+        npad = width - len(e)
+        ids_rows.append([pad_id] * npad + e)
+        mask_rows.append([0] * npad + [1] * len(e))
+    input_ids = torch.tensor(ids_rows, dtype=torch.long, device=device)
+    attn = torch.tensor(mask_rows, dtype=torch.long, device=device)
+    out = model.generate(
+        input_ids, attention_mask=attn, max_new_tokens=max_new_tokens,
+        temperature=0.0, repetition_penalty=repetition_penalty,
+        eos_token_id=tok.eos_token_id,
+    )
+    # Every row's prompt occupies [0:width] (left-padded), so completions all
+    # start at `width`.
+    return [tok.decode(out[i, width:], skip_special_tokens=False)
+            for i in range(out.shape[0])]
+
+
 def run_reasoning_eval(
     model: nn.Module, tok, device, *,
     n_problems: int = 50, max_new_tokens: int = 512, seed: int = 0,
+    batch_size: int = 16, repetition_penalty: float = 1.0,
 ) -> dict:
     """Reasoning-on vs -off accuracy on a held-out GSM8K slice.
 
@@ -92,9 +125,18 @@ def run_reasoning_eval(
     stats = {"on": {"correct": 0, "len": 0, "fmt": 0},
              "off": {"correct": 0, "len": 0, "fmt": 0}}
 
+    # One request per (problem, side); batched left-padded generation.
+    requests = []  # (side, gold, prompt_str)
     for q, gold in problems:
         for side, sys_text in (("on", on_sys), ("off", off_sys)):
-            gen = _gen_one(model, tok, sys_text, q, device, max_new_tokens)
+            prompt = f"<|system|>{sys_text}<|user|>{q}<|assistant|>"
+            requests.append((side, gold, prompt))
+
+    for start in range(0, len(requests), batch_size):
+        chunk = requests[start:start + batch_size]
+        gens = _gen_batch(model, tok, [r[2] for r in chunk], device,
+                          max_new_tokens, repetition_penalty)
+        for (side, gold, _), gen in zip(chunk, gens):
             pred = _norm(extract_numeric_answer(gen))
             if pred is not None and pred == _norm(gold):
                 stats[side]["correct"] += 1

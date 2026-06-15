@@ -1116,6 +1116,7 @@ class RecursiveBlock(nn.Module):
         rope_sin: Tensor,
         past_key_value: Tensor | None,
         use_cache: bool,
+        key_padding_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         """Attention sub-block contribution (pre-residual): GQA + MLA latent.
 
@@ -1168,6 +1169,32 @@ class RecursiveBlock(nn.Module):
             # the manual path so we can apply the exact log-sum-exp rescale.
             attn_out = self._attention_with_sink(
                 q, k, v, S, total_len, past_len,
+            )
+        elif key_padding_mask is not None:
+            # Left-padded batch (eval): combine causal + key-padding into one
+            # additive mask. RoPE is relative, so left-padding preserves the
+            # relative positions among the real (contiguous, right-aligned)
+            # tokens — no position_ids fix is needed; we only stop queries from
+            # attending to pad KEYS. key_padding_mask is (B, total_len), 1=real.
+            neg = torch.finfo(q.dtype).min
+            qpos = torch.arange(
+                past_len, total_len, device=q.device,
+            ).view(S, 1)                                   # query abs positions
+            kpos = torch.arange(total_len, device=q.device).view(1, total_len)
+            causal = (kpos > qpos)                         # (S, total_len)
+            pad = (key_padding_mask == 0).view(B, 1, total_len)  # (B,1,total_len)
+            masked = causal.view(1, S, total_len) | pad          # (B, S, total_len)
+            # Keep each query's own position unmasked so a pad-query row is
+            # never fully masked (all -inf → NaN softmax → poisons the cached
+            # latent across the 18 effective layers). Real queries are
+            # unaffected: their diagonal is already a real key.
+            self_pos = (kpos == qpos).view(1, S, total_len)
+            masked = masked & ~self_pos
+            attn_mask = torch.zeros(
+                B, 1, S, total_len, device=q.device, dtype=q.dtype,
+            ).masked_fill(masked.view(B, 1, S, total_len), neg)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, enable_gqa=gqa,
             )
         elif past_len > 0 and S > 1:
             attn_mask = torch.full(
@@ -1274,6 +1301,7 @@ class RecursiveBlock(nn.Module):
         past_key_value: Tensor | None = None,
         use_cache: bool = False,
         token_ids: Tensor | None = None,
+        key_padding_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         """Run attention then MoE. `x` is (B, S, D) for the standard residual
         path, or (B, S, n_hc, D) when mHC is enabled.
@@ -1287,6 +1315,7 @@ class RecursiveBlock(nn.Module):
             f_attn, present_kv = self._attention(
                 x_in, adapter_a, adapter_b, adapter_scale,
                 rope_cos, rope_sin, past_key_value, use_cache,
+                key_padding_mask=key_padding_mask,
             )
             x = self.mhc_attn.update(x, b_mat, c_out, f_attn)
 
@@ -1300,6 +1329,7 @@ class RecursiveBlock(nn.Module):
         f_attn, present_kv = self._attention(
             x, adapter_a, adapter_b, adapter_scale,
             rope_cos, rope_sin, past_key_value, use_cache,
+            key_padding_mask=key_padding_mask,
         )
         x = x + f_attn
         x = x + self._moe(x, loop_idx, token_ids=token_ids)
@@ -1481,6 +1511,7 @@ class OSRTModel(OSRTPreTrainedModel):
         past_key_values: list[Tensor] | None = None,
         use_cache: bool = False,
         num_loops: int | None = None,
+        attention_mask: Tensor | None = None,
         **kwargs,
     ) -> tuple[
         Tensor, list[Tensor], Tensor, Tensor, Tensor,
@@ -1674,6 +1705,7 @@ class OSRTModel(OSRTPreTrainedModel):
                         past_key_value=layer_past,
                         use_cache=use_cache,
                         token_ids=input_ids,
+                        key_padding_mask=attention_mask,
                     )
                     if presents is not None:
                         presents.append(present_kv)
@@ -1812,6 +1844,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         past_key_values: list[Tensor | None] | None = None,
         use_cache: bool = False,
         num_loops: int | None = None,
+        attention_mask: Tensor | None = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         """Causal-LM forward.
@@ -1834,6 +1867,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,
             num_loops=num_loops,
+            attention_mask=attention_mask,
         )
 
         # Weight-tied LM head
@@ -2058,6 +2092,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         self,
         input_ids: Tensor,
         max_new_tokens: int = 512,
+        attention_mask: Tensor | None = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
         top_k: int = 0,
@@ -2115,6 +2150,19 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # loop. It is a GREEDY throughput optimization, so it only makes sense
         # at temperature 0 (or very low temp); we route to it only when asked.
         if speculative:
+            # Speculative decoding is a GREEDY throughput path; it does not
+            # implement sampling or padded-batch masking. Reject those args
+            # rather than silently ignoring them (finding #6).
+            if attention_mask is not None:
+                raise ValueError(
+                    "speculative=True does not support attention_mask "
+                    "(left-padded batches)."
+                )
+            if temperature > 0 or top_p < 1.0 or top_k > 0:
+                raise ValueError(
+                    "speculative=True is greedy-only; temperature/top_p/top_k "
+                    "are not supported."
+                )
             return self._generate_speculative(
                 input_ids,
                 max_new_tokens=max_new_tokens,
@@ -2131,7 +2179,15 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # per-layer latent tensors. Cast locally so ty/mypy line up.
         PastKV = list[Tensor | None]
         context = input_ids[:, -self.config.max_position_embeddings:]
-        out = self.forward(context, use_cache=True, num_loops=num_loops)
+        # Running key-padding mask over the full cached span. Truncated to match
+        # the (possibly truncated) prompt context, then extended by 1 (real)
+        # per decode step. None → no padding → existing fast paths, bit-identical.
+        attn = None
+        if attention_mask is not None:
+            attn = attention_mask[:, -self.config.max_position_embeddings:]
+        out = self.forward(
+            context, use_cache=True, num_loops=num_loops, attention_mask=attn,
+        )
         past_key_values = cast("PastKV | None", out.past_key_values)
 
         # Precompute stop tensor if any
@@ -2185,11 +2241,21 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                 # cache grow naturally is safe. Memory cost grows with generation
                 # length; if that becomes a constraint, the right fix
                 # is sliding-window with re-rotation, not a naive trim.
+                if attn is not None:
+                    # New token is always real → append a 1 to the mask so the
+                    # cached pad columns stay masked as the span grows.
+                    attn = torch.cat(
+                        [attn, torch.ones(
+                            batch_size, 1, dtype=attn.dtype, device=attn.device,
+                        )],
+                        dim=1,
+                    )
                 out = self.forward(
                     new_tok,
                     past_key_values=past_key_values,
                     use_cache=True,
                     num_loops=num_loops,
+                    attention_mask=attn,
                 )
                 past_key_values = cast("PastKV | None", out.past_key_values)
                 logits_tensor = cast(Tensor, out.logits)
