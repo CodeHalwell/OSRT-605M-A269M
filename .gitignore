@@ -77,3 +77,4 @@ wheels/
 .junie/
 .ruff_cache/
 .son-of-anton/v6_tokenizer_export/
+rollouts/sft_v2.jsonl
