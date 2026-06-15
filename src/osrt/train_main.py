@@ -110,7 +110,7 @@ def _build_model_config(tokenizer_path: str) -> OSRTConfig:
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}", flush=True)
 
-    expected_vocab = 32768
+    expected_vocab = 65536
     if len(tok) != expected_vocab:
         print(
             f"WARNING: expected vocab {expected_vocab} but got {len(tok)}. "
@@ -118,12 +118,14 @@ def _build_model_config(tokenizer_path: str) -> OSRTConfig:
             flush=True,
         )
 
-    return OSRTConfig(
+    from osrt.presets import build_config
+    return build_config(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
 
 

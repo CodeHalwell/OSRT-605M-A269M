@@ -285,6 +285,8 @@ def run_sft(model_config: OSRTConfig, sft_cfg, vol, tokenizer) -> None:
                     think_close=sft_cfg.think_close,
                     answer_open=sft_cfg.answer_open,
                     answer_close=sft_cfg.answer_close,
+                    system_tag=getattr(sft_cfg, "system_tag", None),
+                    min_response_tokens=getattr(sft_cfg, "min_response_tokens", 0),
                 )
                 loader_iter = iter(loader)
                 input_ids, labels = next(loader_iter)
