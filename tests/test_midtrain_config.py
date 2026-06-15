@@ -239,6 +239,41 @@ def test_sftv2_config_values():
     assert c.ckpt_interval == 300
 
 
+def test_midtrain_extend_config_values():
+    from osrt.train_config import MidtrainExtendConfig
+    c = MidtrainExtendConfig()
+    # extended continued-pretrain from the clean midtrain base
+    assert c.pretrained_checkpoint.endswith("osrt_v5_midtrain_final.pt")
+    assert c.stage_prefix == "midtrain2"
+    # fresh re-warm cosine, gentler than midtrain's 2e-4 (base more cooked)
+    assert c.peak_lr == 1e-4 and c.min_lr == 1e-5
+    assert c.lr_anchor_step == 0
+    assert c.total_steps == 4_000
+    # native HRA + checkpointing carried from MidtrainConfig
+    assert c.hra_native is True and c.gradient_checkpointing is True
+    ph = c.phases["extend"]
+    assert ph["seq_len"] == 4096
+    assert abs(sum(d["weight"] for d in ph["datasets"]) - 1.0) < 1e-9
+    # reasoning/instruction-heavy reweight: math+STEM-SFT+reasoning ≥ 0.70
+    heavy = sum(d["weight"] for d in ph["datasets"] if d["name"] in {
+        "nemotron-cc-math-4plus", "nemotron-stem",
+        "nemotron-math-textbooks", "nemotron-reasoning",
+    })
+    assert heavy >= 0.70
+    # NOT a rollout/SFT run — full-sequence streaming pretrain
+    assert getattr(c, "rollout_dataset_path", None) is None
+
+
+def test_midtrain_extend_sanity_writes_no_final():
+    from osrt.train_config import MidtrainExtendSanityConfig
+    c = MidtrainExtendSanityConfig()
+    assert c.total_steps == 30
+    assert c.save_final_checkpoint is False
+    assert c.compile_enabled is False
+    assert c.stage_prefix == "midtrain2-sanity"
+    assert c.phases["extend"]["seq_len"] == 4096
+
+
 def test_sftv2_sanity_writes_no_final():
     from osrt.train_config import SFTv2SanityConfig
     c = SFTv2SanityConfig()

@@ -1327,6 +1327,93 @@ class SFTConfig:
     ]
 
 
+class MidtrainExtendConfig(MidtrainConfig):
+    """v6 midtrain phase 2 — extended continued-pretraining to push the badly
+    undertrained base toward Chinchilla.
+
+    The base has seen ~1.7B tokens (foundation ~0.46B + midtrain ~1.22B) — only
+    ~0.3x Chinchilla-optimal for 278M active params. v1's incoherent reasoning
+    is likely undertraining-dominant, not just short-SFT-data. So before any
+    more post-training we add tokens with a fresh re-warm cosine on a
+    REASONING/INSTRUCTION-heavy mix (the modern annealing/decay phase): the
+    knowledge mix already contains SFT-style text (Nemotron STEM-SFT +
+    InfiniByte-Reasoning + math textbooks), so we just reweight toward it — no
+    loader change. Full-sequence LM (every token gets gradient, unlike masked
+    SFT) = maximal capability per dollar on an undertrained base.
+
+    Budget: ~4000 steps @ seq 4096 ≈ ~1.1B tokens ≈ ~$110 on Lightning, taking
+    the base to ~2.8B (~0.5x Chinchilla). A real lift, not "good" (that needs
+    ~$2.5K of tokens) — but the right use of a tight budget vs SFT'ing an
+    undertrained base. Resume from midtrain_final; reassess capability after.
+    """
+
+    total_steps: int = 4_000
+    warmup_steps: int = 100
+    lr_anchor_step: int = 0           # fresh re-warm cosine over the full run
+    peak_lr: float = 1e-4             # below midtrain's 2e-4 (base more cooked)
+    min_lr: float = 1e-5
+    muon_lr: float = 3.3e-3           # proportional to the AdamW peak
+    muon_min_lr: float = 3.3e-4
+
+    eval_interval: int = 500          # perplexity eval is meaningful (full-seq)
+    ckpt_interval: int = 500
+    log_interval: int = 50
+
+    # Reasoning/instruction-heavy reweight (reasoning+STEM-SFT+math = 0.75,
+    # was 0.65). Same sources/seq as midtrain — just emphasises the SFT-style
+    # Nemotron splits the user wants more of. Weights sum to 1.0.
+    phases: dict = {  # noqa: RUF012
+        "extend": {
+            "seq_len": 4096,
+            "batch_size": 6,
+            "grad_accum_steps": 11,
+            "datasets": [
+                {"name": "nemotron-cc-math-4plus",
+                 "hf_id": "nvidia/Nemotron-CC-Math-v1",
+                 "hf_config": "4plus", "weight": 0.20},
+                {"name": "nemotron-stem",
+                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                 "hf_config": "Nemotron-Pretraining-STEM-SFT", "weight": 0.20},
+                {"name": "nemotron-math-textbooks",
+                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                 "hf_config": "Nemotron-Pretraining-Math-Textbooks",
+                 "weight": 0.15},
+                {"name": "nemotron-reasoning",
+                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                 "hf_config": "Nemotron-Pretraining-InfiniByte-Reasoning",
+                 "weight": 0.20},
+                {"name": "fineweb-edu",
+                 "hf_id": "HuggingFaceFW/fineweb-edu", "weight": 0.10},
+                {"name": "nemotron-code-syn-qa",
+                 "hf_id": "nvidia/Nemotron-Pretraining-Code-v2",
+                 "hf_config": "Synthetic-Question-Answering", "weight": 0.075},
+                {"name": "cosmopedia-openstax",
+                 "hf_id": "HuggingFaceTB/cosmopedia",
+                 "hf_config": "openstax", "weight": 0.075},
+            ],
+        },
+    }
+
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain_final.pt"
+    stage_prefix: str = "midtrain2"
+    wandb_run_name: str = "osrt-v6-midtrain2"
+    wandb_run_id: str = ""
+
+
+class MidtrainExtendSanityConfig(MidtrainExtendConfig):
+    """30-step probe: native-HRA loads clean from midtrain_final, the reweighted
+    mix streams, VRAM fits at seq 4096 — before the ~$110 extend run."""
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    ckpt_interval: int = 9_999_999
+    eval_interval: int = 9_999_999
+    save_final_checkpoint: bool = False
+    compile_enabled: bool = False
+    stage_prefix: str = "midtrain2-sanity"
+    wandb_run_name: str = "osrt-v6-midtrain2-sanity"
+
+
 class SFTv1Config(SFTConfig):
     """v6 SFT v1 — system-prompt instruction tuning on the midtrain base.
 

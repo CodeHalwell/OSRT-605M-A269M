@@ -838,6 +838,71 @@ def run_sft_v2_sanity():
 
 
 # =============================================================================
+# MIDTRAIN 2 — extended continued-pretraining (push the undertrained base)
+# =============================================================================
+# The base is ~0.3x Chinchilla (~1.7B tokens). Adds ~1.1B more on a
+# reasoning/instruction-heavy reweight of the knowledge mix (full-seq LM),
+# resuming from midtrain_final. Reuses _run_midtrain + run_pretrain_extend —
+# streams HF datasets, no rollout volume. See MidtrainExtendConfig.
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def midtrain2():
+    """v6 midtrain phase 2: ~4000 more steps, reasoning-heavy mix, fresh
+    re-warm cosine from midtrain_final. See MidtrainExtendConfig."""
+    from osrt.train_config import MidtrainExtendConfig
+    _run_midtrain(MidtrainExtendConfig)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def midtrain2_sanity():
+    """30-step probe: native-HRA loads clean from midtrain_final, reweighted
+    mix streams, VRAM fits at seq 4096. See MidtrainExtendSanityConfig."""
+    from osrt.train_config import MidtrainExtendSanityConfig
+    _run_midtrain(MidtrainExtendSanityConfig)
+
+
+@app.local_entrypoint()
+def run_midtrain2():
+    """Spawn v6 midtrain phase 2 (fire-and-forget)."""
+    call = midtrain2.spawn()
+    print(f"Spawned v6 midtrain2 — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_midtrain2_sanity():
+    """Spawn the 30-step v6 midtrain2 sanity probe."""
+    call = midtrain2_sanity.spawn()
+    print(f"Spawned v6 midtrain2 sanity — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+# =============================================================================
 # PRETRAIN_EXTEND2 — broadened mid-training pass
 # =============================================================================
 # Reuses run_pretrain_extend (the training loop is config-driven). Resumes
