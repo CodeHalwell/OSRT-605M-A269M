@@ -208,3 +208,44 @@ def test_sftv1_config_values():
     # ~35% reasoning-on (math)
     on = sum(d["weight"] for d in ds if d["reasoning_mode"] == "on")
     assert 0.30 <= on <= 0.40
+
+
+# ── SFT v2 tests (reasoning distillation via the rollout-loader path) ─────
+
+
+def test_sftv2_config_values():
+    from osrt.train_config import SFTv2Config
+    c = SFTv2Config()
+    # resumes from the clean v6 midtrain base, distinct prefix
+    assert c.pretrained_checkpoint.endswith("osrt_v5_midtrain_final.pt")
+    assert c.stage_prefix == "sft_v2"
+    # the MOPD rollout-loader override → run_pretrain_extend uses sft_v2.jsonl
+    assert c.rollout_dataset_path.endswith("sft_v2.jsonl")
+    # native + trainable HRA (v6), checkpointing on at seq 4096
+    assert c.hra_native is True and c.hra_frozen is False
+    assert c.gradient_checkpointing is True
+    # gentle SFT schedule — NOT midtrain's continued-pretrain 2e-4
+    assert c.peak_lr == 1e-5 and c.min_lr == 1e-6
+    assert c.total_steps == 1_500 and c.warmup_steps == 100
+    assert c.lr_anchor_step == 0          # fresh cosine over the full run
+    # recursive depth kept active during SFT
+    assert c.aux_loop_loss_weight == 0.05 and c.loop_dropout_prob == 0.10
+    # phase sizing the rollout path reads: seq 4096, eff batch 64
+    ph = c.phases["extend"]
+    assert ph["seq_len"] == 4096
+    assert ph["batch_size"] * ph["grad_accum_steps"] == 64
+    # in-loop perplexity eval disabled (reasoning eval runs offline on ckpts)
+    assert c.eval_interval > 9_000
+    assert c.ckpt_interval == 300
+
+
+def test_sftv2_sanity_writes_no_final():
+    from osrt.train_config import SFTv2SanityConfig
+    c = SFTv2SanityConfig()
+    assert c.total_steps == 30
+    assert c.save_final_checkpoint is False
+    assert c.compile_enabled is False
+    assert c.stage_prefix == "sft_v2-sanity"
+    # inherits the real seq/rollout so the probe measures production VRAM
+    assert c.phases["extend"]["seq_len"] == 4096
+    assert c.rollout_dataset_path.endswith("sft_v2.jsonl")

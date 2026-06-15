@@ -1432,6 +1432,88 @@ class SFTv1SanityConfig(SFTv1Config):
     wandb_run_name: str = "osrt-v6-sft-v1-sanity"
 
 
+class SFTv2Config(MidtrainConfig):
+    """v6 SFT v2 — reasoning distillation from the clean midtrain base.
+
+    The v6 line went pretrain → midtrain → SFT v1 (system-prompt instruction
+    tuning), which proved the format works but left reasoning incoherent. The
+    v5 line had a reasoning-distillation stage (MOPD) the v6 line skipped; this
+    closes that gap by training the midtrain base on the long, coherent teacher
+    CoT in rollouts/sft_v2.jsonl (built by scripts/build_sft_v2_data.py from
+    mopd_v1 + system_prompt_sft, with reasoning-on/off personas baked into each
+    record's `system` field — 65/20/15 ON/OFF/CHAT, all ≤ 4096 tokens).
+
+    Mechanism: reuses run_pretrain_extend (the MOPD rollout-loader path) with
+    MidtrainConfig's proven v6 plumbing — native HRA, seq 4096, gradient
+    checkpointing — but with a gentle SFT schedule (peak 1e-5, not midtrain's
+    continued-pretrain 2e-4) since this is supervised alignment on a small,
+    high-quality set. RolloutDataset reads system/prompt/thinking/response and
+    masks the prefix, so loss fires only on the assistant turn (think+answer).
+
+    Eval: in-loop perplexity eval is DISABLED (it would stream the knowledge
+    mix, not the rollouts — confusing). The north-star reasoning-on/off GSM8K
+    eval runs OFFLINE on the periodic checkpoints via scripts/local_sft_eval.py
+    (fast now that generation is batched). ckpt_interval=300 → 5 checkpoints.
+    """
+
+    # ── Schedule: gentle SFT (not continued-pretrain) ────────────────
+    total_steps: int = 1_500
+    warmup_steps: int = 100
+    lr_anchor_step: int = 0          # fresh cosine over the full run
+    peak_lr: float = 1e-5            # SFT-scale (cf. SFT v1 1.5e-5); NOT 2e-4
+    min_lr: float = 1e-6
+    # Muon group proportional to the AdamW peak (midtrain ratio ~33×).
+    muon_lr: float = 3.3e-4
+    muon_min_lr: float = 3.3e-5
+
+    # Keep recursive depth exercised during SFT (same rationale as MOPD).
+    aux_loop_loss_weight: float = 0.05
+    loop_dropout_prob: float = 0.10
+    loop_dropout_min_loops: int = 3
+
+    # ── Rollout-loader override (the MOPD mechanism) ─────────────────
+    # run_pretrain_extend swaps make_rollout_loader in when this is set. The
+    # Lightning/Modal entrypoints repoint it at the local path as needed.
+    rollout_dataset_path: str = "/vol/rollouts/sft_v2.jsonl"
+
+    # ── Phase sizing for the rollout path (seq/batch/accum read here) ─
+    # seq 4096 (long CoT genuinely needs it); eff batch 4×16=64. The datasets
+    # list is unused on the rollout path (only printed) — placeholder name.
+    phases: dict = {  # noqa: RUF012
+        "extend": {
+            "seq_len": 4096,
+            "batch_size": 4,
+            "grad_accum_steps": 16,
+            "datasets": [{"name": "sft_v2_rollout", "weight": 1.0}],
+        },
+    }
+
+    # In-loop perplexity eval off (see docstring); checkpoint often.
+    eval_interval: int = 9_999_999
+    ckpt_interval: int = 300
+    log_interval: int = 25
+
+    # ── Lineage ──────────────────────────────────────────────────────
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain_final.pt"
+    stage_prefix: str = "sft_v2"
+    wandb_run_name: str = "osrt-v6-sft-v2"
+    wandb_run_id: str = ""
+
+
+class SFTv2SanityConfig(SFTv2Config):
+    """30-step SFT-v2 probe: confirms the rollout loader builds the v6
+    system/think/answer sequence, native-HRA loads clean from midtrain_final,
+    and VRAM fits at seq 4096 — before the paid run. No final, distinct prefix."""
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    ckpt_interval: int = 9_999_999
+    save_final_checkpoint: bool = False
+    compile_enabled: bool = False
+    stage_prefix: str = "sft_v2-sanity"
+    wandb_run_name: str = "osrt-v6-sft-v2-sanity"
+
+
 class SFTLongConfig(SFTConfig):
     """Long-context SFT — resumes from the seq-2048 SFT checkpoint and
     fine-tunes at seq_len 4096 with a Nemotron-heavy data mix.

@@ -734,6 +734,110 @@ def run_midtrain_sanity():
 
 
 # =============================================================================
+# SFT v2 — reasoning distillation from the v6 midtrain base
+# =============================================================================
+# Reuses run_pretrain_extend (the MOPD rollout-loader path) on the v6 midtrain
+# base, training the long coherent teacher CoT in /vol/rollouts/sft_v2.jsonl
+# with reasoning-on/off personas. Upload the corpus first (regenerated locally
+# via scripts/build_sft_v2_data.py):
+#   modal volume put osrt-rollouts rollouts/sft_v2.jsonl sft_v2.jsonl
+# See SFTv2Config.
+def _run_sft_v2(cfg_cls):
+    """Shared body for sft_v2 + sft_v2_sanity (differ only by config)."""
+    import os
+
+    from transformers import AutoTokenizer
+
+    from osrt.presets import build_config
+    from osrt.train import run_pretrain_extend
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    print(f"Tokenizer loaded: vocab_size={len(tok)}")
+
+    model_config = build_config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
+    )
+    cfg = cfg_cls()
+    if not os.path.exists(cfg.rollout_dataset_path):
+        raise FileNotFoundError(
+            f"SFT-v2 corpus not found at {cfg.rollout_dataset_path}. Upload it: "
+            "`modal volume put osrt-rollouts rollouts/sft_v2.jsonl sft_v2.jsonl`"
+        )
+    print(
+        f"{cfg.__class__.__name__}: {cfg.total_steps} steps @ seq "
+        f"{cfg.phases['extend']['seq_len']}, peak LR {cfg.peak_lr}, "
+        f"HRA native+trainable, resume {cfg.pretrained_checkpoint}, "
+        f"rollout {cfg.rollout_dataset_path}"
+    )
+    run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v2():
+    """v6 SFT v2: reasoning distillation from midtrain_final, seq 4096,
+    ~1500 steps on the persona-tagged teacher CoT. See SFTv2Config."""
+    from osrt.train_config import SFTv2Config
+    _run_sft_v2(SFTv2Config)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v2_sanity():
+    """30-step SFT-v2 probe: rollout loader builds the v6 seq, native-HRA
+    loads clean from midtrain_final, VRAM fits at seq 4096. See SFTv2SanityConfig."""
+    from osrt.train_config import SFTv2SanityConfig
+    _run_sft_v2(SFTv2SanityConfig)
+
+
+@app.local_entrypoint()
+def run_sft_v2():
+    """Spawn v6 SFT v2 (fire-and-forget)."""
+    call = sft_v2.spawn()
+    print(f"Spawned v6 SFT v2 — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_sft_v2_sanity():
+    """Spawn the 30-step v6 SFT-v2 sanity probe."""
+    call = sft_v2_sanity.spawn()
+    print(f"Spawned v6 SFT v2 sanity — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+# =============================================================================
 # PRETRAIN_EXTEND2 — broadened mid-training pass
 # =============================================================================
 # Reuses run_pretrain_extend (the training loop is config-driven). Resumes
