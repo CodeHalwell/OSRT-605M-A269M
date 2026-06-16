@@ -93,8 +93,8 @@ Let `B = 3` physical blocks, `L = 6` loops. Cache today = `B·L = 18`.
 
 1. **Grouped reuse (recompute every `g` loops).** Cache KV at loops
    `{0, g, 2g, …}`; intervening loops attend into the most recent cached latent
-   for their physical block. `g=2` → 9 caches (1.5×... no: caches `B·L/g = 9`,
-   so 2×). `g=3` → 6 caches (3×). Safest middle ground; tunable.
+   for their physical block. Cache `= B·ceil(L/g)`: `g=2` → 9 caches (2×),
+   `g=3` → 6 caches (3×). Safest middle ground; tunable.
 2. **First-loop share (compute once, reuse `L-1`).** Each physical block
    computes its latent at loop 0 only; loops 1..5 reuse it. Cache = `B = 3`
    (**6×**), and 6× fewer `kv_down` matmuls. Most aggressive, most lossy.
@@ -115,7 +115,7 @@ loss holds → variant 4 only if P0 says per-loop KV is information-rich.**
 **P0 — does per-loop KV actually differ? (no training)**
 Run the existing mid-trained base on a held-out batch with telemetry, dump the
 per-`(loop, block)` latents `c_kv`, and compute, per physical block, the
-cross-loop cosine / explained-variance of the latents. If loop-to-loop latents
+cross-loop cosine / linear CKA of the latents. If loop-to-loop latents
 are near-collinear, full share (variant 2) is nearly free; if they fan out,
 prefer variant 4. This is a forward-only probe — hours, not dollars.
 

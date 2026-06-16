@@ -46,6 +46,8 @@ import os
 import sys
 from pathlib import Path
 
+import torch
+
 # Load .env (HF_TOKEN etc.) the same way the other local scripts do.
 _env = Path(__file__).parent.parent / ".env"
 if _env.exists():
@@ -101,8 +103,6 @@ def linear_cka(X, Y) -> float:
 
 def mean_cosine(X, Y) -> float:
     """Mean per-row cosine similarity between two aligned (N, D) matrices."""
-    import torch
-
     return float(torch.nn.functional.cosine_similarity(X, Y, dim=-1).mean().item())
 
 
@@ -130,8 +130,6 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="Write the full report as JSON here.")
     args = ap.parse_args()
 
-    import torch
-
     from osrt.presets import build_config
 
     if args.device:
@@ -156,10 +154,17 @@ def main() -> int:
         try:
             from transformers import AutoTokenizer
             tok = AutoTokenizer.from_pretrained(args.tokenizer)
+            if tok.pad_token is None:
+                # Some tokenizers (LLaMA/GPT-2) ship no pad token; padding
+                # ="max_length" would raise. Fall back to eos.
+                tok.pad_token = tok.eos_token
         except Exception as e:  # noqa: BLE001
-            print(f"tokenizer load failed ({e}); falling back to --tiny synthetic ids",
-                  flush=True)
+            # Fall back to a tiny random model: the full checkpoint cannot load
+            # into a tiny config (shape mismatch), so force random-init too.
+            print(f"tokenizer load failed ({e}); falling back to --tiny synthetic "
+                  f"ids + random init", flush=True)
             args.tiny = True
+            args.random_init = True
 
     if args.tiny:
         # Synthetic ids — plumbing smoke test, no real tokenizer/checkpoint.
@@ -194,11 +199,11 @@ def main() -> int:
             return 2
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         sd = ck.get("model_state_dict", ck)
-        missing, unexpected = model.load_state_dict(sd, strict=False)
-        # Native-HRA v6 load: tolerate nothing structural. Report and continue.
-        if missing or unexpected:
-            print(f"load_state_dict: {len(missing)} missing, {len(unexpected)} "
-                  f"unexpected keys (expected ~0 for a clean v6 load)", flush=True)
+        # FAIL on any key drift — these metrics drive a KV-reuse decision, so a
+        # stale/mismatched checkpoint that leaves params randomly initialised must
+        # not masquerade as a real probe. Same contract as the training loader.
+        from osrt.train import load_model_state_or_raise
+        load_model_state_or_raise(model, sd, context=f"probe load {ckpt_path}")
     else:
         print("random-init: results are a PLUMBING CHECK ONLY, not evidence.",
               flush=True)
@@ -214,6 +219,13 @@ def main() -> int:
     assert len(latents) == n_blocks * n_loops, (
         f"expected {n_blocks * n_loops} latents, got {len(latents)}")
 
+    # Guard against an all-padding/empty batch: _masked_rows would return empty
+    # tensors and every metric would be NaN / divide-by-zero.
+    valid_tokens = int(attn.sum().item())
+    if valid_tokens == 0:
+        print("ERROR: no valid (non-padding) tokens in the input batch.", flush=True)
+        return 1
+
     # idx = loop * n_blocks + block_idx  -> per_block[block][loop]
     per_block: list[list] = [[None] * n_loops for _ in range(n_blocks)]
     for idx, lat in enumerate(latents):
@@ -224,7 +236,7 @@ def main() -> int:
     report: dict = {
         "config": {"num_blocks": n_blocks, "num_loops": n_loops,
                    "kv_dim": int(latents[0].shape[-1]),
-                   "valid_tokens": int(attn.sum().item()),
+                   "valid_tokens": valid_tokens,
                    "random_init": bool(args.random_init), "tiny": bool(args.tiny)},
         "blocks": [],
     }
@@ -242,7 +254,9 @@ def main() -> int:
         first_err = [round(rel_l2(loops[k], loops[0]), 4) for k in range(1, n_loops)]
         first_mean = round(sum(first_err) / max(len(first_err), 1), 4)
 
-        # Scheme 2: grouped g=3 — loops [0..h) reuse loop 0, [h..L) reuse loop h.
+        # Scheme 2: two-group split at h = L//2 — loops [0..h) reuse loop 0,
+        # loops [h..L) reuse loop h (caches 2 of L; == "recompute every L/2
+        # loops", i.e. g=3 only in the default L=6 case).
         h = n_loops // 2
         grouped_err = (
             [rel_l2(loops[k], loops[0]) for k in range(1, h)]
@@ -267,8 +281,12 @@ def main() -> int:
               f"= {n_loops / 2:.1f}x): mean {grouped_mean}")
 
     # ---- decision hint -----------------------------------------------------
+    # Average CKA(loop_k, loop_0) over k=1..L-1 ONLY — excluding the self term
+    # CKA(loop_0, loop_0)=1.0, which would otherwise inflate the gate (e.g. five
+    # real 0.66s would report as (1+5*0.66)/6=0.72 and trip the >0.70 hint).
+    denom = max(n_loops - 1, 1)
     mean_cka0 = sum(
-        sum(blk["cka_matrix"][0]) / n_loops for blk in report["blocks"]
+        sum(blk["cka_matrix"][0][1:]) / denom for blk in report["blocks"]
     ) / n_blocks
     mean_first = sum(b["first_share_rel_l2_mean"] for b in report["blocks"]) / n_blocks
     report["summary"] = {"mean_cka_vs_loop0": round(mean_cka0, 4),

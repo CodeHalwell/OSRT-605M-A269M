@@ -458,7 +458,8 @@ Per block: ~5.76M params; across 3 blocks: ~17.3M. Plus HRA adapters.
 > **Implemented correctly: KDV operates on the UN-rotated latent.** RoPE is
 > position-dependent, so the cache holds the un-rotated `c_kv`; both K (RoPE'd)
 > and V (`v_from_k(c_kv)`) are recomputed from it at attention time. See
-> `model.py::_attention` lines ~1000-1015.
+> `RecursiveBlock._attention` in `src/osrt/model.py` (the `c_kv_new = kv_down(h)`
+> / `v_from_k(c_kv)` block).
 
 ### 6.3 V derived from K (Key-Derived Value / KDV, MLA-inspired)
 
