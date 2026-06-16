@@ -100,6 +100,7 @@ class OSRTLMEval(LM):
         tokenizer_path: str,
         hra_enabled: bool = True,
         hra_rank: int = 256,
+        hra_native: bool = True,
         batch_size: int = 8,
         max_length: int = 8192,
         device: str = "cuda",
@@ -186,23 +187,41 @@ class OSRTLMEval(LM):
         print(f"[lm_eval] Loading tokenizer from {tokenizer_path}", flush=True)
         self._tok = AutoTokenizer.from_pretrained(tokenizer_path)
 
-        print("[lm_eval] Constructing model...", flush=True)
-        cfg = OSRTConfig(
-            vocab_size=len(self._tok),
-            real_vocab_size=len(self._tok),
-            bos_token_id=self._tok.bos_token_id,
-            eos_token_id=self._tok.eos_token_id,
-            pad_token_id=self._tok.pad_token_id,
-        )
+        print("[lm_eval] Constructing model "
+              f"(hra_native={hra_native})...", flush=True)
+        if hra_native:
+            # v6 lane: build the FULL preset architecture (recursive MoE, mHC,
+            # MTP, native rank-256 HRA already in the config). A bare
+            # OSRTConfig defaults to the wrong (v5-class) shape and would
+            # silently mis-load a v6 checkpoint — the exact correctness bug
+            # this path fixes.
+            from osrt.presets import build_config
+            cfg = build_config(
+                vocab_size=len(self._tok),
+                real_vocab_size=len(self._tok),
+                bos_token_id=self._tok.bos_token_id,
+                eos_token_id=self._tok.eos_token_id,
+                pad_token_id=self._tok.pad_token_id,
+                fused_cross_entropy_chunks=8,
+            )
+        else:
+            # Legacy v5 lane (HRALinear injected post-construction).
+            cfg = OSRTConfig(
+                vocab_size=len(self._tok),
+                real_vocab_size=len(self._tok),
+                bos_token_id=self._tok.bos_token_id,
+                eos_token_id=self._tok.eos_token_id,
+                pad_token_id=self._tok.pad_token_id,
+            )
         self._cfg = cfg
 
         model = OSRTForCausalLM(cfg).to(self._device)
 
-        # Inject HRA adapters BEFORE loading the state_dict. SFT
-        # checkpoints have HRA params already in their state_dict; the
-        # injection adds the matching nn.Parameter slots so they fill
-        # in correctly during load_state_dict.
-        if hra_enabled:
+        # HRA: v6 builds adapters NATIVELY from the preset (adapters_a/b are
+        # already module params), so DO NOT inject — injecting changes the key
+        # namespace and the native checkpoint then mis-loads (the recurring HRA
+        # trap). Only the legacy v5 HRALinear path needs inject_hra.
+        if hra_enabled and not hra_native:
             from osrt.hra import inject_hra
             print(f"[lm_eval] Injecting HRA (rank={hra_rank})", flush=True)
             inject_hra(model, rank=hra_rank)
@@ -212,17 +231,13 @@ class OSRTLMEval(LM):
             ckpt_path, map_location=self._device, weights_only=True,
         )
         state_dict = ckpt.get("model_state_dict", ckpt)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(
-                f"[lm_eval] WARNING: missing keys ({len(missing)}): "
-                f"{missing[:3]}", flush=True,
-            )
-        if unexpected:
-            print(
-                f"[lm_eval] WARNING: unexpected keys ({len(unexpected)}): "
-                f"{unexpected[:3]}", flush=True,
-            )
+        # STRICT load — a key/shape mismatch must FAIL loudly, not silently
+        # produce a garbage eval (the old strict=False tolerated wrong-arch
+        # loads, the root of untrustworthy benchmark numbers).
+        from osrt.train import load_model_state_or_raise
+        load_model_state_or_raise(
+            model, state_dict, context=f"lm_eval {ckpt_path}",
+        )
 
         model.train(False)  # disables MoE capacity drops, enables KV-cache path
         self._model = model

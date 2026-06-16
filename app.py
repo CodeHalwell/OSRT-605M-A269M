@@ -57,8 +57,17 @@ image = (
         extra_options="--index-url https://download.pytorch.org/whl/cu128",
     )
     .pip_install(
-        "transformers", "datasets", "lion-pytorch", "triton", "wandb",
-        "tokenizers", "sentencepiece", "safetensors",
+        # Keep Modal aligned with the pinned local/Lightning lockfile. The
+        # CUDA torch wheel is installed above from the PyTorch index; these are
+        # the PyPI-side packages that otherwise drift when the image rebuilds.
+        "transformers==5.3.0",
+        "datasets==4.6.1",
+        "lion-pytorch==0.2.4",
+        "triton==3.6.0",
+        "wandb==0.25.1",
+        "tokenizers==0.22.2",
+        "sentencepiece==0.2.0",
+        "safetensors==0.7.0",
         # lm-eval baked into the base image so the `evaluate` function
         # doesn't need a derived image. Modal disallows .pip_install
         # after .add_local_dir; folding it in here keeps the build chain
@@ -70,7 +79,7 @@ image = (
         # `lm_eval.simple_evaluate(tasks=["ifeval", ...])` fails at
         # task-config load time with "ModuleNotFoundError: No module
         # named 'langdetect'" before the model even runs.
-        "lm-eval[ifeval]",
+        "lm-eval[ifeval]==0.4.11",
     )
     .add_local_dir("src/osrt", remote_path="/root/osrt")
     .add_local_dir("scripts", remote_path="/root/scripts")
@@ -2483,7 +2492,8 @@ def sft_math():
     image=image,  # lm-eval is in the base image's pip_install
     volumes={
         "/vol/checkpoints": vol,
-        "/vol/tokenizer": tokenizer_vol,
+        "/vol/tokenizer_v4": tokenizer_vol,
+        "/vol/tokenizer_v6": v6_tokenizer_vol,
         "/vol/hf_cache": hf_cache_vol,
     },
     secrets=[
@@ -2493,8 +2503,8 @@ def sft_math():
     timeout=14400,  # 4h: comfortable headroom for full lm-eval suite
 )
 def evaluate(
-    ckpt_name: str = "osrt_v5_sft_ultralong_final.pt",
-    tag: str = "pre-grpo",
+    ckpt_name: str = "osrt_v5_sft_v2_final.pt",
+    tag: str = "sft-v2",
     tasks: str = (
         # Original three: math reasoning + instruction following + STEM knowledge
         "gsm8k,ifeval,mmlu_stem,"
@@ -2508,18 +2518,20 @@ def evaluate(
         "hellaswag,arc_easy,arc_challenge,piqa,winogrande"
     ),
     limit: int | None = None,
+    tokenizer_path: str = "/vol/tokenizer_v6",
+    hra_native: bool = True,
+    hra_enabled: bool = True,
 ):
-    """Run lm-evaluation-harness on the latest SFT/GRPO checkpoint.
+    """Run lm-evaluation-harness on an OSRT checkpoint.
 
     Runs gsm8k + IFEval + MMLU-stem by default. Results are written to
     `/vol/checkpoints/v5/eval_<tag>.json` so pre-GRPO and post-GRPO
     runs can be diffed straightforwardly.
 
     Args:
-        ckpt_name: filename under /vol/checkpoints/v5/. Default points
-            at the SFT-ultralong final ckpt; pass
-            "osrt_v5_grpo_final.pt" (or step-named variants) for the
-            post-GRPO eval.
+        ckpt_name: filename under /vol/checkpoints/v5/. Default points at
+            the active v6 SFT-v2 final ckpt. For legacy v4/v5 checkpoints,
+            pass tokenizer_path="/vol/tokenizer_v4" and hra_native=False.
         tag: short label embedded in the output filename and W&B run.
             Use "pre-grpo" / "post-grpo" / "post-iter-grpo" for the
             comparison sequence.
@@ -2527,6 +2539,11 @@ def evaluate(
             three benchmarks we care about; override for ad-hoc runs.
         limit: cap problems per task for quick smoke tests. None =
             full benchmark. 50 is a reasonable smoke value.
+        tokenizer_path: mounted tokenizer directory. Defaults to the v6
+            65K tokenizer; legacy ckpts should use /vol/tokenizer_v4.
+        hra_native: True for the v6 preset-native adapters_a/adapters_b lane.
+            False for legacy HRALinear checkpoints that need injection.
+        hra_enabled: Whether the checkpoint includes HRA parameters.
 
     Cost: ~$5 for the default three-task pass on H100 (gsm8k 1319
     problems × 256 generated tokens dominates).
@@ -2554,15 +2571,18 @@ def evaluate(
     print(f"OSRT — lm-eval-harness ({tag})")
     print("=" * 60)
     print(f"Checkpoint     : {ckpt_path}")
+    print(f"Tokenizer      : {tokenizer_path}")
+    print(f"HRA native     : {hra_native}")
     print(f"Tasks          : {tasks}")
     print(f"Per-task limit : {limit or 'full'}")
     print()
 
     wrapper = OSRTLMEval(
         ckpt_path=ckpt_path,
-        tokenizer_path="/vol/tokenizer",
-        hra_enabled=True,
+        tokenizer_path=tokenizer_path,
+        hra_enabled=hra_enabled,
         hra_rank=256,
+        hra_native=hra_native,
         batch_size=8,
         device="cuda",
     )
@@ -2578,6 +2598,9 @@ def evaluate(
                 "ckpt_name": ckpt_name,
                 "tasks": task_list,
                 "limit": limit,
+                "tokenizer_path": tokenizer_path,
+                "hra_native": hra_native,
+                "hra_enabled": hra_enabled,
             },
         )
 
@@ -4006,12 +4029,15 @@ def main(stage: str = "pretrain"):
                              pipeline; validates all 10 streams + format
                              functions before committing $28 on the full run
     --stage sft            Balanced SFT on the final pretrained checkpoint
-    --stage sft_long       Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
-    --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming from sft_long_final.pt
+    --stage sft_long       Long-context SFT (seq 4096) resuming from
+                             sft_final.pt with Nemotron mix
+    --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming
+                             from sft_long_final.pt
     --stage sft_refresh    Short format-anchor SFT on top of extend_final.pt
                              (500 steps, peak LR 5e-6, no tool_calling)
     --stage sft_math       Math-only SFT polish on top of sft_refresh_final.pt
-                             (1,000 steps, peak LR 3e-6, GSM8K + Orca + MathInstruct + NuminaMath)
+                             (1,000 steps, peak LR 3e-6, GSM8K + Orca +
+                              MathInstruct + NuminaMath)
     --stage evaluate       lm-eval-harness pass (gsm8k + IFEval + MMLU-stem). Args:
                              --ckpt-name <filename in /vol/checkpoints/v5/>
                              --tag <pre-grpo|post-grpo|...>
@@ -4021,83 +4047,62 @@ def main(stage: str = "pretrain"):
                              --limit <int or None for full benchmark>
     --stage grpo           GRPO RL on the SFT checkpoint (verifiable math rewards)
     """
-    if stage == "sanity":
-        sanity.remote()
-    elif stage == "sweep":
-        sweep.remote()
-    elif stage == "ablate":
-        ablate.remote()
-    elif stage == "pretrain":
-        pretrain.remote()
-    elif stage == "pretrain_extend":
-        pretrain_extend.remote()
-    elif stage == "pretrain_extend2":
-        # .spawn() instead of .remote() — the local CLI exits cleanly
-        # in detached mode, and .remote() inside a local_entrypoint can
-        # be cancelled when the caller disconnects (Modal warns about
-        # this on launch). Observed: extend2 cancelled at ~2 min from
-        # container start regardless of compile/wandb/ckpt/log config.
-        # .spawn() is true fire-and-forget; the function continues even
-        # if the local entrypoint exits immediately.
-        call = pretrain_extend2.spawn()
-        print(f"Spawned pretrain_extend2 as call: {call.object_id}")
-    elif stage == "pretrain_extend2_sanity":
-        call = pretrain_extend2_sanity.spawn()
-        print(f"Spawned pretrain_extend2_sanity as call: {call.object_id}")
-    elif stage == "loop_fix":
-        call = loop_fix.spawn()
-        print(f"Spawned loop_fix as call: {call.object_id}")
-    elif stage == "loop_fix_sanity":
-        call = loop_fix_sanity.spawn()
-        print(f"Spawned loop_fix_sanity as call: {call.object_id}")
-    elif stage == "loop_fix_v2":
-        call = loop_fix_v2.spawn()
-        print(f"Spawned loop_fix_v2 as call: {call.object_id}")
-    elif stage == "loop_fix_v2_sanity":
-        call = loop_fix_v2_sanity.spawn()
-        print(f"Spawned loop_fix_v2_sanity as call: {call.object_id}")
-    elif stage == "pretrain_extend3":
-        call = pretrain_extend3.spawn()
-        print(f"Spawned pretrain_extend3 as call: {call.object_id}")
-    elif stage == "pretrain_extend3_sanity":
-        call = pretrain_extend3_sanity.spawn()
-        print(f"Spawned pretrain_extend3_sanity as call: {call.object_id}")
-    elif stage == "mopd":
-        call = mopd.spawn()
-        print(f"Spawned mopd as call: {call.object_id}")
-    elif stage == "mopd_sanity":
-        call = mopd_sanity.spawn()
-        print(f"Spawned mopd_sanity as call: {call.object_id}")
-    elif stage == "grpo_multi":
-        call = grpo_multi.spawn()
-        print(f"Spawned grpo_multi as call: {call.object_id}")
-    elif stage == "grpo_multi_sanity":
-        call = grpo_multi_sanity.spawn()
-        print(f"Spawned grpo_multi_sanity as call: {call.object_id}")
-    elif stage == "system_sft":
-        call = system_sft.spawn()
-        print(f"Spawned system_sft as call: {call.object_id}")
-    elif stage == "system_sft_sanity":
-        call = system_sft_sanity.spawn()
-        print(f"Spawned system_sft_sanity as call: {call.object_id}")
-    elif stage == "sft":
-        sft.remote()
-    elif stage == "sft_long":
-        sft_long.remote()
-    elif stage == "sft_ultralong":
-        sft_ultralong.remote()
-    elif stage == "sft_refresh":
-        sft_refresh.remote()
-    elif stage == "sft_math":
-        sft_math.remote()
-    elif stage == "evaluate":
-        evaluate.remote()
-    elif stage == "grpo":
-        grpo.remote()
+    # Central stage registry — single source of truth so --stage dispatch and
+    # the help/unknown-stage message can't drift. The v6 stages (midtrain*,
+    # sft_v1*, sft_v2*, midtrain2*) were previously missing here entirely, so
+    # `modal run app.py --stage midtrain2` fell through to "Unknown stage".
+    # mode SPAWN = long fire-and-forget training (the local entrypoint can exit
+    # without cancelling the run — .remote() gets cancelled on disconnect);
+    # mode REMOTE = short/blocking (eval, smoke). Each training stage also has
+    # a dedicated run_* @app.local_entrypoint.
+    REMOTE, SPAWN = "remote", "spawn"
+    registry = {
+        # ── v5 lineage ──
+        "sanity": (sanity, REMOTE),
+        "sweep": (sweep, REMOTE),
+        "ablate": (ablate, REMOTE),
+        "pretrain": (pretrain, REMOTE),
+        "pretrain_extend": (pretrain_extend, REMOTE),
+        "pretrain_extend2": (pretrain_extend2, SPAWN),
+        "pretrain_extend2_sanity": (pretrain_extend2_sanity, SPAWN),
+        "loop_fix": (loop_fix, SPAWN),
+        "loop_fix_sanity": (loop_fix_sanity, SPAWN),
+        "loop_fix_v2": (loop_fix_v2, SPAWN),
+        "loop_fix_v2_sanity": (loop_fix_v2_sanity, SPAWN),
+        "pretrain_extend3": (pretrain_extend3, SPAWN),
+        "pretrain_extend3_sanity": (pretrain_extend3_sanity, SPAWN),
+        "mopd": (mopd, SPAWN),
+        "mopd_sanity": (mopd_sanity, SPAWN),
+        "grpo_multi": (grpo_multi, SPAWN),
+        "grpo_multi_sanity": (grpo_multi_sanity, SPAWN),
+        "system_sft": (system_sft, SPAWN),
+        "system_sft_sanity": (system_sft_sanity, SPAWN),
+        "sft": (sft, REMOTE),
+        "sft_long": (sft_long, REMOTE),
+        "sft_ultralong": (sft_ultralong, REMOTE),
+        "sft_refresh": (sft_refresh, REMOTE),
+        "sft_math": (sft_math, REMOTE),
+        "evaluate": (evaluate, REMOTE),
+        "grpo": (grpo, REMOTE),
+        # ── v6 lineage (were missing from --stage) ──
+        "midtrain": (midtrain, SPAWN),
+        "midtrain_sanity": (midtrain_sanity, SPAWN),
+        "midtrain2": (midtrain2, SPAWN),
+        "midtrain2_sanity": (midtrain2_sanity, SPAWN),
+        "sft_v1": (sft_v1, SPAWN),
+        "sft_v1_sanity": (sft_v1_sanity, SPAWN),
+        "sft_v2": (sft_v2, SPAWN),
+        "sft_v2_sanity": (sft_v2_sanity, SPAWN),
+    }
+    entry = registry.get(stage)
+    if entry is None:
+        print(f"Unknown stage: {stage!r}. Available stages:")
+        for name in sorted(registry):
+            print(f"  - {name}")
+        return
+    fn, mode = entry
+    if mode == SPAWN:
+        call = fn.spawn()
+        print(f"Spawned {stage} as call: {call.object_id}")
     else:
-        print(
-            f"Unknown stage: {stage}. "
-            f"Use sanity, sweep, ablate, pretrain, pretrain_extend, "
-            f"sft, sft_long, sft_ultralong, sft_refresh, sft_math, "
-            f"evaluate, or grpo"
-        )
+        fn.remote()
