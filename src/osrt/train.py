@@ -1804,12 +1804,22 @@ def run_pretrain_extend(
                             extend_cfg, "dataloader_prefetch_factor", 2),
                     )
                 else:
+                    # Thread the configured worker/prefetch settings, matching
+                    # the INITIAL make_loader call above. Without this the
+                    # rebuild silently reverts to make_loader's 4-worker default,
+                    # re-opening too many concurrent HF streams from one
+                    # container → the SSL/connection-reset storm we tuned the
+                    # config down to avoid (see the initial-loader comment).
                     loader = make_loader(
                         extend_phase["datasets"],
                         seq_len,
                         tokenizer_name,
                         batch_size,
                         step,
+                        num_workers=getattr(
+                            extend_cfg, "dataloader_num_workers", 4),
+                        prefetch_factor=getattr(
+                            extend_cfg, "dataloader_prefetch_factor", 4),
                     )
                 loader_iter = iter(loader)
                 input_ids, labels = next(loader_iter)
