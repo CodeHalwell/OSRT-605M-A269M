@@ -158,14 +158,14 @@ Instead of caching projection matrices $K, V \in \mathbb{R}^{B \times S \times H
 \begin{equation}
 \mathbf{c}_{\text{kv}} = \mathbf{x} W_{\text{kv\_down}}
 \end{equation}
-where $W_{\text{kv\_down}} \in \mathbb{R}^{1536 \times 512}$. During generation, only $\mathbf{c}_{\text{kv}}$ is stored in the KV cache, requiring 512 scalar allocations per token instead of $8 \times 64 \times 2 = 1024$ scalars under a Grouped-Query Attention (GQA) baseline.
+where $W_{\text{kv\_down}} \in \mathbb{R}^{1536 \times 512}$. During generation, only $\mathbf{c}_{\text{kv}}$ is stored in the KV cache, requiring 512 scalar allocations per token instead of $8 \times 64 \times 2 = 1024$ scalars under a Grouped-Query Attention (GQA) baseline. The roofline rationale is explicit: at decode the arithmetic intensity of attention is $\mathcal{O}(1)$ FLOP per cached byte, far below the ridge point of modern accelerators, so throughput scales as the inverse of cache bytes per token per layer. KDV thus trades idle tensor-core FLOPs for halved HBM traffic --- ``recompute, don't reload.'' Notably this is \emph{leaner} than the MLA scheme it derives from: MLA additionally caches a decoupled-RoPE channel ($d_c + d_h^R \approx 512 + 64$ scalars) so that its key up-projection can be absorbed into $Q$ at inference, a compute saving that is irrelevant when decode is bandwidth-bound; KDV forgoes absorption and caches the smaller 512-scalar latent.
 
 At attention computation, Keys ($K$) and Values ($V$) are reconstructed from $\mathbf{c}_{\text{kv}}$:
 \begin{align}
-K &= \text{view}(\mathbf{c}_{\text{kv}}) \cdot W_{\text{K\_proj}} \\
-V &= \mathbf{c}_{\text{kv}} W_{\text{v\_from\_k}}
+K &= \text{view}(\mathbf{c}_{\text{kv}}) \\
+V &= \mathbf{c}_{\text{kv}} W_{\text{v\_from\_k}} + \mathbf{b}_v
 \end{align}
-where $W_{\text{v\_from\_k}} \in \mathbb{R}^{512 \times 512}$ with a bias vector. The queries $Q$ are projected from the hidden state. 
+where $W_{\text{v\_from\_k}} \in \mathbb{R}^{512 \times 512}$. The Key is the un-rotated latent reshaped into heads --- there is no learned key projection --- while the Value is a learned affine map of the same latent; the queries $Q$ are projected from the hidden state. We note the expressivity trade honestly: the $W_{\text{v\_from\_k}}$ map is absorbable into the output projection and so adds no representational power beyond a bias, while tying $K$ to the raw latent makes KDV's attention-score function class a strict subset of MLA's (whose $K = W_{UK}\,\mathbf{c}$ mixes across the full latent). The constraint is accepted in exchange for the minimal cache footprint above.
 
 To prevent attention scale explosion during early optimization steps, we apply QK-Norm~\cite{qknorm2020}, normalizing $Q$ and $K$ along the head dimension before computing dot products:
 \begin{equation}
