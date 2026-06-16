@@ -422,22 +422,44 @@ W_O ∈ ℝ^(1536 × 1536)        # 2.36M params
 
 Per block: ~5.76M params; across 3 blocks: ~17.3M. Plus HRA adapters.
 
-> ✅ **DECISION MADE — KDV (Key-Derived Value, constraint accepted).** Of the three
-> options once on the table (a: accept the V=f(K) constraint; b: widen
-> latent then split; c: full DeepSeek MLA), the implementation chose
-> **(a)** — `model.py` caches a single 512-dim un-rotated latent
-> (`kv_down`), reads K straight off it, and derives V via
-> `v_from_k` (a learned `Linear(512→512)+bias`). The name for that
-> contract — *Value derived from the Key latent* — is **KDV (Key-Derived
-> Value)**. One cached tensor, ~half the KV cache of storing K and V
-> separately. The expressivity note still holds in principle but was
-> judged acceptable at this scale; revisit only if attention quality
-> stalls. (`review/SYNTHESIS.md` Tier 1 #7.)
+> ✅ **DECISION MADE — KDV (Key-Derived Value).** Of the three options once on
+> the table (a: cache one latent, derive V from it; b: widen latent then
+> split; c: full DeepSeek MLA with decoupled-RoPE + matrix absorption), the
+> implementation chose **(a)** — `model.py` caches a single 512-dim un-rotated
+> latent (`kv_down`), reads K straight off it (identity reshape), and derives V
+> via `v_from_k` (a learned `Linear(512→512)+bias`). The name for that contract
+> — *Value derived from the Key latent* — is **KDV (Key-Derived Value)**.
+> (`review/SYNTHESIS.md` Tier 1 #7.)
 >
-> **Implemented correctly: KDV (Key-Derived Value) operates on the UN-rotated latent.**
-> RoPE is position-dependent, so the cache holds the un-rotated `c_kv`;
-> both K (RoPE'd) and V (`v_from_k(c_kv)`) are recomputed from it at
-> attention time. See `model.py::_attention` lines ~1000-1015.
+> **The justification is memory bandwidth, not expressivity.** Autoregressive
+> decode is HBM-bandwidth-bound: each step streams the entire KV cache out of
+> memory and does ~O(1) FLOP per byte loaded — far below an H100's ~300+
+> FLOP/byte roofline ridge — so the tensor cores sit idle behind the load.
+> Decode throughput therefore scales as 1 / (cache bytes per token per layer).
+> KDV caches **512 scalars/token/layer** vs **1024** for a GQA K+V cache (≈2×
+> fewer bytes ⇒ ≈2× the attention-bound decode throughput), and the `v_from_k`
+> recompute is FLOPs that hide *for free* under the memory latency already being
+> paid. The design deliberately spends idle compute to avoid HBM traffic —
+> **"recompute, don't reload."** (Per-layer is a constant 2×; the larger
+> bytes-moved levers for the recursive stack — cross-loop KV reuse and
+> sequence-axis compression — are catalogued in
+> `docs/specs/2026-06-16-cross-loop-kv-reuse.md`.)
+>
+> **KDV vs MLA on the metric that matters (cache bytes).** MLA-V2 caches its
+> compressed latent **plus** a separate decoupled-RoPE channel
+> (`d_c + d_h^R ≈ 512 + 64 = ~576` scalars/token/layer) precisely so the K
+> up-projection can be *absorbed* into Q at inference — an absorption that saves
+> decode *compute*. KDV forgoes absorption (it RoPEs the reshaped latent
+> directly and recomputes K/V each step), costing only the idle FLOPs we don't
+> care about, and in exchange caches **fewer bytes** (512 < ~576) with no
+> decoupled channel to carry. On the bandwidth axis KDV is therefore marginally
+> *leaner* than MLA, not a degraded version of it.
+>
+> **Implemented correctly: KDV operates on the UN-rotated latent.** RoPE is
+> position-dependent, so the cache holds the un-rotated `c_kv`; both K (RoPE'd)
+> and V (`v_from_k(c_kv)`) are recomputed from it at attention time. See
+> `RecursiveBlock._attention` in `src/osrt/model.py` (the `c_kv_new = kv_down(h)`
+> / `v_from_k(c_kv)` block).
 
 ### 6.3 V derived from K (Key-Derived Value / KDV, MLA-inspired)
 
@@ -446,13 +468,33 @@ K = W_K_DOWN @ x_normed          # [batch, seq, 512]
 V = W_V_FROM_K @ K + b_V         # [batch, seq, 512] — KDV: derived from K
 ```
 
-**Cache only K** (not K and V separately) to halve KV cache. V is
-recomputed at decode time via the learnable transform — the **Key-Derived
-Value (KDV)** contract: at every token, V is a fixed learned affine
-function of that token's cached key latent. The single cached latent
-loses no expressivity relative to caching K and V separately (both
-are linear in `c_kv`); this is the same trick as DeepSeek MLA's
-shared `c_KV`.
+**Cache only the latent** (not K and V separately) to halve KV-cache bytes;
+V is recomputed at decode via the learnable transform — the **Key-Derived
+Value (KDV)** contract: at every token, V is a fixed learned affine function
+of that token's cached key latent.
+
+**Expressivity — the honest accounting.** It is *not* accurate to say KDV
+"loses no expressivity." Split it into the two sides:
+
+- **V side: free.** `v_from_k` is a full `512→512` map, so V mixes across the
+  whole latent exactly as MLA's `W_UV` does — and that map is anyway
+  *absorbable* into `out_proj` (`W_O · Σ_j a_j (W c_j) = (W_O W) · Σ_j a_j c_j`),
+  so it costs no representational power beyond a per-block bias term. Nothing
+  is lost here.
+- **K side: a mild, accepted restriction.** K is the *identity* reshape of the
+  latent, whereas MLA's `K = W_UK · c` is a learned projection of the *full*
+  latent. Each KDV key head therefore sees only its own 64-dim slice, while an
+  MLA key head sees a learned 64-dim view of all 512 dims. Formally KDV's
+  attention-score function class is a **subset** of MLA's (MLA reproduces KDV
+  by setting `W_UK` block-identity; KDV cannot reproduce a cross-slice MLA
+  key). This was accepted on purpose: it is exactly what lets the cache hold
+  the raw latent with RoPE folded in (no decoupled channel, fewer bytes — §6.2),
+  and the lost cross-slice key mixing is judged marginal at this scale.
+  Revisit only if attention quality stalls.
+
+This is the same *family* as DeepSeek MLA's shared `c_KV` (one cached latent,
+K and V both linear in it), tuned toward minimal cache bytes rather than
+inference-time absorption — see the bandwidth argument in §6.2.
 
 ### 6.4 QK-Norm
 
