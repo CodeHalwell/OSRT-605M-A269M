@@ -1963,23 +1963,36 @@ def run_pretrain_extend(
         # 9_999_999 there).
         eval_interval = getattr(extend_cfg, "eval_interval", 0)
         if eval_interval and step > 0 and step % eval_interval == 0:
-            eval_metrics = run_eval(
-                model,
-                tokenizer_name,
-                seq_len,
-                batch_size,
-                getattr(extend_cfg, "eval_steps", 20),
-                device,
-                model_config.real_vocab_size,
-            )
-            print(
-                f"  EVAL step {step} | "
-                f"loss {eval_metrics['eval/loss']:.4f} | "
-                f"ppl {eval_metrics['eval/perplexity']:.1f}",
-                flush=True,
-            )
-            if use_wandb:
-                wandb.log(eval_metrics, step=step)
+            # Eval is BEST-EFFORT: it runs before the checkpoint block below,
+            # so an eval failure must NOT crash the run and lose the pending
+            # checkpoint (a DataLoader-worker death once took the whole process
+            # down at a 500-boundary, before step_*.pt was written). Catch,
+            # log, and fall through to the checkpoint save.
+            try:
+                eval_metrics = run_eval(
+                    model,
+                    tokenizer_name,
+                    seq_len,
+                    batch_size,
+                    getattr(extend_cfg, "eval_steps", 20),
+                    device,
+                    model_config.real_vocab_size,
+                )
+                print(
+                    f"  EVAL step {step} | "
+                    f"loss {eval_metrics['eval/loss']:.4f} | "
+                    f"ppl {eval_metrics['eval/perplexity']:.1f}",
+                    flush=True,
+                )
+                if use_wandb:
+                    wandb.log(eval_metrics, step=step)
+            except Exception as e:  # noqa: BLE001 — eval must never kill training
+                print(
+                    f"  EVAL step {step} FAILED ({type(e).__name__}: {e}) — "
+                    f"skipping eval, continuing to checkpoint.",
+                    flush=True,
+                )
+                model.train(True)  # run_eval set eval mode; restore train mode
 
         # ── Numbered checkpoints ───────────────────────────────────
         if step > 0 and step % extend_cfg.ckpt_interval == 0:
