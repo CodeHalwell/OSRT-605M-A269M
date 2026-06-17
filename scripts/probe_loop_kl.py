@@ -120,7 +120,7 @@ def main() -> int:
     ce_full, ppl_full = ce_ppl(full)
 
     rows = []
-    drop1_argmax = None  # argmax at L-1 loops, for the 6->5 flip-type analysis
+    argmax_by_k = {full_loops: full_argmax}   # per-loop-count argmax (valid pos)
     for k in range(2, full_loops):
         lg = logits_at(k)
         lp = F.log_softmax(lg[:, :-1, :], dim=-1).reshape(-1, rv)[valid]
@@ -131,8 +131,8 @@ def main() -> int:
         rows.append({"loops": k, "kl_full_given_k": round(kl, 4),
                      "top1_agree": round(top1, 4),
                      "ce": round(ce_k, 4), "ppl": round(ppl_k, 3)})
-        if k == full_loops - 1:
-            drop1_argmax = k_argmax
+        argmax_by_k[k] = k_argmax
+    drop1_argmax = argmax_by_k.get(full_loops - 1)  # 6->5 headline boundary
 
     # ---- 6->5 flip-type analysis: what KIND of token does the last loop
     # change its mind about, and are those flips low-confidence near-ties?
@@ -206,6 +206,30 @@ def main() -> int:
             flag = "  <LOW-N" if all_counts[c] < 20 else ""
             print(f"    {c:>20}  {flip_rate_by_cat[c]:>11.3f}  {enrich[c]:>6}  "
                   f"{flip_counts[c]:>4}/{all_counts[c]:<5}{flag}")
+
+        # All-boundary sweep: per-category P(flip) at each adjacent k->k+1, to
+        # test whether reasoning-token specialization lives in the early/mid
+        # loops (where the representational work happens) rather than the
+        # converged tail. gold_cat computed once and reused across boundaries.
+        gold_cat = [cat2(g) for g in gold_cpu]
+        boundary_rates = {}
+        for kk in range(2, full_loops):
+            fl = (argmax_by_k[kk] != argmax_by_k[kk + 1]).tolist()
+            allc = {c: 0 for c in cats}
+            flc = {c: 0 for c in cats}
+            for gc, f in zip(gold_cat, fl, strict=True):
+                allc[gc] += 1
+                if f:
+                    flc[gc] += 1
+            boundary_rates[f"{kk + 1}->{kk}"] = {
+                c: round(flc[c] / max(allc[c], 1), 3) for c in cats}
+        flip_report["per_boundary_flip_rate_by_category"] = boundary_rates
+        bnames = list(boundary_rates)
+        print("\n  ALL-BOUNDARY P(flip|cat) — is specialization in the early loops?")
+        print(f"    {'category':>20}  " + "  ".join(f"{b:>8}" for b in bnames))
+        for c in cats:
+            print(f"    {c:>20}  "
+                  + "  ".join(f"{boundary_rates[b][c]:>8.3f}" for b in bnames))
 
     report = {"ckpt": args.ckpt, "texts": args.texts, "full_loops": full_loops,
               "full_ce": round(ce_full, 4), "full_ppl": round(ppl_full, 3),

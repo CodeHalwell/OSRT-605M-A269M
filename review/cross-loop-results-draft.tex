@@ -65,21 +65,27 @@ $0.07,0.12,0.18,0.36$ vs $0.04,0.06,0.08,0.21$), so the usable knob is
 Top-1 agreement ($0.89$ at $6\!\to\!5$) \emph{overstates} the damage: the flipped
 tokens are low-confidence near-ties (full-model confidence $0.24$ at flipped vs
 $0.56$ at unflipped positions), so the faithful cost is the small KL/ppl move.
-Categorizing the flips by gold-token type (GSM8K, $\geq\!1.4$k digit and operator
-tokens) shows the last loop's perturbation is \emph{roughly uniform across
-content tokens} --- per-category flip rates $0.13$ (digit), $0.12$ (operator),
-$0.11$ (word), $0.09$ (connective) --- with only structural punctuation spared
-($0.06$). It neither targets nor avoids reasoning-relevant positions: we find
-\emph{no} depth-for-reasoning specialization, only depth spent broadly on
-low-confidence content. (An earlier small-batch run suggested operators never
-flip; that was a low-$N$ artifact, corrected here.) Two scopes bound the claim:
-flip rate is depth-\emph{sensitivity}, not correctness (it marks where the output
-moves between loops~5 and~6, not where it becomes right), and it is teacher-forced,
-not free-running generation. The per-loop auxiliary LM heads
+Categorizing the per-loop output revisions by gold-token type (GSM8K,
+$N\!=\!1904$ digit / $1418$ operator tokens) reveals \emph{where} depth is spent.
+At the converged tail ($6\!\to\!5$) the revisions are uniform across content
+tokens --- per-category flip rate $0.13$ (digit), $0.12$ (operator), $0.11$
+(word), with only punctuation spared ($0.06$) --- so the last loop does
+undifferentiated, low-stakes polish. But sweeping \emph{all} adjacent boundaries
+shows this is the tail of a front-loaded, reasoning-specialized process: at the
+first refinement boundary ($3\!\to\!2$) the model revises digits and logical
+connectives at $0.39$ and $0.34$ --- $1.7\times$ and $1.5\times$ the generic-word
+rate ($0.23$) --- and this enrichment decays monotonically to uniform by loop~6
+(digit $0.39\!\to\!0.27\!\to\!0.18\!\to\!0.13$). The recursion thus spends its
+\emph{early} depth disproportionately on reasoning-relevant tokens and its
+\emph{late} depth on lexical settling, mirroring the representational
+contraction. (The digit signal is robust at $N\!\approx\!1.9$k; the connective
+trend rests on $N\!=\!128$ and the operator enrichment is marginal.) Two scopes
+bound the claim: flip rate is depth-\emph{sensitivity}, not correctness (it marks
+where the output moves between loops, not where it becomes right), and it is
+teacher-forced, not free-running generation. The per-loop auxiliary LM heads
 (\S\ref{sec:aux-heads}), which train every depth to be decodable, are the
-mechanism by which a representationally near-redundant late loop still emits a
-coherent prediction. All thresholds are on the current mid-trained base (GSM8K
-ppl $11.9$, in-distribution); the droppable depth and any reasoning interaction
-should be re-measured after SFT/RL, and gated on whether the reasoning-on$>$off
-delta survives fewer loops --- a compute saving that erodes it is rejected
-regardless of throughput.
+mechanism by which these intermediate revisions are well-formed predictions.
+All figures are on the current mid-trained base (GSM8K ppl $11.9$,
+in-distribution); the generative behaviour, the post-SFT/RL picture, and whether
+the reasoning-on$>$off delta survives fewer loops remain to be measured --- a
+compute saving that erodes that delta is rejected regardless of throughput.

@@ -66,6 +66,36 @@
       "reasoning_connective": 0.094,
       "punct/space": 0.055,
       "word/other": 0.114
+    },
+    "per_boundary_flip_rate_by_category": {
+      "3->2": {
+        "digit": 0.389,
+        "math_op": 0.254,
+        "reasoning_connective": 0.336,
+        "punct/space": 0.196,
+        "word/other": 0.226
+      },
+      "4->3": {
+        "digit": 0.268,
+        "math_op": 0.147,
+        "reasoning_connective": 0.25,
+        "punct/space": 0.132,
+        "word/other": 0.188
+      },
+      "5->4": {
+        "digit": 0.184,
+        "math_op": 0.131,
+        "reasoning_connective": 0.18,
+        "punct/space": 0.098,
+        "word/other": 0.151
+      },
+      "6->5": {
+        "digit": 0.127,
+        "math_op": 0.119,
+        "reasoning_connective": 0.094,
+        "punct/space": 0.055,
+        "word/other": 0.114
+      }
     }
   }
 }
