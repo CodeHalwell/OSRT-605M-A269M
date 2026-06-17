@@ -137,6 +137,7 @@ Misc. (Norms, routers, etc.) & 45,857 & 45,857 \\
 \end{table*}
 
 \subsection{Depth-Recursive Backbone and Loop Embeddings}
+\label{sec:variable-loops}
 OSRT uses 3 physical decoder blocks unrolled 6 times to achieve 18 effective layers. To allow the shared weights to adapt to different depths, we introduce a \textbf{loop embedding} $\mathbf{e}_l \in \mathbb{R}^{D}$ at each loop step $l \in [0, 5]$:
 \begin{equation}
 \mathbf{x}_{l, b+1} = \text{RecursiveBlock}_b(\mathbf{x}_{l, b})
@@ -269,6 +270,7 @@ where $\gamma = 0.001$. This optimization is performed out-of-graph, ensuring th
 \section{Empirical Results and Lessons Learned}
 
 \subsection{Mitigating Loop Collapse}
+\label{sec:aux-heads}
 During the development of nano-osrt v5 (363M parameters), post-training evaluations using layer ablation revealed a severe failure mode: \textbf{loop collapse}. We observed that the final loop iteration ($l=5$) was performing approximately 90\% of the cross-entropy reduction, while intermediate loops ($l \in [0, 4]$) contributed negligible representational progress. The model had collapsed into a shallow network, wasting compute on earlier loops.
 
 To force intermediate loops to build useful representations, we implemented two mechanisms:
@@ -283,6 +285,94 @@ Following these fixes, cross-entropy evaluations showed monotonic, balanced prog
 
 \subsection{Optimization Efficiency}
 Pretraining runs comparing Muon to the Lion optimizer on the OSRT architecture demonstrated a massive sample efficiency gap. Under identical training data mixtures and context windows, Muon achieved a final cross-entropy loss of \textbf{3.43} within 1200 steps, whereas the Lion baseline achieved only \textbf{7.4}. This represents a 4-point cross-entropy advantage, which translates to a $>40\%$ saving in training FLOPs.
+
+% --- inserted: cross-loop representational dynamics (P0 probe) ---
+\subsection{Cross-loop representational dynamics}
+
+We ask whether the recursive stack puts \emph{distinct} information in the
+per-loop key/value latents, both to test the recursion-as-iterative-refinement
+premise and to gate a candidate optimization: collapsing the $L{=}6$ per-loop KV
+caches of each physical block into one (a potential $6\times$ decode-bandwidth
+reduction stacking on KDV's $2\times$). The probe is forward-only --- a single
+\texttt{use\_cache=True} pass over a held-out batch, no training --- and dumps,
+per physical block, the cross-loop linear CKA of the cached latents
+$\mathbf{c}_{\text{kv}}$, the per-token cosine, and the \emph{injected} relative
+$L_2$ error a reuse scheme would impose.
+
+\paragraph{The reuse hypothesis is falsified.} Forcing every loop to reuse
+loop~0's latent injects a mean relative $L_2$ error of $\approx\!1.02\text{--}1.04$
+--- the perturbation is as large as the signal itself --- and a two-group split
+(cache 2 of 6) still costs $0.50\text{--}0.97$. Block~0 is the strongest evidence:
+its post-loop-0 cosine to loop~0 is \emph{negative} ($\approx\!-0.4$) while CKA
+stays structured ($0.52$), i.e.\ later loops occupy a related subspace under a
+sign-flip, not noise. Cross-loop KV sharing is therefore rejected for this model;
+a low-rank per-loop delta is the only variant left, and only if decode bandwidth
+later becomes binding.
+
+\paragraph{The recursion is a non-degenerate contracting iteration.} The same
+data yields a positive structural result. Adjacent-loop similarity rises
+monotonically along the chain, so the per-step representational move
+$1-\mathrm{CKA}(k,k{+}1)$ \emph{shrinks} --- in block~0,
+$\{0.30, 0.17, 0.07, 0.05, 0.05\}$ --- and the late loops converge to a near
+fixed point ($\mathrm{CKA}(4,5)\!\approx\!0.95$). Loop~0 acts as an encoding pass
+(the sign-flip above); loops $1{\to}5$ form a diminishing refinement trajectory.
+Three independent signals captured on the \emph{same} forward agree: (i) the
+KV-CKA contraction above; (ii) the residual update magnitude
+$\lVert\Delta x\rVert/\lVert x\rVert$ is strongly front-loaded
+($12.7 \to 0.9 \to \dots \to 0.5$ across loops in block~0); and (iii) the MoE
+\emph{per-token} routing entropy rises from $0.91$ nats at loop~0 to
+$\approx\!1.98$ ($\ln 8 = 2.08$) at later loops --- the router commits sharply in
+the encoding pass and then refines diffusely, a genuine per-token spread rather
+than mere aggregate load balance. The effect is carried by block~0; the deeper
+physical blocks route broadly throughout and instead show a small terminal
+uptick at the final loop, consistent with interior contraction followed by
+output shaping.
+
+\paragraph{Robustness.} The structure is stable across three disjoint probe
+batches (math, general-domain, mixed): mean $\mathrm{CKA}(\cdot,\text{loop}_0) =
+0.656 / 0.687 / 0.656$ and mean first-share $L_2 = 1.04 / 1.02 / 1.04$, and the
+finding independently reproduced on a separately seeded run. The contraction is
+thus not an artifact of the math-heavy default text.
+
+\paragraph{Corollary: a narrow inference knob, with no reasoning-token
+specialization.} The contraction motivates the variable-loop knob
+(\S\ref{sec:variable-loops}), but representation convergence is \emph{not}
+output equivalence; we measure the output shift directly via token-level
+$\mathrm{KL}\!\left(P_{L=6}\,\|\,P_{L=k}\right)$ (teacher-forced on gold context).
+Only the final loop is cheap to drop ($6\!\to\!5$: KL $0.07$, $+6\%$ ppl on
+GSM8K), and the per-dropped-loop cost is \emph{superlinear} --- the inverse of
+the contraction curve: late loops do the least representational work yet sit
+nearest the LM head, where the map has highest gain. On reasoning-dense text the
+cost is steeper than on general text (marginal $\Delta$KL
+$0.07,0.12,0.18,0.36$ vs $0.04,0.06,0.08,0.21$), so the usable knob is
+\emph{one} loop and is more conservative the more the input resembles the task.
+Top-1 agreement ($0.89$ at $6\!\to\!5$) \emph{overstates} the damage: the flipped
+tokens are low-confidence near-ties (full-model confidence $0.24$ at flipped vs
+$0.56$ at unflipped positions), so the faithful cost is the small KL/ppl move.
+Categorizing the per-loop output revisions by gold-token type (GSM8K,
+$N\!=\!1904$ digit / $1418$ operator tokens) reveals \emph{where} depth is spent.
+At the converged tail ($6\!\to\!5$) the revisions are uniform across content
+tokens --- per-category flip rate $0.13$ (digit), $0.12$ (operator), $0.11$
+(word), with only punctuation spared ($0.06$) --- so the last loop does
+undifferentiated, low-stakes polish. But sweeping \emph{all} adjacent boundaries
+shows this is the tail of a front-loaded, reasoning-specialized process: at the
+first refinement boundary ($3\!\to\!2$) the model revises digits and logical
+connectives at $0.39$ and $0.34$ --- $1.7\times$ and $1.5\times$ the generic-word
+rate ($0.23$) --- and this enrichment decays monotonically to uniform by loop~6
+(digit $0.39\!\to\!0.27\!\to\!0.18\!\to\!0.13$). The recursion thus spends its
+\emph{early} depth disproportionately on reasoning-relevant tokens and its
+\emph{late} depth on lexical settling, mirroring the representational
+contraction. (The digit signal is robust at $N\!\approx\!1.9$k; the connective
+trend rests on $N\!=\!128$ and the operator enrichment is marginal.) Two scopes
+bound the claim: flip rate is depth-\emph{sensitivity}, not correctness (it marks
+where the output moves between loops, not where it becomes right), and it is
+teacher-forced, not free-running generation. The per-loop auxiliary LM heads
+(\S\ref{sec:aux-heads}), which train every depth to be decodable, are the
+mechanism by which these intermediate revisions are well-formed predictions.
+All figures are on the current mid-trained base (GSM8K ppl $11.9$,
+in-distribution); the generative behaviour, the post-SFT/RL picture, and whether
+the reasoning-on$>$off delta survives fewer loops remain to be measured --- a
+compute saving that erodes that delta is rejected regardless of throughput.
 
 \section{Conclusion}
 We have presented OSRT, an architecture that combines depth-recursive transformers, hybrid Mixture of Experts, and Manifold-Constrained Hyper-Connections. By projecting residual mixing matrices onto the Birkhoff polytope via log-domain Sinkhorn normalization, OSRT guarantees numerical stability across deep recurrent stacks. Optimized via Muon and speculative Multi-Token Prediction, OSRT-600M provides a viable framework for high-efficiency, memory-bandwidth-friendly LLM deployment.
