@@ -51,6 +51,10 @@ def main() -> int:
     ap.add_argument("--ckpt", default="checkpoints/v5/osrt_v5_midtrain_final.pt")
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
     ap.add_argument("--texts", choices=["math", "general", "mixed"], default="general")
+    ap.add_argument("--text-file", default=None,
+                    help="One example per line; overrides --texts. Use a "
+                         "reasoning-token-dense corpus (e.g. GSM8K) so the "
+                         "math_op/connective flip-type categories have real N.")
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", default=None)
@@ -66,8 +70,13 @@ def main() -> int:
               else torch.device("cpu"))
     print(f"device={device}", flush=True)
 
-    texts = {"math": MATH_PROBE_TEXTS, "general": GENERAL_PROBE_TEXTS,
-             "mixed": MATH_PROBE_TEXTS + GENERAL_PROBE_TEXTS}[args.texts]
+    if args.text_file:
+        texts = [ln for ln in Path(args.text_file).read_text().splitlines()
+                 if ln.strip()]
+        print(f"loaded {len(texts)} examples from {args.text_file}", flush=True)
+    else:
+        texts = {"math": MATH_PROBE_TEXTS, "general": GENERAL_PROBE_TEXTS,
+                 "mixed": MATH_PROBE_TEXTS + GENERAL_PROBE_TEXTS}[args.texts]
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -172,6 +181,9 @@ def main() -> int:
         # over-representation = (flip share of category) / (overall share)
         enrich = {c: round((flip_counts[c] / n_flip) /
                            max(all_counts[c] / n_all, 1e-9), 2) for c in cats}
+        # P(flip | category) — the legible metric ("digits flip 22% vs words 9%").
+        flip_rate_by_cat = {c: round(flip_counts[c] / max(all_counts[c], 1), 3)
+                            for c in cats}
         flip_report = {
             "boundary": f"{full_loops}->{full_loops - 1}",
             "flip_rate": round(float(flip.float().mean()), 4),
@@ -182,15 +194,18 @@ def main() -> int:
             "gold_category_counts_all": all_counts,
             "gold_category_counts_flipped": flip_counts,
             "enrichment_flip_vs_all": enrich,
+            "flip_rate_by_category": flip_rate_by_cat,
         }
         print("\n6->5 FLIP-TYPE ANALYSIS (gold-token category at flipped positions)")
         print(f"  flip rate {flip_report['flip_rate']:.3f} | mean full-model "
               f"confidence: flipped {flip_report['mean_conf_flipped']} vs "
               f"unflipped {flip_report['mean_conf_unflipped']}")
-        print(f"  enrichment (flip share / overall share), >1 = over-represented:")
+        print(f"  {'category':>22}  {'P(flip|cat)':>11}  {'enrich':>6}  "
+              f"{'flip/all':>10}")
         for c in cats:
-            print(f"    {c:>22}: {enrich[c]:>5}  "
-                  f"({flip_counts[c]}/{all_counts[c]})")
+            flag = "  <LOW-N" if all_counts[c] < 20 else ""
+            print(f"    {c:>20}  {flip_rate_by_cat[c]:>11.3f}  {enrich[c]:>6}  "
+                  f"{flip_counts[c]:>4}/{all_counts[c]:<5}{flag}")
 
     report = {"ckpt": args.ckpt, "texts": args.texts, "full_loops": full_loops,
               "full_ce": round(ce_full, 4), "full_ppl": round(ppl_full, 3),

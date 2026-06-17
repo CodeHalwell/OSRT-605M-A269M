@@ -50,32 +50,36 @@ batches (math, general-domain, mixed): mean $\mathrm{CKA}(\cdot,\text{loop}_0) =
 finding independently reproduced on a separately seeded run. The contraction is
 thus not an artifact of the math-heavy default text.
 
-\paragraph{Corollary: a narrow but safe inference knob.} The contraction
-motivates the variable-loop knob (\S\ref{sec:variable-loops}), but representation
-convergence is \emph{not} output equivalence; we measure the output shift
-directly via token-level $\mathrm{KL}\!\left(P_{L=6}\,\|\,P_{L=k}\right)$ on the
-same batches. Only the final loop is cheap to drop ($6\!\to\!5$: KL $0.04$,
-$+6\%$ ppl), and the per-dropped-loop cost is \emph{superlinear} ($\Delta$KL
-$=0.04, 0.06, 0.08, 0.21$) --- the exact inverse of the contraction curve: late
-loops do the least representational work yet sit nearest the LM head, where the
-map has highest gain. The usable knob is thus \emph{one} loop, not the 2--3 the
-CKA plateau invites. Top-1 agreement ($0.85$ at $6\!\to\!5$) \emph{overstates}
-the damage: the flipped tokens are low-confidence near-ties (full-model
-confidence $0.18$ at flipped vs $0.46$ at unflipped positions), so the faithful
-cost is the small KL/ppl move. Categorizing the flips by gold-token type sharpens
-it further --- the last loop \emph{never} changes a mathematical operator or
-logical connective and under-weights digits (type enrichment $0.0/0.0/0.3$ vs
-$1.16$ for generic words), revising only uncertain function-word choices.
-Reasoning-critical tokens are therefore settled by loop~5 and left untouched by
-loop~6, making the drop safe precisely where reasoning lives --- though it also
-means the last loop's marginal computation is lexical polish, not reasoning, so
-we make no claim that depth is spent \emph{on} reasoning tokens. The per-loop
-auxiliary LM heads (\S\ref{sec:aux-heads}), which train every depth to be
-decodable, are the mechanism by which a representationally near-redundant late
-loop still emits a coherent prediction. All thresholds are reported on the
-current mid-trained base (general/mixed batches agree to within $\sim\!1\%$ ppl);
-the droppable depth should be re-measured after SFT/RL, since a better-trained
-model may reach its fixed point --- and lock its reasoning tokens --- at a
-different loop. The accuracy check (does the reasoning-on$>$off delta survive
-fewer loops?) is deferred to a checkpoint exhibiting such a delta, since a
-compute saving that erodes it is rejected regardless of throughput.
+\paragraph{Corollary: a narrow inference knob, with no reasoning-token
+specialization.} The contraction motivates the variable-loop knob
+(\S\ref{sec:variable-loops}), but representation convergence is \emph{not}
+output equivalence; we measure the output shift directly via token-level
+$\mathrm{KL}\!\left(P_{L=6}\,\|\,P_{L=k}\right)$ (teacher-forced on gold context).
+Only the final loop is cheap to drop ($6\!\to\!5$: KL $0.07$, $+6\%$ ppl on
+GSM8K), and the per-dropped-loop cost is \emph{superlinear} --- the inverse of
+the contraction curve: late loops do the least representational work yet sit
+nearest the LM head, where the map has highest gain. On reasoning-dense text the
+cost is steeper than on general text (marginal $\Delta$KL
+$0.07,0.12,0.18,0.36$ vs $0.04,0.06,0.08,0.21$), so the usable knob is
+\emph{one} loop and is more conservative the more the input resembles the task.
+Top-1 agreement ($0.89$ at $6\!\to\!5$) \emph{overstates} the damage: the flipped
+tokens are low-confidence near-ties (full-model confidence $0.24$ at flipped vs
+$0.56$ at unflipped positions), so the faithful cost is the small KL/ppl move.
+Categorizing the flips by gold-token type (GSM8K, $\geq\!1.4$k digit and operator
+tokens) shows the last loop's perturbation is \emph{roughly uniform across
+content tokens} --- per-category flip rates $0.13$ (digit), $0.12$ (operator),
+$0.11$ (word), $0.09$ (connective) --- with only structural punctuation spared
+($0.06$). It neither targets nor avoids reasoning-relevant positions: we find
+\emph{no} depth-for-reasoning specialization, only depth spent broadly on
+low-confidence content. (An earlier small-batch run suggested operators never
+flip; that was a low-$N$ artifact, corrected here.) Two scopes bound the claim:
+flip rate is depth-\emph{sensitivity}, not correctness (it marks where the output
+moves between loops~5 and~6, not where it becomes right), and it is teacher-forced,
+not free-running generation. The per-loop auxiliary LM heads
+(\S\ref{sec:aux-heads}), which train every depth to be decodable, are the
+mechanism by which a representationally near-redundant late loop still emits a
+coherent prediction. All thresholds are on the current mid-trained base (GSM8K
+ppl $11.9$, in-distribution); the droppable depth and any reasoning interaction
+should be re-measured after SFT/RL, and gated on whether the reasoning-on$>$off
+delta survives fewer loops --- a compute saving that erodes it is rejected
+regardless of throughput.
