@@ -106,24 +106,95 @@ def main() -> int:
     full = logits_at(full_loops)
     full_lp = F.log_softmax(full[:, :-1, :], dim=-1).reshape(-1, rv)[valid]
     full_p = full_lp.exp()
-    full_argmax = full[:, :-1, :].reshape(-1, rv)[valid].argmax(-1)
+    full_logits_valid = full[:, :-1, :].reshape(-1, rv)[valid]
+    full_argmax = full_logits_valid.argmax(-1)
     ce_full, ppl_full = ce_ppl(full)
 
     rows = []
+    drop1_argmax = None  # argmax at L-1 loops, for the 6->5 flip-type analysis
     for k in range(2, full_loops):
         lg = logits_at(k)
         lp = F.log_softmax(lg[:, :-1, :], dim=-1).reshape(-1, rv)[valid]
         kl = float((full_p * (full_lp - lp)).sum(-1).mean())   # KL(full || k)
-        top1 = float((lg[:, :-1, :].reshape(-1, rv)[valid].argmax(-1)
-                      == full_argmax).float().mean())
+        k_argmax = lg[:, :-1, :].reshape(-1, rv)[valid].argmax(-1)
+        top1 = float((k_argmax == full_argmax).float().mean())
         ce_k, ppl_k = ce_ppl(lg)
         rows.append({"loops": k, "kl_full_given_k": round(kl, 4),
                      "top1_agree": round(top1, 4),
                      "ce": round(ce_k, 4), "ppl": round(ppl_k, 3)})
+        if k == full_loops - 1:
+            drop1_argmax = k_argmax
+
+    # ---- 6->5 flip-type analysis: what KIND of token does the last loop
+    # change its mind about, and are those flips low-confidence near-ties?
+    import re
+
+    def categorize(tid: int) -> str:
+        s = tok.decode([int(tid)]).strip().lower()
+        if not s:
+            return "punct/space"
+        if any(c.isdigit() for c in s):
+            return "digit"
+        if all(not c.isalnum() for c in s):
+            return "punct/space"
+        if s in {"therefore", "thus", "hence", "because", "since", "so",
+                 "if", "then", "implies", "equals"}:
+            return "reasoning_connective"
+        return "word/other"
+
+    flip_report = None
+    if drop1_argmax is not None:
+        flip = (drop1_argmax != full_argmax)                  # (N_valid,) bool
+        conf = full_p.max(-1).values                          # full-model top prob
+        cats = ["digit", "math_op", "reasoning_connective", "punct/space",
+                "word/other"]
+        # math operators live in the gold token string; fold into categorize via
+        # a quick override set.
+        op_chars = set("+-*/=<>%^")
+
+        def cat2(tid: int) -> str:
+            s = tok.decode([int(tid)]).strip()
+            if s and all(c in op_chars for c in s):
+                return "math_op"
+            return categorize(tid)
+
+        gold_cpu = gold.tolist()
+        flip_cpu = flip.tolist()
+        all_counts = {c: 0 for c in cats}
+        flip_counts = {c: 0 for c in cats}
+        for g, f in zip(gold_cpu, flip_cpu, strict=True):
+            c = cat2(g)
+            all_counts[c] += 1
+            if f:
+                flip_counts[c] += 1
+        n_all = max(sum(all_counts.values()), 1)
+        n_flip = max(sum(flip_counts.values()), 1)
+        # over-representation = (flip share of category) / (overall share)
+        enrich = {c: round((flip_counts[c] / n_flip) /
+                           max(all_counts[c] / n_all, 1e-9), 2) for c in cats}
+        flip_report = {
+            "boundary": f"{full_loops}->{full_loops - 1}",
+            "flip_rate": round(float(flip.float().mean()), 4),
+            "mean_conf_flipped": round(float(conf[flip].mean()), 4)
+            if flip.any() else None,
+            "mean_conf_unflipped": round(float(conf[~flip].mean()), 4)
+            if (~flip).any() else None,
+            "gold_category_counts_all": all_counts,
+            "gold_category_counts_flipped": flip_counts,
+            "enrichment_flip_vs_all": enrich,
+        }
+        print("\n6->5 FLIP-TYPE ANALYSIS (gold-token category at flipped positions)")
+        print(f"  flip rate {flip_report['flip_rate']:.3f} | mean full-model "
+              f"confidence: flipped {flip_report['mean_conf_flipped']} vs "
+              f"unflipped {flip_report['mean_conf_unflipped']}")
+        print(f"  enrichment (flip share / overall share), >1 = over-represented:")
+        for c in cats:
+            print(f"    {c:>22}: {enrich[c]:>5}  "
+                  f"({flip_counts[c]}/{all_counts[c]})")
 
     report = {"ckpt": args.ckpt, "texts": args.texts, "full_loops": full_loops,
               "full_ce": round(ce_full, 4), "full_ppl": round(ppl_full, 3),
-              "rows": rows}
+              "rows": rows, "flip_types": flip_report}
     print("\n" + "=" * 60)
     print(f"VARIABLE-LOOP OUTPUT PERTURBATION (full L={full_loops}, "
           f"ppl={ppl_full:.2f})")
