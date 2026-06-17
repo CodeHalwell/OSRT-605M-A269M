@@ -15,13 +15,24 @@ physical block and, per block, measure how much loop k's latent resembles the
 latent that a reuse scheme would force it to share.
 
 Metrics per physical block (padding tokens masked out):
-  - linear CKA across the 6 loops (rotation/scale-invariant representation match)
+  - linear CKA across the loops (rotation/scale-invariant representation match),
+    incl. the adjacent-loop contraction series 1-CKA(k,k+1) — a monotonically
+    shrinking move size is the fixed-point/DEQ-like contraction signature.
   - mean per-token cosine(loop_k, loop_0)
   - INJECTED relative-L2 error for two concrete schemes:
       * first-loop share  (cache loop 0 only; loops 1..L-1 reuse it)  -> ~6x
-      * grouped g=3       (cache loops 0 and L/2; reuse within halves) -> ~3x
+      * two-group split   (cache loops 0 and L/2; reuse within halves) -> ~3x
     This is literally the perturbation the scheme imposes, so it is the most
     decision-relevant number.
+
+Triangulation (all from the SAME forward, so the signals are comparable):
+  - residual update |dx|/|x| per (block, loop)  [last_loop_update_norm]
+  - per-loop routing entropy (marginal + per-token)  [block.moe telemetry]
+  Three independent signals showing the same front-loaded contraction is a far
+  stronger non-degeneracy claim than KV-CKA alone.
+
+Robustness: --texts {math,general,mixed} swaps the built-in batch so the
+cross-loop structure can be confirmed off the math-heavy default.
 
 Interpretation hint (heuristic, not a hard rule):
   CKA(loop_k, loop_0) high (>~0.9) AND injected first-share error low (<~0.10)
@@ -79,6 +90,27 @@ DEFAULT_PROBE_TEXTS = [
     "Twelve divided by four equals three, and three times four equals twelve.",
 ]
 
+# A non-math, general-domain batch for the robustness re-run (--texts general):
+# confirms the cross-loop structure is not an artifact of the math-heavy default.
+GENERAL_PROBE_TEXTS = [
+    "The Roman Empire reached its greatest territorial extent under Trajan.",
+    "She opened the window and listened to the rain falling on the quiet street.",
+    "Coffee is one of the most widely traded commodities in the world.",
+    "The novel follows a young cartographer who maps a city that keeps changing.",
+    "Most migratory birds navigate using a combination of the sun and magnetic fields.",
+    "He had never seen the ocean before, and the size of it stopped him cold.",
+    "The committee postponed the vote until the following Tuesday afternoon.",
+    "Old libraries smell of paper, dust, and the slow patience of decades.",
+    "The recipe calls for letting the dough rest overnight in the refrigerator.",
+    "After the storm, the villagers spent the week repairing their fishing boats.",
+    "Jazz emerged in New Orleans before spreading north along the Mississippi.",
+    "The interview lasted an hour, but the real conversation happened afterward.",
+    "A good map tells you not only where you are but where you might go.",
+    "The garden was overgrown, yet somehow more beautiful for the neglect.",
+    "Negotiations broke down late in the evening over a single disputed clause.",
+    "They walked home in comfortable silence, the city humming around them.",
+]
+
 
 def _masked_rows(latent, mask):
     """(B, S, D) latent + (B, S) bool mask -> (N_valid, D) of non-pad rows."""
@@ -119,6 +151,9 @@ def main() -> int:
     ap.add_argument("--ckpt", default="checkpoints/v5/osrt_v5_midtrain_final.pt")
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
     ap.add_argument("--text-file", default=None, help="One probe example per line.")
+    ap.add_argument("--texts", choices=["math", "general", "mixed"], default="math",
+                    help="Built-in probe set (ignored if --text-file is given). "
+                         "Use 'general' for the robustness re-run.")
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
@@ -144,10 +179,15 @@ def main() -> int:
     print(f"device={device} dtype={args.dtype}", flush=True)
 
     # ---- tokenizer + input batch ------------------------------------------
-    texts = DEFAULT_PROBE_TEXTS
     if args.text_file:
         texts = [ln for ln in Path(args.text_file).read_text().splitlines()
                  if ln.strip()]
+    elif args.texts == "general":
+        texts = GENERAL_PROBE_TEXTS
+    elif args.texts == "mixed":
+        texts = DEFAULT_PROBE_TEXTS + GENERAL_PROBE_TEXTS
+    else:
+        texts = DEFAULT_PROBE_TEXTS
 
     tok = None
     if not args.tiny:
@@ -211,6 +251,11 @@ def main() -> int:
     model = model.to(device=device, dtype=dtype).eval()
     input_ids, attn = input_ids.to(device), attn.to(device)
 
+    # Arm the loop-collapse hook (last_loop_update_norm) + per-MoE-layer routing
+    # telemetry so a SINGLE forward yields all three triangulation signals on the
+    # same batch: KV-latent CKA, residual-update norm, per-loop routing entropy.
+    model.set_moe_telemetry(True)
+
     # ---- forward, capture per-(loop, block) latents ------------------------
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=attn, use_cache=True)
@@ -218,6 +263,15 @@ def main() -> int:
     n_blocks, n_loops = cfg.num_blocks, cfg.recursive_loops
     assert len(latents) == n_blocks * n_loops, (
         f"expected {n_blocks * n_loops} latents, got {len(latents)}")
+
+    # Telemetry from the same forward. update_norm is indexed per effective layer
+    # (idx = loop*n_blocks + block_idx, like the latents); routing entropy lives
+    # per loop on each physical block's MoE.
+    inner = model.model
+    upd_norm = list(inner.last_loop_update_norm)  # len n_blocks*n_loops
+
+    def _moe_stat(b: int, name: str) -> list[float]:
+        return [round(float(v), 4) for v in getattr(inner.blocks[b].moe, name)]
 
     # Guard against an all-padding/empty batch: _masked_rows would return empty
     # tensors and every metric would be NaN / divide-by-zero.
@@ -264,10 +318,27 @@ def main() -> int:
         )
         grouped_mean = round(sum(grouped_err) / max(len(grouped_err), 1), 4)
 
+        # Contraction series: adjacent-loop CKA(k, k+1) and the per-step KV move
+        # size 1-CKA. A monotonically shrinking move size is the fixed-point /
+        # DEQ-like contraction signature (the headline mechanistic claim).
+        adj_cka = [cka[k][k + 1] for k in range(n_loops - 1)]
+        kv_move = [round(1.0 - a, 4) for a in adj_cka]
+
+        # Triangulation signals from the SAME forward, regrouped per loop:
+        #  - residual update |dx|/|x| at this (block, loop) effective layer
+        #  - per-loop routing entropy (marginal = balance, per-token = sharpness)
+        upd = [round(float(upd_norm[loop * n_blocks + b]), 4)
+               for loop in range(n_loops)]
+        route_marg = _moe_stat(b, "last_marginal_entropy")
+        route_tok = _moe_stat(b, "last_per_token_entropy")
+
         block_report = {
             "block": b, "cka_matrix": cka, "cosine_vs_loop0": cos0,
             "first_share_rel_l2": first_err, "first_share_rel_l2_mean": first_mean,
             "two_group_split_rel_l2_mean": grouped_mean,
+            "adjacent_cka": adj_cka, "kv_move_size": kv_move,
+            "loop_update_norm": upd, "route_marginal_entropy": route_marg,
+            "route_per_token_entropy": route_tok,
         }
         report["blocks"].append(block_report)
 
@@ -275,6 +346,9 @@ def main() -> int:
         print(f"  cosine(loop_k, loop_0): {cos0}")
         print(f"  CKA(loop_k, loop_0):    "
               f"{[cka[0][k] for k in range(n_loops)]}")
+        print(f"  contraction — KV move 1-CKA(k,k+1): {kv_move}")
+        print(f"  triangulate — update |dx|/|x|/loop: {upd}")
+        print(f"  triangulate — route entropy (marg): {route_marg}")
         print(f"  injected rel-L2 if FIRST-LOOP SHARE (caches 1 of {n_loops} "
               f"= {n_loops}x): per-loop {first_err} => mean {first_mean}")
         print(f"  injected rel-L2 if 2-GROUP SPLIT (caches 2 of {n_loops} "

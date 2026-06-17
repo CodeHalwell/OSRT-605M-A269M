@@ -112,12 +112,28 @@ loss holds → variant 4 only if P0 says per-loop KV is information-rich.**
 
 ## 6. Measurement plan (cheap, before any GPU spend)
 
-**P0 — does per-loop KV actually differ? (no training)**
-Run the existing mid-trained base on a held-out batch with telemetry, dump the
-per-`(loop, block)` latents `c_kv`, and compute, per physical block, the
-cross-loop cosine / linear CKA of the latents. If loop-to-loop latents
-are near-collinear, full share (variant 2) is nearly free; if they fan out,
-prefer variant 4. This is a forward-only probe — hours, not dollars.
+**P0 — does per-loop KV actually differ? (no training)** —
+`scripts/probe_cross_loop_kv.py`. Run the mid-trained base on a held-out batch
+with telemetry; per physical block, dump cross-loop cosine / linear CKA of the
+`c_kv` latents, the adjacent-loop contraction series `1-CKA(k,k+1)`, and the
+injected rel-L2 of each reuse scheme. If loops are near-collinear, full share is
+nearly free; if they fan out, reuse is off the table. Forward-only — hours, not
+dollars.
+
+> **RESULT (2026-06-16, `midtrain_final`):** reuse is OFF — mean injected
+> rel-L2 ≈ 1.04 (block 0 = 1.52, loops anti-correlated to loop 0). The loops
+> carry *distinct* KV; the adjacent-CKA move size shrinks monotonically
+> (block 0: 0.30, 0.17, 0.07, 0.05, 0.05) — a **contracting fixed-point
+> iteration** (loop 0 = encoding pass; later loops refine less, converging by
+> loops 4–5). Triangulated by the same-forward `last_loop_update_norm`
+> (front-loaded |dx|/|x|, ~13→0.5) and per-loop routing telemetry. Non-degenerate
+> recursion confirmed; KV reuse rejected. Live corollary: the convergence by
+> loops 4–5 empirically supports the variable-loop knob (§12.2) — validate the
+> drop-to-4/5 lever at the logit/accuracy level, not just representation CKA.
+
+The probe captures all three triangulation signals (KV-CKA, residual-update
+norm, per-loop routing entropy) on one forward; `--texts general|mixed` repeats
+it off the math-heavy default for robustness.
 
 **P1 — tiny-config ablation (CPU/1-GPU).**
 Using `tests/test_model.py::tiny_config` (dim=128, 2 blocks, 2 loops), train
