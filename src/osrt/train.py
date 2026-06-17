@@ -256,6 +256,13 @@ def run_eval(
             tokenizer_name=tokenizer_name,
             batch_size=batch_size,
             step_num=999999,  # fixed seed, never matches training seeds
+            # In-process loading (no worker subprocesses). Eval fetches
+            # eval_steps batches exactly ONCE and caches them, so workers buy
+            # nothing — and spawning a fresh worker pool on top of the running
+            # training workers crashed mid-run on a semaphore/shared-memory
+            # failure (DataLoader worker SemLock._rebuild -> FileNotFoundError,
+            # "leaked semaphore objects"). num_workers=0 removes that surface.
+            num_workers=0,
         )
         data_iter = iter(loader)
         cached = []
