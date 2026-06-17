@@ -40,6 +40,13 @@ def main() -> int:
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
     ap.add_argument("--total-steps", type=int, default=4000,
                     help="cosine target; ~4000 ≈ ~1.1B tokens ≈ ~$110")
+    ap.add_argument("--peak-lr", type=float, default=None,
+                    help="override AdamW peak LR (Muon scales proportionally). "
+                         "The default 1e-4 re-warm was too hot for an annealed "
+                         "base (ppl 30→34, flat); ~3e-5 is a gentler continue. "
+                         "Applies on resume via the cosine at the resumed step.")
+    ap.add_argument("--min-lr", type=float, default=None,
+                    help="override cosine floor (default 1e-5)")
     ap.add_argument("--sanity", action="store_true",
                     help="run the 30-step MidtrainExtendSanityConfig gate")
     args = ap.parse_args()
@@ -73,7 +80,21 @@ def main() -> int:
         args.ckpt_dir, "osrt_v5_midtrain_final.pt")
     if not args.sanity:
         cfg.total_steps = args.total_steps
-    else:
+
+    # Optional LR override. The Muon group is kept proportional to the AdamW
+    # peak (the config's fixed ratio), and the cosine floor scales too — so
+    # lowering --peak-lr gives a gentler continue without yanking the annealed
+    # base out of its basin. On resume the schedule is evaluated at the
+    # resumed step, so the LR simply picks up lower from there.
+    muon_ratio = cfg.muon_lr / cfg.peak_lr  # fixed in the config (~33)
+    if args.peak_lr is not None:
+        cfg.peak_lr = args.peak_lr
+        cfg.muon_lr = args.peak_lr * muon_ratio
+    if args.min_lr is not None:
+        cfg.min_lr = args.min_lr
+    cfg.muon_min_lr = cfg.min_lr * muon_ratio
+
+    if args.sanity:
         cfg.wandb_log = False
 
     ph = cfg.phases["extend"]
