@@ -245,10 +245,12 @@ def test_midtrain_extend_config_values():
     # extended continued-pretrain from the clean midtrain base
     assert c.pretrained_checkpoint.endswith("osrt_v5_midtrain_final.pt")
     assert c.stage_prefix == "midtrain2"
-    # fresh re-warm cosine, gentler than midtrain's 2e-4 (base more cooked)
-    assert c.peak_lr == 1e-4 and c.min_lr == 1e-5
+    # GENTLE re-warm cosine (the 1e-4 was too hot: ppl rose 30→34, flat)
+    assert c.peak_lr == 3e-5 and c.min_lr == 1e-5
     assert c.lr_anchor_step == 0
-    assert c.total_steps == 4_000
+    # sized for one ~$30 Modal workspace (~1000 steps)
+    assert c.total_steps == 1_000
+    assert c.dataloader_num_workers == 1
     # native HRA + checkpointing carried from MidtrainConfig
     assert c.hra_native is True and c.gradient_checkpointing is True
     ph = c.phases["extend"]

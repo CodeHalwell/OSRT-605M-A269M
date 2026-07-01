@@ -1347,17 +1347,24 @@ class MidtrainExtendConfig(MidtrainConfig):
     undertrained base. Resume from midtrain_final; reassess capability after.
     """
 
-    total_steps: int = 4_000
-    warmup_steps: int = 100
+    # Sized for a single ~$30 Modal workspace (~1000 H100-steps): a clean,
+    # fully-annealed short gentle-LR probe from midtrain_final. If it lowers
+    # ppl, chain another workspace (resume from midtrain2_step_1000); if flat,
+    # the base is saturated → SFT v2 from midtrain_final. --total-steps on the
+    # Lightning entry overrides this for a longer run.
+    total_steps: int = 1_000
+    warmup_steps: int = 50
     lr_anchor_step: int = 0           # fresh re-warm cosine over the full run
-    peak_lr: float = 1e-4             # below midtrain's 2e-4 (base more cooked)
+    peak_lr: float = 3e-5             # GENTLE re-warm — the 1e-4 was too hot for
+                                      # an annealed base (ppl rose 30→34, flat)
     min_lr: float = 1e-5
-    muon_lr: float = 3.3e-3           # proportional to the AdamW peak
+    muon_lr: float = 9.9e-4           # proportional to the AdamW peak (×33)
     muon_min_lr: float = 3.3e-4
 
-    eval_interval: int = 500          # perplexity eval is meaningful (full-seq)
-    ckpt_interval: int = 500
+    eval_interval: int = 250          # frequent verdict points on a capped run
+    ckpt_interval: int = 250          # a credit-death then loses ≤250 steps
     log_interval: int = 50
+    dataloader_num_workers: int = 1   # avoid the cold-stream connection storm
 
     # Reasoning/instruction-heavy reweight (reasoning+STEM-SFT+math = 0.75,
     # was 0.65). Same sources/seq as midtrain — just emphasises the SFT-style
