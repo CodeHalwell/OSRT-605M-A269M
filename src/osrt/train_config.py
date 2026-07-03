@@ -1347,12 +1347,14 @@ class MidtrainExtendConfig(MidtrainConfig):
     undertrained base. Resume from midtrain_final; reassess capability after.
     """
 
-    # Sized for a single ~$30 Modal workspace (~1000 H100-steps): a clean,
-    # fully-annealed short gentle-LR probe from midtrain_final. If it lowers
-    # ppl, chain another workspace (resume from midtrain2_step_1000); if flat,
-    # the base is saturated → SFT v2 from midtrain_final. --total-steps on the
-    # Lightning entry overrides this for a longer run.
-    total_steps: int = 1_000
+    # 2000 steps ≈ ~$61 on Modal H100 — spans TWO $30 workspaces by design:
+    # workspace 1 dies around step ~1000 (ckpt_interval 250 keeps step_1000),
+    # then chain: `modal volume get` step_1000 + re-upload to workspace 2 with
+    # midtrain_final, and the resume scan continues the SAME 2000-step cosine
+    # to the fully-annealed end. First verdict at the step-250 eval; if ppl is
+    # flat at 250/500 the base is saturated → kill early, save the credit.
+    # --total-steps on the Lightning entry overrides this for other runs.
+    total_steps: int = 2_000
     warmup_steps: int = 50
     lr_anchor_step: int = 0           # fresh re-warm cosine over the full run
     peak_lr: float = 3e-5             # GENTLE re-warm — the 1e-4 was too hot for

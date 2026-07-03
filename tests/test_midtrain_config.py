@@ -248,8 +248,8 @@ def test_midtrain_extend_config_values():
     # GENTLE re-warm cosine (the 1e-4 was too hot: ppl rose 30→34, flat)
     assert c.peak_lr == 3e-5 and c.min_lr == 1e-5
     assert c.lr_anchor_step == 0
-    # sized for one ~$30 Modal workspace (~1000 steps)
-    assert c.total_steps == 1_000
+    # 2000-step cosine spanning two ~$30 Modal workspaces (chain at ~1000)
+    assert c.total_steps == 2_000
     assert c.dataloader_num_workers == 1
     # native HRA + checkpointing carried from MidtrainConfig
     assert c.hra_native is True and c.gradient_checkpointing is True
