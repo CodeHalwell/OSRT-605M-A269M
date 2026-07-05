@@ -227,7 +227,7 @@ def test_sftv2_config_values():
     assert c.gradient_checkpointing is True
     # gentle SFT schedule — NOT midtrain's continued-pretrain 2e-4
     assert c.peak_lr == 1e-5 and c.min_lr == 1e-6
-    assert c.total_steps == 1_500 and c.warmup_steps == 100
+    assert c.total_steps == 1_200 and c.warmup_steps == 100
     assert c.lr_anchor_step == 0          # fresh cosine over the full run
     # recursive depth kept active during SFT
     assert c.aux_loop_loss_weight == 0.05 and c.loop_dropout_prob == 0.10
@@ -237,7 +237,7 @@ def test_sftv2_config_values():
     assert ph["batch_size"] * ph["grad_accum_steps"] == 64
     # in-loop perplexity eval disabled (reasoning eval runs offline on ckpts)
     assert c.eval_interval > 9_000
-    assert c.ckpt_interval == 300
+    assert c.ckpt_interval == 200
 
 
 def test_midtrain_extend_config_values():

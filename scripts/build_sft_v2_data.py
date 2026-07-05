@@ -1,28 +1,50 @@
-"""Build the SFT-v2 reasoning-distillation corpus (rollouts/sft_v2.jsonl).
+"""Build the SFT-v2 VERIFIED reasoning corpus (rollouts/sft_v2.jsonl).
 
-Combines the two existing rollout files into one persona-tagged corpus so the
-RolloutDataset loader (which reads `system`/`prompt`/`thinking`/`response`) can
-train the v6 model on COHERENT long reasoning WITH the reasoning-on/off system
-toggle that is the project north star.
+v2 of this builder. The first version blended the raw mopd teacher rollouts —
+which turned out to be only 81.4% correct on math (743/4000 confidently-wrong
+traces, verified against GSM8K gold). This version is VERIFIED-ONLY:
 
-Composition (reasoning-focused 65/20/15 of the final corpus):
-  ON   65%  — mopd_v1 record + sampled REASONING_ON persona, keep thinking+response
-  OFF  20%  — mopd_v1 subset, thinking DROPPED + REASONING_OFF persona, direct answer
-              (matched questions → clean on/off contrast)
-  CHAT 15%  — system_prompt_sft as-is (its character persona, answer-only)
+  ON   ~45%  OpenR1-Math-220k: rows with a math_verify-CORRECT R1 generation,
+             assembled seq <=4096. The community-standard verified math set.
+  ON   ~15%  Bespoke-Stratos-17k: rejection-sampled R1 traces (math/code/
+             science/puzzle diversity), <=4096.
+  ON   ~5%   mopd math rollouts RE-VERIFIED against GSM8K-train gold — only
+             the correct 81.4% are eligible.
+  OFF  ~20%  DISJOINT problems from the same verified pools, CoT stripped,
+             off-persona → the reasoning-on/off toggle contrast on verified
+             answers (unique problems maximised: no ON/OFF overlap).
+  CHAT ~15%  existing system_prompt_sft persona/chat slice (correctness N/A).
 
-All mopd_v1 reasoning rollouts are used (split ON/OFF); chat is sampled to hit
-the ratio. Output records carry a `mode` tag for inspection. Deterministic.
+Safeguards baked in:
+  - GSM8K TEST decontamination (normalized-prefix match) on every problem.
+  - Within-corpus dedup by problem hash.
+  - Assembled-length filter <=4096 (never train a CoT truncated pre-answer).
+  - Char-prefilter before tokenizing (skip obvious >>4096 rows cheaply).
 
-Run: PYTHONPATH=src python scripts/build_sft_v2_data.py
+Targets ~60k rows → ~1.3 epochs at 1200 steps x eff-batch 64. Deterministic.
+
+Run: HF_TOKEN=... PYTHONPATH=src python scripts/build_sft_v2_data.py
 """
 from __future__ import annotations
 
+import hashlib
 import json
-import random
+import os
+import re
+import sys
 from pathlib import Path
 
-from osrt.system_prompts import sample_system_prompt
+_env = Path(__file__).parent.parent / ".env"
+if _env.exists():
+    for _l in _env.read_text().splitlines():
+        _l = _l.strip()
+        if _l and not _l.startswith("#") and "=" in _l:
+            k, _, v = _l.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+import random  # noqa: E402
+
+from osrt.system_prompts import sample_system_prompt  # noqa: E402
 
 ROOT = Path(__file__).parent.parent
 MOPD = ROOT / "rollouts" / "mopd_v1.jsonl"
@@ -30,106 +52,229 @@ CHAT = ROOT / "rollouts" / "system_prompt_sft.jsonl"
 OUT = ROOT / "rollouts" / "sft_v2.jsonl"
 
 SEED = 42
-MIN_RESPONSE_CHARS = 100          # drop degenerate-short answers
-OFF_FRACTION_OF_MOPD = 0.235      # → ON:OFF ≈ 65:20 within the mopd pool
-CHAT_FRACTION_OF_TOTAL = 0.15     # → 15% chat in the final corpus
-# Drop records whose full assembled sequence exceeds the SFT-v2 seq_len, so
-# we never train on a CoT truncated before its <|answer|> (which would teach
-# the model to ramble without concluding — the exact failure we're fixing).
 MAX_SEQ_TOKENS = 4096
+# chars/token ~3.5-4 for this tokenizer; 5x gives a safe over-estimate bound.
+MAX_SEQ_CHARS = MAX_SEQ_TOKENS * 5
+MIN_RESPONSE_CHARS = 40
 TOKENIZER = "v6_tokenizer_export"
 
-
-def _load(path: Path) -> list[dict]:
-    # Iterate the file directly: str.splitlines() also breaks on exotic
-    # Unicode line separators (  etc.) that appear inside the teacher
-    # text, which would split a record mid-JSON-string.
-    with path.open(encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
-
-
-def _too_long(tok, system: str, prompt: str, thinking: str,
-              response: str) -> bool:
-    seq = (f"<|system|>{system}<|user|>{prompt}<|assistant|>"
-           f"<|think|>{thinking}<|/think|><|answer|>{response}<|/answer|>")
-    return len(tok.encode(seq, add_special_tokens=False)) > MAX_SEQ_TOKENS
+ON_OPENR1_TARGET = 27_000
+OFF_OPENR1_TARGET = 10_500
+ON_STRATOS_TARGET = 9_000
+OFF_STRATOS_TARGET = 1_500
+CHAT_TARGET = 8_700
+# mopd: all verified-correct that fit (~3.2k)
 
 
-def main() -> int:
+def _norm_prefix(text: str, n: int = 64) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())[:n]
+
+
+def _phash(text: str) -> str:
+    return hashlib.sha1(_norm_prefix(text, 128).encode()).hexdigest()
+
+
+def main() -> int:  # noqa: PLR0915
+    from datasets import load_dataset
     from transformers import AutoTokenizer
+
     tok = AutoTokenizer.from_pretrained(TOKENIZER)
     rng = random.Random(SEED)
-    mopd = _load(MOPD)
-    chat = _load(CHAT)
 
+    def assembled_len(system: str, q: str, think: str, ans: str) -> int:
+        seq = (f"<|system|>{system}<|user|>{q}<|assistant|>"
+               f"<|think|>{think}<|/think|><|answer|>{ans}<|/answer|>")
+        if len(seq) > MAX_SEQ_CHARS:
+            return 10**9  # obvious over-length; skip tokenizing
+        return len(tok.encode(seq, add_special_tokens=False))
+
+    # ── GSM8K test decontamination set ────────────────────────────────
+    print("building GSM8K-test decontamination set...", flush=True)
+    contam = set()
+    for row in load_dataset("openai/gsm8k", "main", split="test",
+                            streaming=True):
+        contam.add(_norm_prefix(row["question"]))
+    print(f"  {len(contam)} test prefixes", flush=True)
+
+    seen: set[str] = set()          # within-corpus problem dedup
     records: list[dict] = []
-    n_on = n_off = n_toolong = 0
-    for rec in mopd:
-        prompt = (rec.get("prompt") or "").strip()
-        thinking = (rec.get("thinking") or "").strip()
-        response = (rec.get("response") or "").strip()
-        if not prompt or len(response) < MIN_RESPONSE_CHARS:
-            continue
-        # Assign OFF to a subset; ON requires real thinking (≈98% have it —
-        # the rest fall back to OFF since they have no CoT to learn from).
-        make_off = (rng.random() < OFF_FRACTION_OF_MOPD) or (not thinking)
-        if make_off:
-            _, persona = sample_system_prompt(rng, "off")
-            think_out = ""
-        else:
-            _, persona = sample_system_prompt(rng, "on")
-            think_out = thinking
-        if _too_long(tok, persona, prompt, think_out, response):
-            n_toolong += 1
-            continue
-        records.append({
-            "system": persona, "prompt": prompt,
-            "thinking": think_out, "response": response,
-            "mode": "off" if make_off else "on",
-            "source": rec.get("source", "?"),
-        })
-        if make_off:
-            n_off += 1
-        else:
-            n_on += 1
+    stats = {"contaminated": 0, "toolong": 0, "dup": 0}
 
-    # Chat: sample to hit CHAT_FRACTION_OF_TOTAL of the final corpus.
-    # total = (n_on + n_off) / (1 - chat_frac)  →  n_chat = total * chat_frac
-    reasoning_n = n_on + n_off
-    target_chat = int(round(
-        reasoning_n * CHAT_FRACTION_OF_TOTAL / (1.0 - CHAT_FRACTION_OF_TOTAL)
-    ))
-    chat_ok = [c for c in chat
-               if (c.get("prompt") or "").strip()
-               and len((c.get("response") or "").strip()) >= MIN_RESPONSE_CHARS]
-    rng.shuffle(chat_ok)
-    n_chat = 0
-    for c in chat_ok:
-        if n_chat >= target_chat:
+    def admit(problem: str) -> bool:
+        if _norm_prefix(problem) in contam:
+            stats["contaminated"] += 1
+            return False
+        h = _phash(problem)
+        if h in seen:
+            stats["dup"] += 1
+            return False
+        seen.add(h)
+        return True
+
+    def add(mode: str, source: str, q: str, think: str, ans: str) -> bool:
+        _, persona = sample_system_prompt(rng, "on" if mode == "on" else "off")
+        L = assembled_len(persona, q, think if mode == "on" else "", ans)
+        if L > MAX_SEQ_TOKENS:
+            stats["toolong"] += 1
+            return False
+        records.append({
+            "system": persona, "prompt": q,
+            "thinking": think if mode == "on" else "",
+            "response": ans, "mode": mode, "source": source,
+        })
+        return True
+
+    # ── 1. mopd math, re-verified against GSM8K-train gold ───────────
+    print("verifying mopd math rollouts vs GSM8K-train gold...", flush=True)
+    from osrt.rewards import extract_numeric_answer
+    gold: dict[int, str] = {}
+    for i, row in enumerate(load_dataset("openai/gsm8k", "main", split="train",
+                                         streaming=True)):
+        if i >= 4200:
             break
-        csys = (c.get("system") or "").strip()
-        cprompt = (c.get("prompt") or "").strip()
-        cresp = (c.get("response") or "").strip()
-        if _too_long(tok, csys, cprompt, "", cresp):
-            n_toolong += 1
-            continue
-        records.append({
-            "system": csys, "prompt": cprompt, "thinking": "",
-            "response": cresp, "mode": "chat", "source": c.get("source", "chat"),
-        })
-        n_chat += 1
+        m = re.search(r"####\s*([\-0-9\.,]+)", row["answer"])
+        if m:
+            gold[i] = m.group(1).replace(",", "").strip().rstrip(".")
+    n_mopd = 0
+    with MOPD.open(encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            if r["source"] != "math":
+                continue
+            idx = int(r["id"].split(":")[1])
+            g = gold.get(idx)
+            pred = extract_numeric_answer(r.get("response") or "")
+            if g is None or pred is None:
+                continue
+            if str(pred).replace(",", "").strip().rstrip(".") != g:
+                continue  # verified-INCORRECT: drop
+            q = (r.get("prompt") or "").strip()
+            think = (r.get("thinking") or "").strip()
+            ans = (r.get("response") or "").strip()
+            if not q or len(ans) < MIN_RESPONSE_CHARS or not admit(q):
+                continue
+            if add("on", "mopd-verified", q, think, ans):
+                n_mopd += 1
+    print(f"  mopd verified-correct kept: {n_mopd}", flush=True)
 
-    rng.shuffle(records)  # interleave modes
-    with OUT.open("w") as f:
+    # ── 2. OpenR1-Math-220k: verified-correct generations ────────────
+    print("streaming OpenR1-Math-220k (verified rows)...", flush=True)
+    n_on_r1 = n_off_r1 = 0
+    ds = load_dataset("open-r1/OpenR1-Math-220k", "default", split="train",
+                      streaming=True)
+    for row in ds:
+        if n_on_r1 >= ON_OPENR1_TARGET and n_off_r1 >= OFF_OPENR1_TARGET:
+            break
+        gens = row.get("generations") or []
+        ver = row.get("correctness_math_verify") or []
+        pick = next((g for g, v in zip(gens, ver) if v), None)
+        if pick is None:
+            continue
+        q = (row.get("problem") or "").strip()
+        if not q or not admit(q):
+            continue
+        # R1 output: <think>…</think> then the worked final answer.
+        think, post = pick, ""
+        if "</think>" in pick:
+            head, _, post = pick.partition("</think>")
+            think = head.replace("<think>", "").strip()
+            post = post.strip()
+        ans = post if len(post) >= MIN_RESPONSE_CHARS else str(
+            row.get("answer") or "").strip()
+        if not ans:
+            continue
+        # INTERLEAVED ON/OFF assignment: roll per admitted row at the target
+        # ratio, so both modes fill proportionally even if the stream ends
+        # early. (The first sequential version exhausted the stream while
+        # filling ON and produced ZERO off rows.)
+        off_frac = OFF_OPENR1_TARGET / (ON_OPENR1_TARGET + OFF_OPENR1_TARGET)
+        go_off = rng.random() < off_frac
+        if go_off and n_off_r1 < OFF_OPENR1_TARGET:
+            if add("off", "openr1", q, "", ans):
+                n_off_r1 += 1
+        elif n_on_r1 < ON_OPENR1_TARGET:
+            if add("on", "openr1", q, think, ans):
+                n_on_r1 += 1
+        elif n_off_r1 < OFF_OPENR1_TARGET and add("off", "openr1", q, "", ans):
+            n_off_r1 += 1
+    print(f"  openr1 ON: {n_on_r1} | OFF: {n_off_r1}", flush=True)
+
+    # ── 3. Bespoke-Stratos-17k: rejection-sampled R1 ─────────────────
+    print("streaming Bespoke-Stratos-17k...", flush=True)
+    n_on_bs = n_off_bs = 0
+    ds = load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train",
+                      streaming=True)
+    for row in ds:
+        if n_on_bs >= ON_STRATOS_TARGET and n_off_bs >= OFF_STRATOS_TARGET:
+            break
+        conv = row.get("conversations") or []
+        q = next((c["value"] for c in conv if c.get("from") == "user"), "")
+        a = next((c["value"] for c in conv if c.get("from") == "assistant"), "")
+        q = q.strip()
+        if not q or not a or not admit(q):
+            continue
+        if "<|begin_of_thought|>" in a:
+            think = a.split("<|begin_of_thought|>")[1].split(
+                "<|end_of_thought|>")[0].strip()
+            ans = a.split("<|begin_of_solution|>")[-1].split(
+                "<|end_of_solution|>")[0].strip()
+        else:
+            think, ans = "", a.strip()
+        if len(ans) < MIN_RESPONSE_CHARS or not think:
+            continue
+        off_frac = OFF_STRATOS_TARGET / (ON_STRATOS_TARGET + OFF_STRATOS_TARGET)
+        go_off = rng.random() < off_frac
+        if go_off and n_off_bs < OFF_STRATOS_TARGET:
+            if add("off", "stratos", q, "", ans):
+                n_off_bs += 1
+        elif n_on_bs < ON_STRATOS_TARGET:
+            if add("on", "stratos", q, think, ans):
+                n_on_bs += 1
+        elif n_off_bs < OFF_STRATOS_TARGET and add("off", "stratos", q, "", ans):
+            n_off_bs += 1
+    print(f"  stratos ON: {n_on_bs} | OFF: {n_off_bs}", flush=True)
+
+    # ── 4. chat/persona slice (correctness N/A) ──────────────────────
+    print("sampling chat slice...", flush=True)
+    chat_rows = []
+    with CHAT.open(encoding="utf-8") as f:
+        for line in f:
+            c = json.loads(line)
+            q = (c.get("prompt") or "").strip()
+            ans = (c.get("response") or "").strip()
+            sysp = (c.get("system") or "").strip()
+            if not q or len(ans) < MIN_RESPONSE_CHARS or not sysp:
+                continue
+            chat_rows.append((sysp, q, ans))
+    rng.shuffle(chat_rows)
+    n_chat = 0
+    for sysp, q, ans in chat_rows:
+        if n_chat >= CHAT_TARGET:
+            break
+        L = assembled_len(sysp, q, "", ans)
+        if L > MAX_SEQ_TOKENS:
+            stats["toolong"] += 1
+            continue
+        records.append({"system": sysp, "prompt": q, "thinking": "",
+                        "response": ans, "mode": "chat", "source": "chat"})
+        n_chat += 1
+    print(f"  chat kept: {n_chat}", flush=True)
+
+    # ── write ─────────────────────────────────────────────────────────
+    rng.shuffle(records)
+    with OUT.open("w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     total = len(records)
-    print(f"wrote {total} records → {OUT}")
-    print(f"  ON   {n_on:>6}  ({100*n_on/total:.1f}%)")
-    print(f"  OFF  {n_off:>6}  ({100*n_off/total:.1f}%)")
-    print(f"  CHAT {n_chat:>6}  ({100*n_chat/total:.1f}%)")
-    print(f"  dropped (> {MAX_SEQ_TOKENS} tok): {n_toolong}")
+    by_mode: dict[str, int] = {}
+    for r in records:
+        by_mode[r["mode"]] = by_mode.get(r["mode"], 0) + 1
+    print(f"\nwrote {total} records → {OUT}")
+    for m, c in sorted(by_mode.items()):
+        print(f"  {m:>4}: {c:>6}  ({100 * c / total:.1f}%)")
+    print(f"  dropped: contaminated={stats['contaminated']} "
+          f"dup={stats['dup']} toolong={stats['toolong']}")
     return 0
 
 

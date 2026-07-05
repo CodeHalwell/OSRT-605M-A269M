@@ -1553,7 +1553,11 @@ class SFTv2Config(MidtrainConfig):
     """
 
     # ── Schedule: gentle SFT (not continued-pretrain) ────────────────
-    total_steps: int = 1_500
+    # 1200 steps: fits ONE ~$30 Modal workspace (~8.3hr @ ~25s/step) with
+    # margin, and SFT-imitation at 601M converges in this regime (v1 plateaued
+    # by ~1000-1200). With the ~60k-row verified corpus this is ~1.3 epochs —
+    # deliberately low repetition (more unique verified problems > re-reading).
+    total_steps: int = 1_200
     warmup_steps: int = 100
     lr_anchor_step: int = 0          # fresh cosine over the full run
     peak_lr: float = 1e-5            # SFT-scale (cf. SFT v1 1.5e-5); NOT 2e-4
@@ -1584,9 +1588,10 @@ class SFTv2Config(MidtrainConfig):
         },
     }
 
-    # In-loop perplexity eval off (see docstring); checkpoint often.
+    # In-loop perplexity eval off (see docstring); checkpoint often — 6 ckpts
+    # over 1200 steps = soup candidates + free local reasoning-evals per ckpt.
     eval_interval: int = 9_999_999
-    ckpt_interval: int = 300
+    ckpt_interval: int = 200
     log_interval: int = 25
 
     # ── Lineage ──────────────────────────────────────────────────────
