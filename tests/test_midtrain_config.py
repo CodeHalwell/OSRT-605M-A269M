@@ -227,7 +227,7 @@ def test_sftv2_config_values():
     assert c.gradient_checkpointing is True
     # gentle SFT schedule — NOT midtrain's continued-pretrain 2e-4
     assert c.peak_lr == 1e-5 and c.min_lr == 1e-6
-    assert c.total_steps == 1_200 and c.warmup_steps == 100
+    assert c.total_steps == 1_000 and c.warmup_steps == 100
     assert c.lr_anchor_step == 0          # fresh cosine over the full run
     # recursive depth kept active during SFT
     assert c.aux_loop_loss_weight == 0.05 and c.loop_dropout_prob == 0.10

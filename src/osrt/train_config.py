@@ -1553,11 +1553,13 @@ class SFTv2Config(MidtrainConfig):
     """
 
     # ── Schedule: gentle SFT (not continued-pretrain) ────────────────
-    # 1200 steps: fits ONE ~$30 Modal workspace (~8.3hr @ ~25s/step) with
-    # margin, and SFT-imitation at 601M converges in this regime (v1 plateaued
-    # by ~1000-1200). With the ~60k-row verified corpus this is ~1.3 epochs —
-    # deliberately low repetition (more unique verified problems > re-reading).
-    total_steps: int = 1_200
+    # 1000 steps: the sanity gate measured steady-state ~33s/step (8k tok/s at
+    # batch 4, seq 4096, grad-ckpt) — SLOWER than the ~25s first assumed, so
+    # 1200 would run ~11hr ≈ $43 and blow one $40 workspace mid-anneal. 1000
+    # completes cleanly (~9.2hr ≈ $37, fully annealed) and is still ~1.2 epochs
+    # over the 53k-row verified corpus — SFT converges well within this (v1
+    # plateaued by ~1000). ckpt every 200 → the $40 wall can't lose progress.
+    total_steps: int = 1_000
     warmup_steps: int = 100
     lr_anchor_step: int = 0          # fresh cosine over the full run
     peak_lr: float = 1e-5            # SFT-scale (cf. SFT v1 1.5e-5); NOT 2e-4
