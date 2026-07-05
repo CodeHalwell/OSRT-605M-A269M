@@ -86,8 +86,10 @@ def main() -> int:
 
     cfg = SFTv2SanityConfig() if args.sanity else SFTv2Config()
     cfg.ckpt_dir = args.ckpt_dir
+    # midtrain2 step_1750 — best intact midtrain2 artifact (final save was
+    # truncated on the volume); see SFTv2Config lineage note.
     cfg.pretrained_checkpoint = os.path.join(
-        args.ckpt_dir, "osrt_v5_midtrain_final.pt")
+        args.ckpt_dir, "osrt_v5_midtrain2_step_1750.pt")
     cfg.rollout_dataset_path = args.rollout
     if args.sanity:
         cfg.wandb_log = False

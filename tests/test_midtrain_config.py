@@ -216,8 +216,9 @@ def test_sftv1_config_values():
 def test_sftv2_config_values():
     from osrt.train_config import SFTv2Config
     c = SFTv2Config()
-    # resumes from the clean v6 midtrain base, distinct prefix
-    assert c.pretrained_checkpoint.endswith("osrt_v5_midtrain_final.pt")
+    # base = midtrain2 step_1750 (ppl 28.2) — the best INTACT midtrain2
+    # artifact; the step-2000 final save was truncated on the volume.
+    assert c.pretrained_checkpoint.endswith("osrt_v5_midtrain2_step_1750.pt")
     assert c.stage_prefix == "sft_v2"
     # the MOPD rollout-loader override → run_pretrain_extend uses sft_v2.jsonl
     assert c.rollout_dataset_path.endswith("sft_v2.jsonl")

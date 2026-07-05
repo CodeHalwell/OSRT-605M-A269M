@@ -1590,7 +1590,14 @@ class SFTv2Config(MidtrainConfig):
     log_interval: int = 25
 
     # ── Lineage ──────────────────────────────────────────────────────
-    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain_final.pt"
+    # Base = midtrain2 step_1750 (ppl 28.2), the best INTACT midtrain2
+    # artifact: the step-2000 final save was interrupted mid-write on the
+    # volume (truncated at 2.4/4.9GB, unloadable — verified by two
+    # independent downloads). The lost 1750→2000 tail at lr ≤1.3e-5 was
+    # worth ~0.1 ppl; SFT re-warms its own schedule anyway.
+    pretrained_checkpoint: str = (
+        "/vol/checkpoints/v5/osrt_v5_midtrain2_step_1750.pt"
+    )
     stage_prefix: str = "sft_v2"
     wandb_run_name: str = "osrt-v6-sft-v2"
     wandb_run_id: str = ""
