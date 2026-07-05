@@ -44,9 +44,26 @@ if _env.exists():
 
 import random  # noqa: E402
 
-from osrt.system_prompts import sample_system_prompt  # noqa: E402
+from osrt.system_prompts import get_by_name  # noqa: E402
 
 ROOT = Path(__file__).parent.parent
+
+# ── Domain-NEUTRAL persona pools ──────────────────────────────────────
+# We deliberately use ONLY the domain-agnostic reasoners, and NOT the
+# domain-specific personas ("Python expert", "word-problem assistant",
+# "scientific"). Reasons: (1) domain-specific personas require classifying
+# each problem's domain to place them coherently, and that classification is
+# fuzzy (e.g. "Return your final response..." in a MATH prompt reads as code)
+# — it produced ~1k incoherent persona/problem pairs. (2) At 601M the domain
+# identity buys ~nothing: the <|think|>/<|answer|> tokens already carry the
+# format. These neutral reasoners are coherent on ANY problem (math, code,
+# science, chat), so mismatches are structurally impossible while still
+# teaching system-prompt-following and the reasoning ON/OFF toggle.
+_GENERAL_ON = ["minimal_format", "concise_direct", "reasoning_3shot",
+               "instruction_strict", "verbose_teaching", "casual_helpful",
+               "general_default"]
+_GENERAL_OFF = ["direct_concise", "no_reasoning", "assistant_plain",
+                "instruction_direct", "chat_direct"]
 MOPD = ROOT / "rollouts" / "mopd_v1.jsonl"
 CHAT = ROOT / "rollouts" / "system_prompt_sft.jsonl"
 OUT = ROOT / "rollouts" / "sft_v2.jsonl"
@@ -112,7 +129,8 @@ def main() -> int:  # noqa: PLR0915
         return True
 
     def add(mode: str, source: str, q: str, think: str, ans: str) -> bool:
-        _, persona = sample_system_prompt(rng, "on" if mode == "on" else "off")
+        names = _GENERAL_ON if mode == "on" else _GENERAL_OFF
+        persona = get_by_name(rng.choice(names))
         L = assembled_len(persona, q, think if mode == "on" else "", ans)
         if L > MAX_SEQ_TOKENS:
             stats["toolong"] += 1
