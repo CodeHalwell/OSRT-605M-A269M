@@ -899,17 +899,78 @@ def sft_eval(ckpt_name: str, n: int = 100, max_new_tokens: int = 400) -> dict:
     return res
 
 
+@app.function(
+    gpu="H100", image=image,
+    volumes={"/vol/checkpoints": vol, "/vol/tokenizer": v6_tokenizer_vol,
+             "/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")], timeout=1800,
+)
+def sft_sample(ckpt_name: str, n: int = 3, max_new_tokens: int = 768) -> None:
+    """Print N full ON + OFF generations from an SFT checkpoint (GPU-side).
+
+    Qualitative failure-mode read: is the model coherent-but-wrong (GRPO can
+    reinforce) or degenerate (GRPO can't)? Stops at <|/answer|> so we also see
+    whether a decode-time stop fixes the no-EOS runaway.
+    """
+    import torch
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+    from osrt.sft_eval import _load_gsm8k_heldout
+    from osrt.system_prompts import sample_system_prompt
+    import random
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    cfg = build_config(vocab_size=len(tok), real_vocab_size=len(tok),
+                       bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+                       pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8)
+    model = OSRTForCausalLM(cfg)
+    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location="cpu",
+                    weights_only=True)
+    model.load_state_dict(ck.get("model_state_dict", ck), strict=False)
+    model = model.to("cuda").to(torch.bfloat16).eval()
+    _, on_sys = sample_system_prompt(random.Random(0), "on")
+    _, off_sys = sample_system_prompt(random.Random(0), "off")
+
+    for i, (q, gold) in enumerate(_load_gsm8k_heldout(n), 1):
+        print(f"\n{'='*70}\n[Q{i}] {q}\nGOLD: {gold}", flush=True)
+        for side, sysp in (("ON", on_sys), ("OFF", off_sys)):
+            ids = torch.tensor([tok.encode(f"<|system|>{sysp}<|user|>{q}<|assistant|>",
+                                add_special_tokens=False)], device="cuda")
+            with torch.no_grad():
+                out = model.generate(ids, max_new_tokens=max_new_tokens,
+                                     temperature=0.0, repetition_penalty=1.2,
+                                     eos_token_id=tok.eos_token_id)
+            txt = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=False)
+            # trim at first <|/answer|> to show the intended stop point
+            cut = txt.find("<|/answer|>")
+            shown = txt[:cut + len("<|/answer|>")] if cut != -1 else txt
+            print(f"\n--- {side} ({len(txt)} chars raw, "
+                  f"{'closed' if cut!=-1 else 'NO CLOSE'}) ---\n{shown}", flush=True)
+
+
 @app.local_entrypoint()
-def run_sft_eval(step: str = "final", n: int = 100):
+def run_sft_sample(step: str = "final", n: int = 3):
+    """Print full generations from an SFT-v2 checkpoint (qualitative read)."""
+    name = ("osrt_v5_sft_v2_final.pt" if step == "final"
+            else f"osrt_v5_sft_v2_step_{step}.pt")
+    sft_sample.remote(name, n)
+
+
+@app.local_entrypoint()
+def run_sft_eval(step: str = "final", n: int = 100, max_new_tokens: int = 768):
     """Scored reasoning on/off eval of an SFT-v2 checkpoint on GPU (blocking).
 
     `step`: "200"/"600"/"1000"/… → osrt_v5_sft_v2_step_<step>.pt, or "final".
+    `max_new_tokens`: 768 default — long OpenR1-style CoT needs room to close
+    into <|answer|> (400 truncated it at step_200, reading format_ok=0).
     Compare acc_delta_on_minus_off vs SFT-v1's +0.02 (acc_on 0.06/off 0.04).
     """
     name = ("osrt_v5_sft_v2_final.pt" if step == "final"
             else f"osrt_v5_sft_v2_step_{step}.pt")
-    print(f"Evaluating {name} (n={n}) on H100 — GPU-side, no local load...")
-    res = sft_eval.remote(name, n)
+    print(f"Evaluating {name} (n={n}, max_new={max_new_tokens}) on H100...")
+    res = sft_eval.remote(name, n, max_new_tokens)
     print("\n=== RESULT ===")
     for k in ("sft_eval/acc_on", "sft_eval/acc_off",
               "sft_eval/acc_delta_on_minus_off", "sft_eval/format_ok_on",
@@ -980,6 +1041,52 @@ def run_midtrain2_sanity():
     """Spawn the 30-step v6 midtrain2 sanity probe."""
     call = midtrain2_sanity.spawn()
     print(f"Spawned v6 midtrain2 sanity — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.function(
+    gpu="H100", image=image,
+    volumes={"/vol/checkpoints": vol, "/vol/tokenizer": v6_tokenizer_vol,
+             "/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("wandb-secret"),
+             modal.Secret.from_name("hf-secret")],
+    timeout=86400,
+)
+def midtrain3():
+    """v6 midtrain phase 3: the LONG capability push (12.6k-step cosine →
+    ~1x Chinchilla), chained across monthly workspaces. Resumes from the
+    highest midtrain3 checkpoint each run. See MidtrainExtend3Config."""
+    from osrt.train_config import MidtrainExtend3Config
+    _run_midtrain(MidtrainExtend3Config)
+
+
+@app.function(
+    gpu="H100", image=image,
+    volumes={"/vol/checkpoints": vol, "/vol/tokenizer": v6_tokenizer_vol,
+             "/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("wandb-secret"),
+             modal.Secret.from_name("hf-secret")],
+    timeout=86400,
+)
+def midtrain3_sanity():
+    """30-step midtrain3 probe: clean load of step_1750, mix streams."""
+    from osrt.train_config import MidtrainExtend3SanityConfig
+    _run_midtrain(MidtrainExtend3SanityConfig)
+
+
+@app.local_entrypoint()
+def run_midtrain3():
+    """Spawn v6 midtrain phase 3 (fire-and-forget; resumes from last ckpt)."""
+    call = midtrain3.spawn()
+    print(f"Spawned v6 midtrain3 — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_midtrain3_sanity():
+    """Spawn the 30-step v6 midtrain3 sanity probe."""
+    call = midtrain3_sanity.spawn()
+    print(f"Spawned v6 midtrain3 sanity — call_id={call.object_id}")
     print("Monitor: modal app logs <app-id>")
 
 

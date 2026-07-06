@@ -1423,6 +1423,65 @@ class MidtrainExtendSanityConfig(MidtrainExtendConfig):
     wandb_run_name: str = "osrt-v6-midtrain2-sanity"
 
 
+class MidtrainExtend3Config(MidtrainExtendConfig):
+    """v6 midtrain phase 3 — the LONG capability-building continued-pretrain,
+    chained across monthly $30 Modal workspaces.
+
+    SFT v2 confirmed the base is UNDERTRAINED, not capacity-capped: format_ok
+    hit 1.0 (clean <|think|>/<|answer|>) but GSM8K stayed ~0.05 (=SFT v1), and
+    generations are fluent-but-wrong ("50/80 = 6.25%", "32 inches in an inch").
+    That's the signature of a base that learned the SHAPE of reasoning but has
+    too few tokens for the substance. Models this size that reason (Qwen2.5-0.5B
+    ~40% GSM8K) saw trillions of tokens; we've seen ~2.2B (~0.4x Chinchilla on
+    278M active). The fix is more PRETRAINING, not more SFT/RL.
+
+    Target: +3.4B tokens → ~5.6B total = 1x Chinchilla, the first point GSM8K
+    should lift off the floor. At eff-batch 66 x 4096 = 270k tok/step that's
+    ~12,600 steps. One ~$30 workspace ≈ 1000 steps (~270M tok), so this is a
+    ~13-workspace, multi-month drip: each month resume from the highest
+    midtrain3 checkpoint (the resume-scan chains it) and continue the SAME long
+    cosine. Re-run SFT v2 (unchanged — it already produces clean form) once the
+    base is stronger.
+
+    LR: peak 5e-5 — above midtrain2's gentle 3e-5 probe (this is a LONG
+    capability push, not a short re-warm, so it can afford more learning per
+    token) but well under the 1e-4 that displaced the base over 1000 steps. The
+    long cosine barely moves in the first 1000 steps, so it's effectively a
+    sustained 5e-5 that anneals to 1e-5 only near the 12,600-step end. Base =
+    midtrain2_step_1750 (the best intact midtrain2 artifact, ppl 28.2).
+    """
+
+    pretrained_checkpoint: str = (
+        "/vol/checkpoints/v5/osrt_v5_midtrain2_step_1750.pt"
+    )
+    stage_prefix: str = "midtrain3"
+    wandb_run_name: str = "osrt-v6-midtrain3"
+
+    total_steps: int = 12_600         # +3.4B tokens → ~1x Chinchilla (multi-month)
+    warmup_steps: int = 100
+    peak_lr: float = 5e-5             # sustained capability LR over a long run
+    min_lr: float = 1e-5
+    muon_lr: float = 1.65e-3          # ×33 of the AdamW peak
+    muon_min_lr: float = 3.3e-4
+
+    eval_interval: int = 500          # a few verdict points per monthly workspace
+    ckpt_interval: int = 500          # chain-friendly; a credit-death loses ≤500
+    dataloader_num_workers: int = 1
+
+
+class MidtrainExtend3SanityConfig(MidtrainExtend3Config):
+    """30-step probe for midtrain3 (clean load of step_1750 + mix streams)."""
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    ckpt_interval: int = 9_999_999
+    eval_interval: int = 9_999_999
+    save_final_checkpoint: bool = False
+    compile_enabled: bool = False
+    stage_prefix: str = "midtrain3-sanity"
+    wandb_run_name: str = "osrt-v6-midtrain3-sanity"
+
+
 class SFTv1Config(SFTConfig):
     """v6 SFT v1 — system-prompt instruction tuning on the midtrain base.
 
