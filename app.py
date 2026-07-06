@@ -846,6 +846,78 @@ def run_sft_v2_sanity():
     print("Monitor: modal app logs <app-id>")
 
 
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=3600,
+)
+def sft_eval(ckpt_name: str, n: int = 100, max_new_tokens: int = 400) -> dict:
+    """Scored reasoning-on/off GSM8K eval of ONE SFT checkpoint, on GPU.
+
+    Loads /vol/checkpoints/v5/<ckpt_name>, runs run_reasoning_eval (batched
+    generation, greedy + rep_penalty 1.2 = the locked decode hygiene), returns
+    the sft_eval/* metric dict. GPU-side by design — the model is far too heavy
+    for local MPS/CPU inference (it froze a Mac). Cheap: ~2-3 min on H100.
+    """
+    import torch
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+    from osrt.sft_eval import run_reasoning_eval
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    model = OSRTForCausalLM(cfg)
+    path = f"/vol/checkpoints/v5/{ckpt_name}"
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    sd = ck["model_state_dict"] if "model_state_dict" in ck else ck
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    model = model.to("cuda").to(torch.bfloat16).eval()
+    print(f"loaded {path} | missing={len(missing)} unexpected={len(unexpected)}",
+          flush=True)
+
+    with torch.no_grad():
+        res = run_reasoning_eval(
+            model, tok, torch.device("cuda"),
+            n_problems=n, max_new_tokens=max_new_tokens,
+            batch_size=32, repetition_penalty=1.2,
+        )
+    print("=== sft_eval ===", flush=True)
+    for k, v in res.items():
+        print(f"  {k}: {v}", flush=True)
+    return res
+
+
+@app.local_entrypoint()
+def run_sft_eval(step: str = "final", n: int = 100):
+    """Scored reasoning on/off eval of an SFT-v2 checkpoint on GPU (blocking).
+
+    `step`: "200"/"600"/"1000"/… → osrt_v5_sft_v2_step_<step>.pt, or "final".
+    Compare acc_delta_on_minus_off vs SFT-v1's +0.02 (acc_on 0.06/off 0.04).
+    """
+    name = ("osrt_v5_sft_v2_final.pt" if step == "final"
+            else f"osrt_v5_sft_v2_step_{step}.pt")
+    print(f"Evaluating {name} (n={n}) on H100 — GPU-side, no local load...")
+    res = sft_eval.remote(name, n)
+    print("\n=== RESULT ===")
+    for k in ("sft_eval/acc_on", "sft_eval/acc_off",
+              "sft_eval/acc_delta_on_minus_off", "sft_eval/format_ok_on",
+              "sft_eval/format_ok_off", "sft_eval/resp_len_on",
+              "sft_eval/resp_len_off", "sft_eval/n"):
+        print(f"  {k}: {res.get(k)}")
+
+
 # =============================================================================
 # MIDTRAIN 2 — extended continued-pretraining (push the undertrained base)
 # =============================================================================
