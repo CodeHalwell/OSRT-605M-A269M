@@ -753,17 +753,28 @@ class RolloutDataset(IterableDataset):
         prefix_ids = tok.encode(prefix_text, add_special_tokens=False)
         target_ids = tok.encode(target_text, add_special_tokens=False)
 
+        # Terminal EOS so the model learns to STOP after <|/answer|>. Without
+        # it the target ended at <|/answer|> followed by masked (-100) padding,
+        # so EOS was never a training target — and at inference the model never
+        # stopped, running to the length cap (observed in SFT-v2: both modes
+        # maxed out, resp_len ≈ cap). Reserve a slot for it and give it a REAL
+        # label so it's actually learned.
+        eos_id = tok.eos_token_id
+        reserve = 1 if eos_id is not None else 0
+
         # Truncation policy: keep full prefix, truncate target tail. Skip
         # if even after truncation the target is below the minimum.
-        max_target = self.seq_len - len(prefix_ids)
+        max_target = self.seq_len - len(prefix_ids) - reserve
         if max_target < self.MIN_RESPONSE_TOKENS:
             return None
         if len(target_ids) > max_target:
             target_ids = target_ids[:max_target]
+        if eos_id is not None:
+            target_ids = target_ids + [eos_id]
 
         seq_ids = prefix_ids + target_ids
         seq_labels: list[int] = (
-            [-100] * len(prefix_ids) + list(target_ids)
+            [-100] * len(prefix_ids) + list(target_ids)  # EOS is a real label
         )
         # Right-pad to seq_len
         pad_len = self.seq_len - len(seq_ids)
