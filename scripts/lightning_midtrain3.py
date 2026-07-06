@@ -60,6 +60,12 @@ def main() -> int:
     ap.add_argument("--min-lr", type=float, default=None)
     ap.add_argument("--ckpt-interval", type=int, default=None,
                     help="lower (e.g. 250) if Colab sessions are short")
+    ap.add_argument("--hf-repo", default=None,
+                    help="private HF repo (e.g. USER/osrt-v6-ckpt) for "
+                         "cross-session persistence: pull latest midtrain3 ckpt "
+                         "(+ base) on start, push each new ckpt as it saves. "
+                         "Essential on Colab (ephemeral VM disk + 24h cap). "
+                         "Needs HF_TOKEN.")
     ap.add_argument("--sanity", action="store_true",
                     help="run the 30-step MidtrainExtend3SanityConfig gate")
     args = ap.parse_args()
@@ -111,6 +117,16 @@ def main() -> int:
 
     if args.sanity:
         cfg.wandb_log = False
+
+    # HF cross-session persistence (Colab): pull the latest midtrain3 ckpt (and
+    # the base if absent) BEFORE the resume-scan runs, and start a background
+    # daemon that pushes each new ckpt to the repo as it saves.
+    if args.hf_repo:
+        from hf_ckpt_sync import pull_latest, start_push_daemon
+        pull_latest(args.hf_repo, args.ckpt_dir, "osrt_v5_midtrain3",
+                    base_name="osrt_v5_midtrain2_step_1750.pt")
+        if not args.sanity:
+            start_push_daemon(args.hf_repo, args.ckpt_dir, "osrt_v5_midtrain3")
 
     ph = cfg.phases["extend"]
     print(
