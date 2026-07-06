@@ -60,6 +60,13 @@ def main() -> int:
     ap.add_argument("--min-lr", type=float, default=None)
     ap.add_argument("--ckpt-interval", type=int, default=None,
                     help="lower (e.g. 250) if Colab sessions are short")
+    ap.add_argument("--micro-batch", type=int, default=None,
+                    help="override extend-phase batch_size (A100-40GB needs ~3 "
+                         "vs the H100 default 6; keep eff-batch constant by "
+                         "raising --grad-accum)")
+    ap.add_argument("--grad-accum", type=int, default=None,
+                    help="override extend-phase grad_accum_steps "
+                         "(e.g. 22 to hold eff-batch 66 at --micro-batch 3)")
     ap.add_argument("--hf-repo", default=None,
                     help="private HF repo (e.g. USER/osrt-v6-ckpt) for "
                          "cross-session persistence: pull latest midtrain3 ckpt "
@@ -98,6 +105,12 @@ def main() -> int:
     cfg = (MidtrainExtend3SanityConfig() if args.sanity
            else MidtrainExtend3Config())
     cfg.ckpt_dir = args.ckpt_dir
+    # GPU-fit override: A100-40GB can't hold the H100 batch-6; drop to
+    # --micro-batch 3 --grad-accum 22 (same eff-batch 66). No-op on H100/A100-80.
+    if args.micro_batch is not None:
+        cfg.phases["extend"]["batch_size"] = args.micro_batch
+    if args.grad_accum is not None:
+        cfg.phases["extend"]["grad_accum_steps"] = args.grad_accum
     cfg.pretrained_checkpoint = os.path.join(
         args.ckpt_dir, "osrt_v5_midtrain2_step_1750.pt")
     if not args.sanity and args.total_steps is not None:
