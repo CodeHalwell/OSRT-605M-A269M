@@ -60,6 +60,12 @@ def main() -> int:
     ap.add_argument("--min-lr", type=float, default=None)
     ap.add_argument("--ckpt-interval", type=int, default=None,
                     help="lower (e.g. 250) if Colab sessions are short")
+    ap.add_argument("--num-workers", type=int, default=None,
+                    help="override dataloader_num_workers. Use 0 on Colab: the "
+                         "spawned streaming workers hit a fatal "
+                         "PyGILState_Release teardown race (tokenizers/pyarrow "
+                         "C-ext + torch 2.11 multiprocessing) that killed the "
+                         "run mid-stream. 0 = in-process, no worker subprocess.")
     ap.add_argument("--micro-batch", type=int, default=None,
                     help="override extend-phase batch_size (A100-40GB needs ~3 "
                          "vs the H100 default 6; keep eff-batch constant by "
@@ -111,6 +117,8 @@ def main() -> int:
         cfg.phases["extend"]["batch_size"] = args.micro_batch
     if args.grad_accum is not None:
         cfg.phases["extend"]["grad_accum_steps"] = args.grad_accum
+    if args.num_workers is not None:
+        cfg.dataloader_num_workers = args.num_workers
     cfg.pretrained_checkpoint = os.path.join(
         args.ckpt_dir, "osrt_v5_midtrain2_step_1750.pt")
     if not args.sanity and args.total_steps is not None:
