@@ -1464,8 +1464,16 @@ class MidtrainExtend3Config(MidtrainExtendConfig):
     muon_lr: float = 1.65e-3          # ×33 of the AdamW peak
     muon_min_lr: float = 3.3e-4
 
-    eval_interval: int = 500          # a few verdict points per monthly workspace
-    ckpt_interval: int = 500          # chain-friendly; a credit-death loses ≤500
+    # In-loop eval DISABLED: the held-out skip=100M build stalls the GPU for
+    # 20-30min (single-threaded with num_workers=0), and Colab reclaims
+    # idle-GPU VMs — it killed a run at step 500 right before its checkpoint.
+    # We eval checkpoints OFFLINE anyway (run_sft_eval / probes), so the
+    # in-loop eval is pure liability here.
+    eval_interval: int = 9_999_999
+    # Checkpoint every 100 (not 500): given repeated Colab VM reclaims, bank
+    # progress to HF fast — first checkpoint ~1hr in, a reclaim costs ≤100
+    # steps. hf_ckpt_sync prunes remote to the newest few so HF stays small.
+    ckpt_interval: int = 100
     dataloader_num_workers: int = 1
 
 
