@@ -59,7 +59,14 @@ def main() -> int:
                          "moves early, so it's effectively sustained.")
     ap.add_argument("--min-lr", type=float, default=None)
     ap.add_argument("--ckpt-interval", type=int, default=None,
-                    help="lower (e.g. 250) if Colab sessions are short")
+                    help="lower (e.g. 100) to bank to HF often on flaky/reclaim-"
+                         "prone GPUs")
+    ap.add_argument("--eval-interval", type=int, default=None,
+                    help="override the (default-disabled) in-loop held-out eval. "
+                         "e.g. 500. WARNING: the eval's skip=100M build stalls "
+                         "the GPU ~20-30min in-process — on Colab this can "
+                         "trigger an idle-GPU reclaim, so pair with a small "
+                         "--ckpt-interval to bound the loss.")
     ap.add_argument("--num-workers", type=int, default=None,
                     help="override dataloader_num_workers. Use 0 on Colab: the "
                          "spawned streaming workers hit a fatal "
@@ -125,6 +132,8 @@ def main() -> int:
         cfg.total_steps = args.total_steps
     if args.ckpt_interval is not None:
         cfg.ckpt_interval = args.ckpt_interval
+    if args.eval_interval is not None:
+        cfg.eval_interval = args.eval_interval
 
     # LR override — Muon kept proportional to the AdamW peak; cosine floor
     # scales too. On resume the schedule is evaluated at the resumed step.
