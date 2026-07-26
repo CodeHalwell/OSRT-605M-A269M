@@ -25,6 +25,7 @@ infra findings: checkpoint sync races, data-builder decon gap).
 | Adaptive expert count (variable top-k)? | **Defer, don't shrink.** Real technique, but its payoff scales with E and this model is E=8 by deliberate choice. Breaks the fixed shapes that buy fullgraph compile, and introduces an always-max-k degenerate solution. Revisit at E≥32. §8 |
 | RAG / web search into the training pipeline? | **Keep the mechanism, drop the retrieval.** The with/without-context objective is *context distillation* — real, and it supersedes the §6.6 plan. But build no retriever: apply it to the §6 hints instead. Live web search is strictly worse than the frozen dump already streaming. §9 |
 | Mixture-of-LoRA with a routing classifier? | **Viable as a serving pattern at low rank** — storage is ~12% overhead, not 3.8×. Two things to design in from the start: **soft-blend with a null adapter** (not hard switching), and note §14.1 says adapters are the one component to keep at bf16. §10 |
+| Anything else being missed for training? | **Nine further opportunities catalogued.** Top three: verify cross-session data fast-forward (possible silent stream-head oversampling), cosine → trunk-and-branch (WSD) for drip training, and a small scaling ladder to re-derive the token target for a weight-reused model. §14 |
 
 ---
 
@@ -1041,6 +1042,18 @@ Mixture-of-LoRA track (§10) — a **serving** play, independent of the training
 - [ ] Run `loop_depth_probe` (`monitoring.py:104`) per adapter before shipping —
       a task score alone will not catch loop-dynamic damage. (§10.5)
 
+Opportunity track (§14) — top three, in order:
+
+- [ ] **Log stream position at session start** (hash of the first few doc IDs)
+      — one W&B line decides whether resumed sessions re-read the stream head;
+      if yes, salt the shuffle seed per session or wire `skip` (mind the O(N)
+      cost, `train.py:195`). (§14.1)
+- [ ] **Cosine → trunk-and-branch (WSD)** for all further pretrain/midtrain
+      extends; short decay branches become the release checkpoints. (§14.1)
+- [ ] **Scaling ladder + µP transfer** at ~50–150M physical to re-derive the
+      token target for a 6×-reused sparse model before committing the next
+      three months of drip. (§14.3)
+
 Deferred — revisit only if a larger-E model is on the table (§8):
 
 - [ ] Adaptive top-k. **Not queued for this model.** If a future config goes to
@@ -1083,3 +1096,97 @@ for 278M active params. SFT and GRPO *elicit* latent capability; they do not
 *create* it. **None of the objective changes in §5 add knowledge.** They are
 worth doing only for what they specifically claim (hard-token weighting, routing
 robustness, generation variety) — not as a route to GSM8K.
+
+---
+
+## 14. Further opportunities (2026-07-26 review) — catalogued, not started
+
+A follow-up review pass asked what §2–§10 *don't* cover. Nine items, ranked by
+leverage per dollar against the §13 constraint: the bottleneck is pretraining
+tokens, so items that protect or re-aim the token budget outrank new
+objectives. Verdicts are code-reads of the same tree (`7ebc2e7`).
+
+### 14.1 Protect the tokens already being paid for
+
+**1. Verify cross-session data fast-forward — check before anything else.**
+The loader's base seed is fixed per run (`data.py:330`) and the per-dataset
+`skip` knob (`data.py:398-400`) is wired to exactly one thing: the hard-coded
+100M held-out carve-out (`train.py:252`). Nothing connects the resume step to
+stream position. If a resumed Colab session re-opens an identically-seeded
+stream at position 0, every 24h session re-trains the stream head — silent
+oversampling that burns the drip budget. One W&B log line (hash of the first
+few doc IDs at session start) settles it. Two fixes, one caveat: wiring
+`skip ≈ consumed samples` is exact but `ds.skip(N)` is O(N) iteration
+(`train.py:195`, `:228` call the cost real); salting the shuffle seed per
+session is the cheap alternative (fresh windows, at the price of exact epoch
+accounting).
+
+**2. Trunk-and-branch (WSD) instead of cosine.** The schedule is cosine with
+warmup (`train.py:47-52`), and the extension-path comments (`train.py:69-71`)
+document the re-warm pain every stretched run pays. For open-ended drip
+training: hold a stable-LR trunk, cut a short cheap decay branch whenever an
+evaluable/releasable checkpoint is wanted, keep training the trunk. Stops
+re-litigating the schedule at every extension; every month of drip can ship a
+real checkpoint. (MiniCPM-style WSD.)
+
+**3. Cheap run hygiene.** (a) Weight EMA (+2.4 GB) — reliably better eval
+checkpoints for near-zero cost. (b) Spike auto-rollback: `presets.py:38-42`
+documents mHC NaN risk under sustained training, and the only guard today is
+the 23h rescue (`train.py:2004-2017`) — nothing *reacts* to divergence. An
+auto reload-last-ckpt + skip-window + LR-dip guard is cheap insurance for
+unattended sessions.
+
+### 14.2 Levers only this architecture has
+
+**4. Loop-count curriculum.** Compute per token scales with loops. Early
+tokens at 3–4 loops (~40 % FLOPs saving), growing to 6, stretches the budget
+through the phase where the model is learning token statistics anyway. The
+machinery half-exists: loop dropout already truncates to ≥ 3
+(`config.py:201`), and the aux heads make shallow depths predictive. Gate
+with `loop_depth_probe` (`monitoring.py:104`), same as everything else.
+(Mixture-of-Recursions is the supporting literature.)
+
+**5. Per-loop self-distillation — §9's mechanism pointed at depth instead of
+context.** The aux loop heads train against labels only (plain CE,
+`model.py:1962`). Add a KL term from each intermediate loop to the
+**stop-grad final-loop** distribution: shallow exits learn to mimic the full
+model at near-zero extra compute (the hidden states and the fused-CE chunking
+already exist). Payoff lands on §12.2 variable-loop inference and the §12.3
+speculative-draft acceptance rate. Same trap as §9.2: the teacher branch must
+be detached, or the objective collapses to depth-invariance.
+
+**6. Harvest the early exit already trained.** The aux heads *are* trained
+exit heads. Per-token confidence early exit is mostly-free inference speed on
+top of the loop-3 draft — with the known KV caveat (exited tokens still owe
+KV to later positions; copy-forward is the standard fix).
+
+### 14.3 Aim the budget before spending three months of it
+
+**7. The Chinchilla yardstick is ill-defined for this model — measure it.**
+"0.4× for 278M active" (`AGENT_HANDOFF.md:57-60`) applies a dense-parameter
+heuristic to a 6×-weight-reused sparse model whose FLOPs/token resemble a
+much larger dense model's. A tiny scaling ladder (≈3 sizes at 50–150M
+physical × 3 token budgets, runnable on the always-on machine) plus µP-style
+LR transfer pins the *actual* token target and LRs — and could re-aim the
+whole +3.4B-token plan in either direction. The most measure-first item in
+this note.
+
+**8. Data quality, not just quantity.** FineWeb-Edu streams unfiltered
+(`train_config.py:205-207`); filtering to `int_score ≥ 4` is a free streaming
+filter. Data-constrained scaling results (Muennighoff et al.) put ~4 epochs
+of high-quality data ≈ fresh data — `_cycling_iter` (`data.py:339-384`)
+already proves multi-epoch works here for small sets; making it deliberate
+policy for the best slices is untapped.
+
+### 14.4 Cheap capability and external leverage
+
+**9. Three small ones.** (a) Report **maj@8 self-consistency** beside greedy
+— typically a large honest lift for weak math models — and feed
+majority-agreed answers into the existing rejection-sampling corpus: a data
+flywheel with no frontier-model hints and no ToS exposure (§6.8). (b) Know
+the KD position: sequence-level KD is *already in effect* (OpenR1/Stratos
+traces in SFT-v2); logit-level KD from open teachers is **blocked by the
+custom 65K tokenizer** — a real cost of the tokenizer worth weighing in any
+v7 decision (ULD-style OT losses are the only bridge; not worth it now).
+(c) HF community GPU grants exist for exactly this kind of open small-model
+work; the repo already ships on HF, so it costs one application.
