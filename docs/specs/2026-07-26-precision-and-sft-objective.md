@@ -5,7 +5,9 @@
 findings below are reads of the tree at commit `7ebc2e7` (the `main` base of
 `claude/model-precision-sarrdk`).
 **Companions:** `ARCHITECTURE.md` §14–15, `docs/08-optimizer.md`,
-`docs/AGENT_HANDOFF.md` §1–2.
+`docs/AGENT_HANDOFF.md` §1–2,
+`docs/specs/2026-07-26-ckpt-sync-and-data-builder-findings.md` (same-day
+infra findings: checkpoint sync races, data-builder decon gap).
 
 ---
 
