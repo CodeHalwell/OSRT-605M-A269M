@@ -21,6 +21,7 @@ findings below are reads of the current tree at `claude/model-precision-sarrdk`.
 | An output-head correction layer? | **Yes — cheapest experiment here, lowest blast radius.** Fills a gap HRA structurally cannot reach (the tied LM head). ~0.8–2.4M params, zero-init so a failed run costs nothing. Fixes tying bias/calibration, not knowledge. §7 |
 | Adaptive expert count (variable top-k)? | **Defer, don't shrink.** Real technique, but its payoff scales with E and this model is E=8 by deliberate choice. Breaks the fixed shapes that buy fullgraph compile, and introduces an always-max-k degenerate solution. Revisit at E≥32. §8 |
 | RAG / web search into the training pipeline? | **Keep the mechanism, drop the retrieval.** The with/without-context objective is *context distillation* — real, and it supersedes the §6.6 plan. But build no retriever: apply it to the §6 hints instead. Live web search is strictly worse than the frozen dump already streaming. §9 |
+| Mixture-of-LoRA with a routing classifier? | **Viable as a serving pattern at low rank** — storage is ~12% overhead, not 3.8×. Two things to design in from the start: **soft-blend with a null adapter** (not hard switching), and note §14.1 says adapters are the one component to keep at bf16. §10 |
 
 ---
 
@@ -36,7 +37,7 @@ rather than getting re-litigated later.
 run yet… The model is in CPU pre-flight." `docs/AGENT_HANDOFF.md:47-63`
 documents pretrain → midtrain → midtrain2 → SFT v1/v2 as *done*, with a GSM8K
 result. `CLAUDE.md` should be corrected — a reader trusting it will prioritise
-completely wrong. **(Open item, §10.)**
+completely wrong. **(Open item, §11.)**
 
 ---
 
@@ -446,7 +447,7 @@ a training run, and it does not recur per step.
 
 ### 6.8 Caveats
 
-- Hints make the GRPO budget go further; they **do not add knowledge** (§12). If
+- Hints make the GRPO budget go further; they **do not add knowledge** (§13). If
   the base genuinely cannot do multi-step arithmetic, an L3 hint yields a
   completion the model could not have reached and likely cannot generalise from
   — closer to distillation than RL. **The tell is whether hinted performance
@@ -552,7 +553,7 @@ h = h + self.down(F.silu(self.up(self.norm(h))))   # up: dim→r, down: r→dim 
 ### 7.6 Measurement protocol and limits
 
 - **Cannot add knowledge.** "Fluent but wrong math" stays wrong — same ceiling
-  as §12.
+  as §13.
 - What it can plausibly fix is the systematic output bias tying imposes
   (over-favouring tokens with large embedding norm, independent of context) — a
   known effect and a plausible contributor to the repetition behaviour at
@@ -721,7 +722,7 @@ This and the hint pipeline (§6) are the **only two ideas in these notes that
 bring external information into the weights**. Focal loss (§5), the correction
 head (§7), and adaptive routing (§8) all rearrange what is already there.
 Retrieved documents are genuinely new information, so context distillation is
-not capped by the §12 "elicit, don't create" ceiling.
+not capped by the §13 "elicit, don't create" ceiling.
 
 That makes it the first proposal here with a real knowledge-transfer channel —
 and also the one most easily mistaken for a cheaper alternative to pretraining,
@@ -788,7 +789,143 @@ stack.
 
 ---
 
-## 10. Open items
+## 10. Mixture-of-LoRA with a routing classifier
+
+### 10.1 The proposal
+
+> Fine-tune the model 50 times on 50 different subjects, then train a small
+> classifier that attaches the right LoRA at inference. **The goal is a more
+> generalist model in production** — adapters should not be too specific, and
+> should still answer normal non-specialised questions. Low rank and low
+> precision.
+
+**Assessment: viable, because the stated goal is the one this pattern is
+actually for.** Mixture-of-LoRA is a *serving* pattern (one base, many
+specialisations, no merging) rather than a capability pattern. Two design
+decisions matter more than the rest, and both are cheaper to build in than to
+retrofit.
+
+### 10.2 What low rank + low precision resolves
+
+At rank 256, HRA is **14,155,776 params** across 18 injection points
+(`ARCHITECTURE.md:107`) — 50 copies would be 708M, *larger than the 601M base*.
+That objection dissolves at low rank:
+
+```
+rank 16:  1536 × 16 × 2 × 18 injection points  =    884,736 / adapter
+          × 50 adapters                        = 44,236,800  (~44M)
+          bf16 88 MB │ int8 44 MB │ int4 22 MB
+          vs §14.2 deployment target ~377 MB   → 12-23% overhead
+```
+
+Note the tradeoff being accepted: `presets.py:37` calls rank 256 *"real HRA
+capacity (NOT LoRA-style 16)"*. Dropping to 16 gives each adapter 1/16th the
+capacity — appropriate for the deliberately-mild adapters this design wants, but
+it is a real reduction, not a free win.
+
+### 10.3 The tension to design around: specific vs generalist
+
+"Should still answer normal non-specialised questions" is in direct tension with
+the premise. Adapter strength (rank × `scale` × training steps) is a single dial
+trading specialisation against generality: mild enough to preserve general
+behaviour also means mild enough to deliver a small benefit.
+
+**The fix is to blend rather than switch.** Use the classifier's *softmax* to
+weight adapters, and include a **null/identity option** in the mix:
+
+| query | behaviour |
+|---|---|
+| confident domain match | mostly that adapter |
+| general or ambiguous | weight shifts toward null → base behaviour preserved |
+| misroute | degrades gracefully instead of catastrophically |
+
+This solves the stated requirement directly and removes the hard-selection
+failure mode. It also means the classifier no longer has to be *right*, only
+roughly right — a much easier target, and one that degrades sensibly
+out-of-distribution.
+
+> Worth noticing where this lands: soft-weighting a set of adapters by a learned
+> gate is precisely what the native MoE router already does (`model.py:759`), at
+> per-token rather than per-request granularity. The design converges on the
+> existing mechanism — which is an argument for confidence in the shape, and for
+> checking §10.6 before building a second one.
+
+### 10.4 ⚠️ Low precision on adapters contradicts the current deployment spec
+
+`ARCHITECTURE.md` §14.1 singles adapters out as the component to keep at full
+precision:
+
+| component | format | method |
+|---|---|---|
+| HRA adapters | **bf16** | kept full precision (**small, sensitive**) |
+
+Two reasons that call is not obviously wrong:
+
+1. `HRALinear.forward` (`hra.py:69+`) *adds* the adapter output to the base
+   output, so quantisation error lands directly on the residual stream rather
+   than being attenuated.
+2. Adapters sit on the 3 physical blocks and therefore run at **all 6 recursion
+   loops** — quantisation error compounds across loops, the same systematic-error
+   argument that rules out fp8 in §3.3.
+
+50 low-rank adapters is a different regime from one rank-256 adapter, so int8 may
+well hold. But it contradicts the current spec, so **measure it rather than
+assuming it** — and if §14.1 turns out to be wrong here, update §14.1.
+
+### 10.5 Recursion amplification
+
+18 injection points = 6 per physical block, and each block runs 6×. Every
+adapter perturbs the same weights at all six recursion depths, where (per the
+design thesis) the block is doing different work — early loops surface, late
+loops abstract. **An adapter cannot be loop-specific.**
+
+Loop collapse is the v5 lineage's headline failure (`LEARNINGS.md`). Low rank and
+low `scale` reduce the risk substantially, which is what makes the mild-adapter
+choice the right one here — but each adapter still wants a loop-depth probe
+(`monitoring.py:104`, `loop_depth_probe`) before it ships, not just a task score.
+
+### 10.6 Serving mechanics
+
+Two production details that do not show up until integration:
+
+**Mid-conversation topic shift.** Adapters change weights, so switching adapters
+mid-generation makes the existing KV cache inconsistent with the new weights.
+Either pin the adapter for the whole conversation (wrong after a topic turn) or
+invalidate the cache on switch (a latency spike). Soft blending (§10.3) softens
+this — small weight changes rather than a discrete swap — but does not remove it.
+Decide the policy before building.
+
+**Batched inference with per-sequence adapters** is the S-LoRA problem: different
+sequences in a batch need different weights, which defeats naive batching. The
+solution is to sort sequences by adapter and run grouped matmuls — **which is
+structurally identical to `_dispatch_grouped` (`model.py:594-627`)**, already in
+the tree for MoE: sort by expert, `bincount` → `cumsum` → `offs`,
+`torch._grouped_mm`. The same primitive serves batched multi-LoRA. Reuse it
+rather than reaching for a new dependency.
+
+### 10.7 Do this before the 50 training runs
+
+`monitoring.py:55` provides `moe_health` — per-block, per-loop load entropy with
+`MIN_LOAD_ENTROPY = 0.55` and dead-expert detection. Run it on **domain-segmented
+batches** and look at whether expert usage shifts between math, code and prose:
+
+- **Experts already differentiate by domain** → the specialisation mechanism
+  exists natively at per-token granularity. Strengthen it before paralleling it.
+- **Load entropy is collapsed** → that is a router bug. A second routing layer on
+  top of a broken router does not fix the first one.
+
+Either answer costs one evaluation pass and is more informative than 50
+fine-tuning runs.
+
+**Also: start with ~5 broad adapters, not 50.** Data fragmentation is the real
+cost at 0.4× Chinchilla — 50 splits starve each adapter and destroy the
+cross-domain transfer that is a small model's main advantage. Five coarse domains
+capture most of the serving benefit at 1/10th the training cost, and the result
+tells you whether 50 is worth it.
+
+---
+
+## 11. Open items
 
 Not started. Roughly in priority order:
 
@@ -837,6 +974,25 @@ Correction-head track (§7) — independent of the above, can run in parallel:
 - [ ] Label the outcome honestly: entropy moves but accuracy flat = a calibration
       layer, which is useful for sampling and **not** a reasoning result. (§7.6)
 
+Mixture-of-LoRA track (§10) — a **serving** play, independent of the training work above:
+
+- [ ] **`moe_health` on domain-segmented batches first** (`monitoring.py:55`). One
+      eval pass; tells you whether the native per-token router already
+      specialises by domain before committing to a second routing layer. (§10.7)
+- [ ] **~5 broad adapters, not 50**, at rank 16. Measures the pattern without
+      fragmenting scarce data. (§10.7, §10.2)
+- [ ] **Soft-blend with a null/identity option** from the start — not argmax
+      switching. This is what preserves general-question behaviour and makes
+      misroutes graceful. (§10.3)
+- [ ] Measure int8 adapters against bf16 before adopting: `ARCHITECTURE.md` §14.1
+      currently specifies bf16 for adapters as "small, sensitive", and error lands
+      on the residual stream × 6 loops. If int8 holds, **update §14.1**. (§10.4)
+- [ ] Decide the mid-conversation switching policy (pin vs invalidate KV cache)
+      before integration, and reuse `_dispatch_grouped` (`model.py:594-627`) for
+      batched per-sequence adapters rather than adding a dependency. (§10.6)
+- [ ] Run `loop_depth_probe` (`monitoring.py:104`) per adapter before shipping —
+      a task score alone will not catch loop-dynamic damage. (§10.5)
+
 Deferred — revisit only if a larger-E model is on the table (§8):
 
 - [ ] Adaptive top-k. **Not queued for this model.** If a future config goes to
@@ -846,7 +1002,7 @@ Deferred — revisit only if a larger-E model is on the table (§8):
 
 ---
 
-## 11. Rejected, with reasons — do not re-litigate without new evidence
+## 12. Rejected, with reasons — do not re-litigate without new evidence
 
 | option | why rejected |
 |---|---|
@@ -866,10 +1022,13 @@ Deferred — revisit only if a larger-E model is on the table (§8):
 | Building a retriever / vector store for training | ~3× the cost per token of just pretraining on the same corpus, and FineWeb-Edu + Wikipedia already stream. Use context distillation on hints instead. §9.4, §9.6 |
 | Live web search in the training loop | Non-reproducible across resumes, variable quality, licensing exposure. A frozen dump is strictly better, and is what is already in use. §9.4 |
 | Context distillation with a differentiable teacher | Degenerate solution: make the output invariant to the context. KL → 0 while the model learns to *ignore* retrieval, and the loss curve looks great. Teacher must be stop-grad. §9.2 |
+| Mixture-of-LoRA at rank 256 | 50 × 14.16M = 708M of adapters, larger than the 601M base and ~3.8× the §14.2 deployment target. Low rank is what makes the pattern viable. §10.2 |
+| Hard adapter switching on classifier argmax | A misroute is catastrophic, and it cannot preserve general-question behaviour. Soft-blend the softmax with a null/identity option instead. §10.3 |
+| Starting at 50 adapters | Data fragmentation at 0.4× Chinchilla, and it destroys cross-domain transfer. ~5 broad adapters give most of the serving benefit at 1/10th the cost and tell you whether 50 is worth it. §10.7 |
 
 ---
 
-## 12. Standing constraint
+## 13. Standing constraint
 
 `docs/AGENT_HANDOFF.md:57-63`: the base has seen **~2.2B tokens ≈ 0.4× Chinchilla**
 for 278M active params. SFT and GRPO *elicit* latent capability; they do not
