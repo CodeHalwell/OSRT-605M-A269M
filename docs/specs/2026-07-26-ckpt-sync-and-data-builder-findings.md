@@ -16,7 +16,7 @@ implementations.
 | finding | severity | verdict |
 |---|---|---|
 | Checkpoints can be uploaded while still being written | **High** | **Confirmed.** `torch.save` writes directly to the glob-matched name; the sync daemon permanently marks a truncated upload as done. §1 |
-| The completed run's final checkpoint is never synchronized | **Medium-High** | **Confirmed, and broader than reported:** the 23h *rescue* checkpoint is also structurally excluded, and the daemon thread dies at process exit with no flush. §2 |
+| The completed run's final checkpoint is never synchronized | **Medium-High** | **Confirmed, and broader than reported:** the 23h *rescue* checkpoint is also structurally excluded, the daemon thread dies at process exit with no flush, **no `total_steps` value is exempt** (save-before-increment), and **widening the sync globs alone does not fix it** — the local resume scan also ignores `_final.pt`. §2 |
 | The chat slice bypasses the advertised decontamination + dedup | **Medium** | **Confirmed.** Slices 1–3 gate through `admit()`; the ~8.7k-row chat slice never calls it. §3 |
 
 Scope note: findings 1–2 bite only the Colab/Lightning path —
@@ -71,9 +71,25 @@ newest 3 (`hf_ckpt_sync.py:83-85`), so the corrupt newest is retained.
 
 1. **Final:** the end-of-run save is `osrt_v5_{prefix}_final.pt`
    (`train.py:2022-2023`), which can never match the daemon's
-   `{prefix}_step_*.pt` glob (`hf_ckpt_sync.py:70`). Unless `total_steps`
-   lands exactly on `ckpt_interval`, the tail of training exists only in
-   `_final.pt` on the ephemeral VM disk — lost when the VM is reclaimed.
+   `{prefix}_step_*.pt` glob (`hf_ckpt_sync.py:70`). The tail of training
+   exists only in `_final.pt` on the ephemeral VM disk — lost when the VM is
+   reclaimed.
+
+   > **Correction (PR #5 review, verified).** An earlier version of this
+   > paragraph read "unless `total_steps` lands exactly on `ckpt_interval`".
+   > **That exception does not exist.** The loop is `while step < total_steps`
+   > (`train.py:1748`) and saves *before* incrementing
+   > (`:1998` check, `:2019` increment), so the periodic block never executes at
+   > `step == total_steps`. The last iteration runs at `step = total_steps - 1`,
+   > so a numbered save equivalent to the final model requires
+   > **`(total_steps - 1) % ckpt_interval == 0`**, not `total_steps %
+   > ckpt_interval == 0`.
+   >
+   > This matters for the configuration actually in use: midtrain3 at
+   > **12,600 steps / interval 100** looks safe under the old rule but is not —
+   > `12599 % 100 = 99`, so the newest numbered artifact is **step 12,500** and
+   > the last 100 steps live only in `_final.pt`. **No current configuration is
+   > exempt.**
 2. **Rescue (not in the original finding):** the 23h-cap save is
    `osrt_v5_{prefix}_rescue_step_{step}.pt` (`train.py:2004-2008`).
    `_rescue_step_` does not match `_step_` immediately after the prefix, so
@@ -94,6 +110,17 @@ newest 3 (`hf_ckpt_sync.py:83-85`), so the corrupt newest is retained.
 - Widen the daemon glob and `pull_latest` patterns to cover
   `_rescue_step_*.pt` and `_final.pt` (resume preference order must mirror
   the local scan's rescue-on-ties logic).
+- ⚠️ **Widening the sync patterns is necessary but not sufficient** (PR #5
+  review, verified). `run_pretrain_extend`'s local resume scan iterates only
+  `osrt_v5_{prefix}_step_*.pt` and `osrt_v5_{prefix}_rescue_step_*.pt`
+  (`train.py:1635-1638`) and derives its ordering key from the trailing step
+  number. A downloaded `_final.pt` therefore has **no step to sort on and is
+  silently skipped** — a restarted or extended run would resume from an older
+  numbered checkpoint while the final weights sit unused on disk. The fix must
+  also either (a) teach the local scan to rank `_final.pt` above every numbered
+  file, or (b) persist the end-of-run save under a step-numbered name
+  (e.g. `_step_{total_steps}.pt`) so both the scan and the daemon glob match it
+  for free. **(b) is the smaller change and removes the special case entirely.**
 - Export a synchronous `flush()` from `hf_ckpt_sync` and call it from the
   trainer (or `lightning_midtrain3.py`) after the rescue/final save, before
   exit. The background thread alone can never make the last write durable.

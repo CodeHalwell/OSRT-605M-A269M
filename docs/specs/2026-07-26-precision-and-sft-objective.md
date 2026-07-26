@@ -20,11 +20,11 @@ infra findings: checkpoint sync races, data-builder decon gap).
 | Does fp8 let us use a smaller GPU? | **Wrong tool.** fp8 mixed precision is a speed technique; gradient checkpointing already claimed the memory it would save. §4 |
 | Is "group-relative SFT" worth building? | The weighting instinct is sound and **already has an exact closed form (focal loss)**. The sample-and-count step adds variance for nothing. §5 |
 | Anything genuinely new in the idea? | Yes — a **consistency loss over stochastic routing passes**. Architecture-specific, real experiment. §5.5 |
-| Are model-written hints for GRPO worth building? | **Yes — best of the ideas.** Targets the documented zero-gradient trap; ~66% of rollout budget currently produces no gradient. But hints must target *variance*, not success — and the recommended build is hint **context distillation** (§9.6), which supersedes §6.6's rejection-sampling SFT. §6 |
+| Are model-written hints for GRPO worth building? | **Unranked pending measurement** (was "best of the ideas"). The ~66%-wasted figure assumed a binary reward that no longer runs — `correctness_partial_credit` already exists to fix that trap, so the ROI case is retracted (§6.2). Instrument `std < 1e-8` first. If built: hints must target *variance*, and the objective is filtered context distillation (§9.6), not §6.6's plan. §6 |
 | An output-head correction layer? | **Yes — cheapest experiment here, lowest blast radius.** Fills a gap HRA structurally cannot reach (the tied LM head). ~65K (per-token logit bias) up to ~0.8–2.4M params (hidden-state head), zero-init so a failed run costs nothing. Fixes tying bias/calibration, not knowledge. §7 |
 | Adaptive expert count (variable top-k)? | **Defer, don't shrink.** Real technique, but its payoff scales with E and this model is E=8 by deliberate choice. Breaks the fixed shapes that buy fullgraph compile, and introduces an always-max-k degenerate solution. Revisit at E≥32. §8 |
 | RAG / web search into the training pipeline? | **Keep the mechanism, drop the retrieval.** The with/without-context objective is *context distillation* — real, and it supersedes the §6.6 plan. But build no retriever: apply it to the §6 hints instead. Live web search is strictly worse than the frozen dump already streaming. §9 |
-| Mixture-of-LoRA with a routing classifier? | **Viable as a serving pattern at low rank** — storage is ~12% overhead, not 3.8×. Two things to design in from the start: **soft-blend with a null adapter** (not hard switching), and note §14.1 says adapters are the one component to keep at bf16. §10 |
+| Mixture-of-LoRA with a routing classifier? | **Viable as a serving pattern at low rank** — storage is ~12% overhead, not 3.8×. Design in **soft-blend with a null adapter** (not hard switching). Note §14.1 keeps adapters at bf16. The native adapters are **already loop-specific** (`model.py:1658-1662`), so per-depth specialisation is free — an earlier claim to the contrary is corrected in §10.5. §10 |
 | Anything else being missed for training? | **Nine further opportunities catalogued.** Top three: verify cross-session data fast-forward (possible silent stream-head oversampling), cosine → trunk-and-branch (WSD) for drip training, and a small scaling ladder to re-derive the token target for a weight-reused model. §14 |
 
 ---
@@ -284,8 +284,22 @@ So the number of samples and the shape of `f` just parameterise γ:
 ```python
 # exact, no sampling — γ ≈ 1–2
 logp = F.log_softmax(shift_logits, -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
-loss = -((1 - logp.exp()).pow(gamma) * logp)[mask].mean()
+w    = (1 - logp.exp()).pow(gamma).detach()        # ← detach: see below
+loss = -(w * logp)[mask].mean()
 ```
+
+⚠️ **The `.detach()` is what makes the equivalence exact** (PR #5 review). The
+sampled count `k` is non-differentiable, so the sampling scheme's expected
+gradient is `E[f(k)] · ∇(-log p)` — the weight is a *constant* with respect to θ.
+Leaving `(1 - logp.exp())` attached adds a weight-derivative term and yields a
+**different objective**: that is ordinary focal loss (Lin et al.), which does
+backprop through its weight. Both are legitimate, but only the detached form is
+the zero-variance equivalent of the proposal. Pick deliberately:
+
+| form | objective |
+|---|---|
+| `w.detach()` | exact closed form of the 4-sample scheme |
+| `w` attached | standard focal loss — a different (also reasonable) objective |
 
 Cost of the sampling version instead: a **5-level quantized, noisy** estimate of
 the same weight. At `p_gold = 0.9` it heavily upweights an already-learned token
@@ -368,6 +382,32 @@ P(all 8 wrong) = 0.80^8 ≈ 17%     ← if hints lift per-rollout success to 20%
                                   → ~2.5× more usable groups per dollar (34% → 83% carry gradient)
 ```
 
+> 🚫 **RETRACTED — the arithmetic above assumes a binary reward that no longer
+> runs** (PR #5 review, verified). `compute_reward` uses
+> `correctness_partial_credit`, and its own docstring says the tiered schedule
+> was introduced *to fix exactly this*:
+>
+> > Replaces the original binary correctness (+1 if exact, 0 otherwise) which
+> > caused GRPO collapse on this model: at ~5 % gsm8k baseline acc with
+> > group_size=8, most groups had zero correct rollouts → uniform rewards → zero
+> > advantage → frozen updates. See `correctness_partial_credit()` for the tier
+> > schedule (**+5.0 exact down to -2.5 no-extract**).
+>
+> With a tiered schedule, eight *wrong* answers receive **different** scores, so
+> `std` does not collapse and `0.95^8` is not the wasted fraction. Length-ramp
+> and empty-thinking penalties add further within-group variance. **The ~2.5×
+> ROI does not follow, and neither does the "two thirds wasted" figure.**
+>
+> The §6.3 format-saturation argument is also misattributed: `match_format_*`
+> (`rewards.py:195`, `:210`) belongs to the multi-environment scorer, not the
+> math-only `app.py::grpo` loop this section is about.
+>
+> **What survives:** the zero-gradient trap is real and documented
+> (`train_config.py:2157-2159`), but its *current* frequency is unknown. The
+> §11 "instrument first" item — count groups with `std < 1e-8`, split all-wrong
+> vs all-right — is now a **precondition**, not a nice-to-have. Do not use this
+> section to prioritise the hint pipeline until that number exists.
+
 Full generation cost is paid regardless (`max_gen_len=384` × 8,
 `train_config.py:2182`).
 
@@ -404,10 +444,27 @@ The instinct that hints must not be universal is right, but random selection
 spends them on problems the model already solves — *adding* zero-gradient groups
 at the top end.
 
-**Adaptive selection is strictly better and cheap:** track per-prompt pass rate,
-hint only prompts sitting at 0/8, escalate L1→L3 until the group is mixed,
-withdraw the hint once a prompt reaches ~50%. Every hint is then spent where a
-zero-gradient group would otherwise have been.
+**Adaptive selection** — track per-prompt pass rate, hint only prompts sitting at
+0/8, escalate L1→L3 until the group is mixed, withdraw the hint once a prompt
+reaches ~50%. Every hint is then spent where a zero-gradient group would
+otherwise have been.
+
+⚠️ **It is not free, and the earlier "strictly better at the same cost" claim was
+wrong** (PR #5 review). At `batch_size=4` × `grad_accum_steps=4` × 800 steps, the
+streaming GSM8K iterator supplies only **~3,200 prompts** — fewer than GSM8K
+train's ~7.5k, so **prompts are not revisited during a run** and no pass-rate
+history accumulates. Establishing that a fresh prompt is at 0/8 requires
+generating an *unhinted* group first, then a hinted one: **2× rollout cost on
+exactly the prompts you select.**
+
+Three ways to pay for it, pick one explicitly:
+
+1. **Separate baseline pass** — one cheap unhinted sweep to label difficulty,
+   reused across runs. Amortises if the prompt set is stable.
+2. **Budget the probe** — accept 2× on selected prompts and size the hint
+   fraction accordingly.
+3. **Static difficulty proxy** — label by problem length / step count offline,
+   no probe at all. Weakest signal, zero rollout cost.
 
 ### 6.5 The decision that determines whether it transfers
 
@@ -574,13 +631,30 @@ covers attention and expert FFN across every block and the output projection
 ### 7.5 Implementation sketch
 
 Mirror the HRA init convention (`hra.py:59-62` — A random, B zeros) so the layer
-is an **exact no-op at step 0** and can be dropped onto an existing checkpoint
-without perturbing it:
+is an **exact no-op at step 0**:
 
 ```python
 # residual, zero-init `down` → exact identity before any training
 h = h + self.down(F.silu(self.up(self.norm(h))))   # up: dim→r, down: r→dim (zeros)
 ```
+
+⚠️ **Zero-init alone does *not* make it droppable onto an existing checkpoint**
+(PR #5 review, verified). `load_model_state_or_raise` (`train.py:150-166`) calls
+`load_state_dict(strict=False)` and then **raises on any missing or unexpected
+key** — its own error text says *"Use an explicit migration or start a fresh
+checkpoint directory."* Enabling the flag adds `norm`/`up`/`down` keys the
+checkpoint lacks, so resume fails immediately.
+
+One of these is required:
+
+1. **Attach after load** — construct the base model, load the checkpoint, *then*
+   instantiate and attach the head. Keeps the loader strict, no migration file.
+2. **Explicit allowlist** — permit missing keys matching the correction-head
+   prefix, and only those.
+3. **Migration pass** — rewrite the checkpoint once with zero-valued head keys.
+
+(1) is the least invasive and preserves the strict-load guarantee everywhere
+else, which exists to catch exactly this class of silent drift.
 
 - `r=256` → ~790K params; full `Linear(1536,1536)` → ~2.4M. Negligible vs 601M.
 - Zero-init means a failed experiment costs nothing — the checkpoint is unchanged
@@ -663,12 +737,20 @@ saving.**
 top-`(N·K)` (token, expert) pairs across the batch — confident tokens contribute
 fewer, ambiguous ones more, total stays exactly `N·K`. Shapes fixed, compute
 constant, allocation adaptive. But it is **batch-coupled**: a token's k depends
-on which other tokens share its batch. That breaks autoregressive decode
-(batch=1, one token at a time) — the same property that makes Expert-Choice
-routing awkward for generation.
+on which other tokens share its batch — the same property that makes
+Expert-Choice routing awkward for generation.
+
+**Correction (PR #5 review): this does not *break* single-token decode.** At
+`N=1` the global top-`(N·K)` selection simply picks `K` pairs for the lone token
+— ordinary fixed top-k. Generation runs fine; what is lost is per-token
+adaptivity during decode, leaving a **train/inference inconsistency** (adaptive
+during training and prefill, fixed during decode) rather than a failure. That is
+a real concern, but it also means fixed-k decode is a **viable fallback**, not a
+disqualification.
 
 > Summary: per-token adaptive works at inference but breaks shapes; batch-budget
-> keeps shapes but breaks decode.
+> keeps shapes and still decodes, but degenerates to fixed-k at batch 1 and
+> stays batch-dependent above it.
 
 ### 8.5 The new degenerate solution
 
@@ -743,11 +825,25 @@ weights.
 whether it works at all:
 
 ```python
-with torch.no_grad():
-    p_ctx = F.log_softmax(model(question + docs + y).logits, -1)   # teacher, detached
-p_bare = F.log_softmax(model(question + y).logits, -1)             # student, trainable
-loss = F.kl_div(p_bare, p_ctx, log_target=True, reduction="batchmean")
+# NOTE: the two branches have DIFFERENT prompt lengths — slice before the KL.
+with torch.no_grad():                                    # teacher, detached
+    lg_ctx = model(ctx_ids).logits[:, ctx_len - 1 : -1]   # ctx_ids  = question + docs + y
+lg_bare  = model(bare_ids).logits[:, bare_len - 1 : -1]  # bare_ids = question + y
+# both now cover the same |y| continuation positions
+loss = F.kl_div(
+    F.log_softmax(lg_bare, -1), F.log_softmax(lg_ctx, -1),
+    log_target=True, reduction="batchmean",
+)
 ```
+
+⚠️ **Two failure modes, both easy to miss:**
+
+1. **Shape mismatch (PR #5 review).** Written without the slices, `p_ctx` has a
+   longer sequence dimension than `p_bare` whenever the context is non-empty, and
+   `F.kl_div` raises rather than training. The prose flagged prefix alignment;
+   the snippet did not implement it. Both branches must be sliced to the *same
+   `|y|` continuation positions*, causally shifted.
+2. **The teacher must be stop-grad** — see below.
 
 Backprop through **both** branches and the objective has a trivial degenerate
 solution: make the output *invariant to the context*. KL → 0 and the model has
@@ -817,12 +913,33 @@ short generated one rather than a retrieved one. This gives:
 - **No sequence-budget hit.** SFT runs at `seq_len 2048`
   (`train_config.py:1215`), where retrieved documents would consume most of the
   window; hints are a line or two
-- A **strictly better objective than §6.6's rejection-sampling SFT**: full-
-  distribution KL uses the whole hinted distribution at every position —
-  including from rollouts that were *wrong* — instead of discarding failures and
-  flattening successes to one-hot targets. Far more signal per generation
+- **Denser signal than one-hot targets:** full-distribution KL uses the whole
+  hinted distribution at every position, instead of flattening a kept rollout to
+  one-hot
 - **The §6.5 off-policy problem dissolves.** KL distillation is not a policy
   gradient, so no importance weighting is needed
+
+⚠️ **"Strictly better" was wrong — filter the teacher first** (PR #5 review).
+The original claim counted *learning from wrong rollouts too* as an advantage. It
+is the opposite: when a hinted rollout is incorrect, the teacher has failed the
+pipeline's only correctness check, and applying KL at every position trains the
+unhinted student to **reproduce that wrong continuation**. Rejection sampling
+discards those; undiscriminating distillation actively reinforces them.
+
+The correct build combines both rather than replacing one with the other:
+
+```
+generate hinted rollouts
+  → score with compute_reward (the existing verifier)
+  → KEEP only correct ones            (rejection-sampling's filter)
+  → distil full-distribution KL from those, teacher stop-grad, on the
+    unhinted prefix                    (distillation's denser signal)
+  → optionally retain a verified-target CE term as an anchor
+```
+
+Reward-weighting the KL is the softer alternative to a hard filter, but some
+correctness gate is **required** — this objective is only better than §6.6 once
+the teacher trajectory is known-good.
 
 Cost is still 2 forward passes per step with a longer teacher branch, which
 lands on the §4 memory constraints. That is a far smaller bill than a retrieval
@@ -900,30 +1017,57 @@ precision:
 |---|---|---|
 | HRA adapters | **bf16** | kept full precision (**small, sensitive**) |
 
-Two reasons that call is not obviously wrong:
-
-1. `HRALinear.forward` (`hra.py:69+`) *adds* the adapter output to the base
-   output, so quantisation error lands directly on the residual stream rather
-   than being attenuated.
-2. Adapters sit on the 3 physical blocks and therefore run at **all 6 recursion
-   loops** — quantisation error compounds across loops, the same systematic-error
-   argument that rules out fp8 in §3.3.
+The reason that call is not obviously wrong: `HRALinear.forward` (`hra.py:69+`)
+*adds* the adapter output to the base output, so quantisation error lands
+directly on the residual stream rather than being attenuated.
 
 50 low-rank adapters is a different regime from one rank-256 adapter, so int8 may
 well hold. But it contradicts the current spec, so **measure it rather than
 assuming it** — and if §14.1 turns out to be wrong here, update §14.1.
 
-### 10.5 Recursion amplification
+> **Correction (PR #5 review):** an earlier version of this section gave a second
+> reason — that adapters run at all 6 loops, so quantisation error compounds the
+> way §3.3 describes for fp8. **That is false for the native adapter path** (see
+> §10.5). It has been removed; only the residual-stream argument stands.
 
-18 injection points = 6 per physical block, and each block runs 6×. Every
-adapter perturbs the same weights at all six recursion depths, where (per the
-design thesis) the block is doing different work — early loops surface, late
-loops abstract. **An adapter cannot be loop-specific.**
+### 10.5 ✅ Correction — the native adapters *are* loop-specific
 
-Loop collapse is the v5 lineage's headline failure (`LEARNINGS.md`). Low rank and
-low `scale` reduce the risk substantially, which is what makes the mild-adapter
-choice the right one here — but each adapter still wants a loop-depth probe
-(`monitoring.py:104`, `loop_depth_probe`) before it ships, not just a task score.
+An earlier version of this section claimed 18 injection points = 6 per physical
+block reused at every loop, and concluded "an adapter cannot be loop-specific."
+**That is backwards** (PR #5 review, verified at `model.py:1658-1662`):
+
+```python
+for loop in range(n_loops_to_run):
+    for block_idx, block in enumerate(self.blocks):
+        idx = loop * self.config.num_blocks + block_idx   # 0..17
+        adapter_a = self.adapters_a[idx]
+        adapter_b = self.adapters_b[idx]
+```
+
+`18 = 6 loops × 3 blocks` — **one adapter per *effective* layer**, each used at
+exactly one `(loop, block)` pair. The native adapters are already loop-specific
+by construction; nothing is reused across depths.
+
+**Two HRA paths exist, and only one has the reuse behaviour:**
+
+| path | layout | reused across loops? |
+|---|---|---|
+| **native** (`adapters_a/b` ParameterList, built from config) | one per effective layer | **No** |
+| legacy `inject_hra` (wraps `nn.Linear` inside blocks) | one per module | Yes |
+
+`app.py:1489` confirms which runs: *"HRA is native (built from config) —
+skipping inject_hra."* So the §7.4 finding that HRA cannot reach the **output
+head** still stands (native adapters are applied inside blocks either way), but
+every argument in these notes that depended on *adapters being replayed 6×* does
+not apply to the path in use.
+
+**What this changes:** a per-subject adapter can differentiate by recursion depth
+for free — early-loop and late-loop behaviour are separately parameterised. That
+is a point in the design's favour, and it removes the compounding-error concern
+from §10.4. The loop-depth probe (`monitoring.py:104`, `loop_depth_probe`) is
+still worth running per adapter before shipping, since loop collapse is the v5
+lineage's headline failure (`LEARNINGS.md`) — but as ordinary diligence, not to
+catch an amplification effect that isn't there.
 
 ### 10.6 Serving mechanics
 
@@ -991,23 +1135,31 @@ Not started. Roughly in priority order:
 - [ ] Profile `mhc_sinkhorn_iters=20` — Sinkhorn typically converges in 3–5;
       that's 20 bandwidth-bound passes × 18 effective layers. (§3.2)
 
-Hint track (§6), roughly in order:
+Hint track (§6) — **gated: do not start item 2 until item 1 returns a number.**
+The ROI case for this track was retracted (§6.2); its priority is unknown until
+measured.
 
-- [ ] **Instrument first** — log the fraction of GRPO groups with `std < 1e-8`,
-      split into all-wrong vs all-right. Confirms the ~66% estimate before any
-      hint is generated, and is the metric every later step is judged against. (§6.2)
+- [ ] **🚦 GATE — instrument first.** Log the fraction of GRPO groups with
+      `std < 1e-8`, split all-wrong vs all-right, under the reward that actually
+      runs (`compute_reward` + `correctness_partial_credit`, **not** binary
+      correctness). This was a confirmation step; it is now a **precondition**.
+      If the fraction is small, the whole track is low-value and should be
+      dropped. (§6.2)
 - [ ] **Generate graded L1/L2/L3 hints** offline over the prompt set; store as
       `{question_hash: [L1, L2, L3]}` (streaming rules out a lazy join). (§6.3, §6.7)
 - [ ] **Leakage filter** — reject any hint whose text yields the gold value under
       `extract_numeric_answer` / `_strict`; manual-read ~50. (§6.7)
-- [ ] **Hint context distillation** — the recommended first build (supersedes the
-      rejection-sampling plan in §6.6): teacher = model with hint in context
-      (**stop-grad**), student = model without, KL between them on the same
-      continuation. No off-policy correction, and it learns from wrong rollouts
-      too. (§9.2, §9.6)
+- [ ] **Filtered hint context distillation** — teacher = model with hint in
+      context (**stop-grad**), student = model without, KL on the same
+      continuation with **both branches sliced** to the shared `|y|` positions.
+      **Keep only rollouts the verifier scores correct** — unfiltered KL trains
+      the student to reproduce wrong teacher trajectories. (§9.2, §9.6)
 - [ ] Only if going into GRPO proper: adaptive selection targeting ~50% group
-      pass rate, hinted-vs-unhinted pass rate logged separately, and the
-      `prompt_len` / ratio≈1 fixes at `app.py:3098`, `:3186`, `:3202-3203`. (§6.4, §6.5)
+      pass rate — **and budget the difficulty probe** (~3,200 prompts per run
+      means no revisits, so labelling 0/8 costs an extra unhinted group; pick one
+      of the three funding options in §6.4). Log hinted-vs-unhinted pass rate
+      separately, plus the `prompt_len` / ratio≈1 fixes at `app.py:3098`,
+      `:3186`, `:3202-3203`. (§6.4, §6.5)
 
 Correction-head track (§7) — independent of the above, can run in parallel:
 
@@ -1016,7 +1168,10 @@ Correction-head track (§7) — independent of the above, can run in parallel:
       the capacity head below inherits a measured motivation. (§7.3)
 - [ ] **Zero-init residual correction head** behind a config flag, applied to
       `hidden` before the tied projection at `model.py:1874`. Exact no-op at
-      step 0, so it drops onto an existing checkpoint safely. (§7.5)
+      step 0 — but **zero-init alone does not make it loadable**:
+      `load_model_state_or_raise` (`train.py:150-166`) raises on any missing key,
+      so choose an attach-after-load / allowlist / migration strategy up front.
+      Applies to the logit-bias probe above too. (§7.5)
 - [ ] **Baseline first:** unhinted greedy accuracy + output entropy on the frozen
       base, so the before/after comparison exists. Shares the entropy
       instrumentation with the §5.6 item — do that one first and this is free. (§7.6)
@@ -1040,7 +1195,9 @@ Mixture-of-LoRA track (§10) — a **serving** play, independent of the training
       before integration, and reuse `_dispatch_grouped` (`model.py:594-627`) for
       batched per-sequence adapters rather than adding a dependency. (§10.6)
 - [ ] Run `loop_depth_probe` (`monitoring.py:104`) per adapter before shipping —
-      a task score alone will not catch loop-dynamic damage. (§10.5)
+      a task score alone will not catch loop-dynamic damage. Ordinary diligence,
+      **not** mitigation of a 6× amplification effect: the native adapters are
+      one-per-effective-layer and are never replayed across loops. (§10.5)
 
 Opportunity track (§14) — top three, in order:
 
@@ -1080,6 +1237,8 @@ Deferred — revisit only if a larger-E model is on the table (§8):
 | Unpadded variable-k dispatch | `sum(k_i)` is data-dependent → dynamic shape into grouped-GEMM → loses the fullgraph compile worth 9-12%. §8.3 |
 | Batch-global expert budget | Keeps shapes and compute fixed, but couples a token's k to its batch-mates — breaks autoregressive decode at batch=1. §8.4 |
 | Benchmarking padded adaptive-k against fixed top-2 | Padding to `max_k` pays `max_k` FLOPs; the honest baseline is fixed top-`max_k`. §8.7 |
+| Unfiltered KL distillation from hinted rollouts | Trains the student to reproduce **wrong** teacher continuations. Gate on the verifier (or reward-weight) before distilling. §9.6 |
+| An undetached focal weight sold as the *exact* equivalent | Backprops through the weight, adding a derivative term the sampled scheme doesn't have. That is ordinary focal loss — fine, but a different objective. §5.4 |
 | Building a retriever / vector store for training | ~3× the cost per token of just pretraining on the same corpus, and FineWeb-Edu + Wikipedia already stream. Use context distillation on hints instead. §9.4, §9.6 |
 | Live web search in the training loop | Non-reproducible across resumes, variable quality, licensing exposure. A frozen dump is strictly better, and is what is already in use. §9.4 |
 | Context distillation with a differentiable teacher | Degenerate solution: make the output invariant to the context. KL → 0 while the model learns to *ignore* retrieval, and the loss curve looks great. Teacher must be stop-grad. §9.2 |
