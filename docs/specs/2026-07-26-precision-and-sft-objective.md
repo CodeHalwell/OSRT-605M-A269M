@@ -2,7 +2,8 @@
 
 **Date:** 2026-07-26
 **Status:** Investigation — **nothing implemented, no config changed.** All
-findings below are reads of the current tree at `claude/model-precision-sarrdk`.
+findings below are reads of the tree at commit `7ebc2e7` (the `main` base of
+`claude/model-precision-sarrdk`).
 **Companions:** `ARCHITECTURE.md` §14–15, `docs/08-optimizer.md`,
 `docs/AGENT_HANDOFF.md` §1–2.
 
@@ -17,8 +18,8 @@ findings below are reads of the current tree at `claude/model-precision-sarrdk`.
 | Does fp8 let us use a smaller GPU? | **Wrong tool.** fp8 mixed precision is a speed technique; gradient checkpointing already claimed the memory it would save. §4 |
 | Is "group-relative SFT" worth building? | The weighting instinct is sound and **already has an exact closed form (focal loss)**. The sample-and-count step adds variance for nothing. §5 |
 | Anything genuinely new in the idea? | Yes — a **consistency loss over stochastic routing passes**. Architecture-specific, real experiment. §5.5 |
-| Are model-written hints for GRPO worth building? | **Yes — best of the ideas.** Targets the documented zero-gradient trap; ~66% of rollout budget currently produces no gradient. But hints must target *variance*, not success, and the simplest correct form is rejection-sampling SFT, not GRPO. §6 |
-| An output-head correction layer? | **Yes — cheapest experiment here, lowest blast radius.** Fills a gap HRA structurally cannot reach (the tied LM head). ~0.8–2.4M params, zero-init so a failed run costs nothing. Fixes tying bias/calibration, not knowledge. §7 |
+| Are model-written hints for GRPO worth building? | **Yes — best of the ideas.** Targets the documented zero-gradient trap; ~66% of rollout budget currently produces no gradient. But hints must target *variance*, not success — and the recommended build is hint **context distillation** (§9.6), which supersedes §6.6's rejection-sampling SFT. §6 |
+| An output-head correction layer? | **Yes — cheapest experiment here, lowest blast radius.** Fills a gap HRA structurally cannot reach (the tied LM head). ~65K (per-token logit bias) up to ~0.8–2.4M params (hidden-state head), zero-init so a failed run costs nothing. Fixes tying bias/calibration, not knowledge. §7 |
 | Adaptive expert count (variable top-k)? | **Defer, don't shrink.** Real technique, but its payoff scales with E and this model is E=8 by deliberate choice. Breaks the fixed shapes that buy fullgraph compile, and introduces an always-max-k degenerate solution. Revisit at E≥32. §8 |
 | RAG / web search into the training pipeline? | **Keep the mechanism, drop the retrieval.** The with/without-context objective is *context distillation* — real, and it supersedes the §6.6 plan. But build no retriever: apply it to the §6 hints instead. Live web search is strictly worse than the frozen dump already streaming. §9 |
 | Mixture-of-LoRA with a routing classifier? | **Viable as a serving pattern at low rank** — storage is ~12% overhead, not 3.8×. Two things to design in from the start: **soft-blend with a null adapter** (not hard switching), and note §14.1 says adapters are the one component to keep at bf16. §10 |
@@ -211,21 +212,44 @@ Those four should fit 601M on **24 GB** (4090 / L4) without touching precision.
 
 ### 5.2 The blocking premise: the forward pass is deterministic
 
-Same weights + same input tokens → **bit-identical logits**. The
-non-determinism in LLM generation lives entirely in the *sampling* step that
-draws a token **from** the distribution. In this model specifically:
+Same weights + same input tokens → the **same distribution** (identical up to
+floating-point noise: the grouped dispatch's `index_add_` at `model.py:626`
+uses CUDA atomics, so repeated forwards can differ in low-order bits — far
+below sampling variance, changing nothing that follows). The non-determinism
+in LLM generation lives entirely in the *sampling* step that draws a token
+**from** the distribution. In this model specifically:
 
 | source | default | status during SFT |
 |---|---|---|
 | activation/attention dropout | — | **does not exist in the model** |
-| loop dropout (stochastic depth), `model.py:1643` | `0.0` (`config.py:200`) | off |
+| loop dropout (stochastic depth), `model.py:1643` | `0.0` (`config.py:200`) | off in `sft_v2` (dead field — see below); **on (0.10) in `system_sft`** |
 | Gumbel router noise, `model.py:749-753` | `0.0` (`config.py:240`) | **off** — `PretrainExtendConfig` sets 0.0 (`train_config.py:414`) |
 
 Gumbel is live *only* during pretrain, annealed 0.5 → 0 over 4k steps
-(`train_config.py:187-189`). Loop dropout is set in `LoopFixV2Config` (0.2,
-`train_config.py:858`) and `PretrainExtend3Config` (0.10, `:924`).
+(`train_config.py:187-189`). Loop dropout is declared in six configs, not two:
+`LoopFixV2Config` (0.2, `train_config.py:858`), `PretrainExtend3Config`
+(0.10, `:924`), `MOPDConfig` (0.10, `:980`), `SystemSFTConfig` (0.10,
+`:1033`), `SFTv2Config` (0.10, `:1640`), `MultiEnvGRPOConfig` (0.05,
+`:2316`). Whether it *runs* depends on the stage plumbing threading it into
+the model config:
 
-**So during SFT there is no source of variation. Four passes → one
+- `mopd` (`app.py:1627`), `system_sft` (`app.py:1807`) and multi-env GRPO
+  (`app.py:3402`) **do** thread it — those stages train (and, for multi-env
+  GRPO, sample *and* score rollouts) with stochastic depth on.
+- `sft_v2` does **not**: `_run_sft_v2` builds the model config via
+  `build_config(...)` without the field (`app.py:766-773`), and
+  `run_pretrain_extend` never reads it — so
+  **`SFTv2Config.loop_dropout_prob = 0.10` is silently ignored at runtime**
+  (dead field; open item, §11).
+
+> ⚠️ **Correction recorded (review):** an earlier draft said flatly "during
+> SFT there is no source of variation." That is true for `sft_v2` only
+> because of the dead field above, and **false for `system_sft`**. The §5.3
+> reduction applies to any stage whose stochastic knobs are off at runtime;
+> where loop dropout actually runs, the passes genuinely differ and §5.5 is
+> the relevant analysis.
+
+**For `sft_v2` as plumbed there is no source of variation. Four passes → one
 distribution.**
 
 ### 5.3 What the scheme reduces to
@@ -282,6 +306,9 @@ passes and penalize disagreement (symmetric KL, R-Drop style) alongside CE. That
 trains "the answer shouldn't depend on which experts fired" — well-aimed given
 this repo's router-collapse history. **2 passes, so 2× forward, not 4×.**
 
+Per §5.2, `system_sft` already trains with loop dropout threaded at 0.10 — the
+stochastic substrate this needs is live in-tree today, not hypothetical.
+
 ### 5.6 Related: the diversity/repetition angle
 
 Separately established in-session — the repetition problem is real and measured
@@ -322,27 +349,27 @@ attempting to create knowledge.
 
 ### 6.2 The problem it solves — quantified
 
-`compute_group_advantages` (`rewards.py`) returns `[0.0]*n` whenever
-`std < 1e-8`. `train_config.py:36-41` records run 2 hitting exactly this:
+`compute_group_advantages` (`rewards.py:1325-1336`) returns `[0.0]*n` whenever
+`std < 1e-8`. `train_config.py:2157-2159` records run 2 hitting exactly this:
 
 > acc 12.5 % (0) → 18.8 % (10) → 0 % (20, 30) → 3.1 % … the rest were stuck in
 > GRPO's "all-rollouts-uniform-rewards" trap where group-relative advantage
 > normalisation produces zero [gradient]
 
 At GSM8K ~0.05 per-rollout (`AGENT_HANDOFF.md:54`) with `group_size=8`
-(`train_config.py:56`):
+(`train_config.py:2177`):
 
 ```
 P(all 8 wrong) = 0.95^8 ≈ 66%     ← two thirds of the rollout budget, zero gradient
 P(all 8 wrong) = 0.80^8 ≈ 17%     ← if hints lift per-rollout success to 20%
-                                  → ~3× more usable samples per dollar
+                                  → ~2.5× more usable groups per dollar (34% → 83% carry gradient)
 ```
 
 Full generation cost is paid regardless (`max_gen_len=384` × 8,
-`train_config.py:61`).
+`train_config.py:2182`).
 
 **This got worse when format was solved, which is easy to miss.**
-`AGENT_HANDOFF.md:53` reports `format_ok_on = 1.0`. With format saturated,
+`AGENT_HANDOFF.md:52` reports `format_ok_on = 1.0`. With format saturated,
 `match_format_exactly_score` and `match_format_approximately_score`
 (`rewards.py:195`, `:210`) are **constant within every group** and contribute no
 variance. Correctness is the only remaining varying term — so when all 8 are
@@ -473,7 +500,7 @@ add knowledge.
 
 ### 7.2 The shape already exists in-tree
 
-`MTPHead` (`model.py:1353-1376`) is exactly this construct:
+`MTPHead` (`model.py:1342-1363`) is exactly this construct:
 
 ```python
 class MTPHead(nn.Module):
@@ -485,7 +512,7 @@ class MTPHead(nn.Module):
 ```
 
 The +2/+3 MTP heads each get an `RMSNorm + Linear(dim, dim)` before the tied
-projection. **The main +1 path does not** — `model.py:1873` applies the tied
+projection. **The main +1 path does not** — `model.py:1873-1874` applies the tied
 embedding directly:
 
 ```python
@@ -500,13 +527,23 @@ non-linearity.
 
 | variant | can it change greedy argmax? | what it is |
 |---|---|---|
-| `z' = f(z)` — function of logits, monotone per-coordinate | **No.** Greedy decoding is bit-identical | temperature/calibration scaling |
+| `z' = f(z)` — one **shared** monotone scalar `f` on every logit | **No.** Greedy decoding is bit-identical | temperature/calibration scaling |
+| `z' = z + b` — learned **per-token** logit bias (~65K params) | Yes | the classic tied-head fix; cheapest variant here |
 | `z' = F.linear(g(h), E)` — function of the hidden state | Yes | **added output-layer capacity** |
 
 The first version cannot affect accuracy at all — worth knowing before building,
-since "better match the target" sounds like an accuracy claim.
+since "better match the target" sounds like an accuracy claim. But the
+monotone-therefore-argmax-preserving argument holds **only for a single shared
+`f`**: a per-coordinate family (each `f_i` monotone but different — `z + b` is
+the affine case) reorders logits freely.
 
-The second is the one worth building, but name it honestly: it is capacity, not
+The middle row is aimed at exactly the failure §7.6 describes — tying's
+systematic, **context-independent** per-token bias. A 65K-param zero-init bias
+vector is the step-zero experiment: ~12× cheaper than the r=256 head below,
+same drop-onto-checkpoint safety. If it moves nothing, the capacity argument
+for `g(h)` gets tested next, not first.
+
+The third is the full version, but name it honestly: it is capacity, not
 correction. **Hard ceiling: no function of `h` recovers information `h` does not
 encode.** If the final hidden state doesn't represent the answer, no non-linear
 map produces it.
@@ -577,7 +614,7 @@ larger-E model rather than shrinking it to fit E=8.
 
 ### 8.2 Scale — the payoff scales with E, and E=8 was a deliberate choice
 
-`presets.py:24-27` records the reasoning for 12 → 8 experts:
+`presets.py:6-10` records the reasoning for 12 → 8 experts:
 
 > 8 experts (not the original 12) trades sparsity for per-token capacity: each
 > token sees a larger fraction of the routed knowledge base, less risk of expert
@@ -657,8 +694,9 @@ assumes every token contributes exactly K pairs — **each normalizer divides by
 | `compute_budget.py:66` | `sparse_frac = top_k / num_routed` — **the headline active-param number** |
 
 The last is not just bookkeeping: "278M active per token" becomes a
-*distribution* rather than a number (~278M mean, roughly 180–520M range). That
-figure appears in the repo name, the preset names, and the `ARCHITECTURE.md`
+*distribution* rather than a number (slope ≈ 53M per unit k: ~225M at k=1,
+278M at today's top-2, ~385M at §8.7's padded k=4, ~600M ≈ physical at k=8).
+That figure appears in the repo name, the preset names, and the `ARCHITECTURE.md`
 §14.2 deployment memory math, which assumes a fixed active set.
 
 **Recursion compounds it:** 18 routing decisions per token (6 loops × 3 blocks),
@@ -818,7 +856,7 @@ rank 16:  1536 × 16 × 2 × 18 injection points  =    884,736 / adapter
           vs §14.2 deployment target ~377 MB   → 12-23% overhead
 ```
 
-Note the tradeoff being accepted: `presets.py:37` calls rank 256 *"real HRA
+Note the tradeoff being accepted: `presets.py:35` calls rank 256 *"real HRA
 capacity (NOT LoRA-style 16)"*. Dropping to 16 gives each adapter 1/16th the
 capacity — appropriate for the deliberately-mild adapters this design wants, but
 it is a real reduction, not a free win.
@@ -931,6 +969,11 @@ Not started. Roughly in priority order:
 
 - [ ] **Fix `CLAUDE.md`** — it claims CPU pre-flight / no GPU run; `AGENT_HANDOFF.md`
       documents pretrain → SFT v2 complete. Misleads prioritisation. (§1)
+- [ ] **Resolve the `SFTv2Config.loop_dropout_prob` dead field** — declared 0.10
+      (`train_config.py:1640`) but `_run_sft_v2` never threads it into the model
+      config (`app.py:766-773`), so sft_v2 trains at 0.0 while `system_sft` /
+      `mopd` / multi-env GRPO do thread theirs (`app.py:1807`, `:1627`, `:3402`).
+      Decide the intended behaviour, then thread it or delete it. (§5.2)
 - [ ] **mHC A/B probe** — `n_hc ∈ {4, 2, off}` at fixed seq/batch: peak VRAM,
       tok/s, and whether the `presets.py:38-42` NaN reproduces on GPU. Answers
       the smaller-GPU question *and* the oldest open architecture question. (§4.3)
@@ -965,8 +1008,11 @@ Hint track (§6), roughly in order:
 
 Correction-head track (§7) — independent of the above, can run in parallel:
 
+- [ ] **Learned per-token logit bias first** (~65K params, zero-init) — the
+      cheapest probe of the §7.4 tying bias; if it moves accuracy or entropy,
+      the capacity head below inherits a measured motivation. (§7.3)
 - [ ] **Zero-init residual correction head** behind a config flag, applied to
-      `hidden` before the tied projection at `model.py:1873`. Exact no-op at
+      `hidden` before the tied projection at `model.py:1874`. Exact no-op at
       step 0, so it drops onto an existing checkpoint safely. (§7.5)
 - [ ] **Baseline first:** unhinted greedy accuracy + output entropy on the frozen
       base, so the before/after comparison exists. Shares the entropy
@@ -1009,11 +1055,11 @@ Deferred — revisit only if a larger-E model is on the table (§8):
 | fp8 training for speed | `_grouped_mm` is bf16/fp16-only (`model.py:570`); `dim=1536` below the payoff shape; A100 has no fp8 silicon; compounds through 6 loops. §3 |
 | fp8 to fit a smaller GPU | Saves activations only, and gradient checkpointing already claimed those. Leaves the ~7.6 GB floor untouched. §4 |
 | GRPO-style group-relative SFT | User explicitly out of scope; the existing GRPO stack (`rewards.py::compute_group_advantages`, `app.py:3200-3215`) already implements it if ever wanted. |
-| Sampling 4 next-token candidates | Forward pass is deterministic (§5.2); any `f(k)` has an exact closed form (§5.3). Pure added variance. |
+| Sampling 4 next-token candidates | Forward pass is deterministic in stages whose stochastic knobs are off at runtime (§5.2); any `f(k)` then has an exact closed form (§5.3). Pure added variance. Where loop dropout actually runs, §5.5's consistency loss is the non-redundant form. |
 | Uniform label smoothing at ε=0.1 | V=65,536 → parks ~10% of mass on junk tokens. §5.6 |
 | Hints on a fixed random x% of prompts | Spends hints on already-solved problems, *adding* all-8-right zero-gradient groups. Adaptive 0/8-triggered selection dominates it at the same cost. §6.4 |
 | Single-strength hints | GRPO needs within-group variance, not success. One strength cannot land different-difficulty prompts near the p=0.5 variance peak. §6.3 |
-| A correction layer applied to the *logits* (monotone `f(z)`) | Cannot change greedy argmax — accuracy is bit-identical. Only calibration/sampling moves. Use `g(h)` before the tied projection instead. §7.3 |
+| A correction layer applied to the *logits* via one shared monotone `f(z)` | Cannot change greedy argmax — accuracy is bit-identical. Only calibration/sampling moves. NOT rejected: the per-token logit bias `z + b` and `g(h)` before the tied projection — both can move argmax. §7.3 |
 | Reaching the output head via HRA | `inject_hra` wraps `nn.Linear`; the head is a bare `F.linear` against `embedding.weight`, so no wrapper can attach. Needs its own module. §7.4 |
 | Variable top-k at E=8 | Payoff scales with E; 25% density already, and 12→8 was a deliberate move *toward* density. Deferred to E≥32, not rejected outright. §8.2 |
 | Unpadded variable-k dispatch | `sum(k_i)` is data-dependent → dynamic shape into grouped-GEMM → loses the fullgraph compile worth 9-12%. §8.3 |
