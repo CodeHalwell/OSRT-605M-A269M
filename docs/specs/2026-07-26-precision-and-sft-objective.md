@@ -19,6 +19,7 @@ findings below are reads of the current tree at `claude/model-precision-sarrdk`.
 | Anything genuinely new in the idea? | Yes — a **consistency loss over stochastic routing passes**. Architecture-specific, real experiment. §5.5 |
 | Are model-written hints for GRPO worth building? | **Yes — best of the ideas.** Targets the documented zero-gradient trap; ~66% of rollout budget currently produces no gradient. But hints must target *variance*, not success, and the simplest correct form is rejection-sampling SFT, not GRPO. §6 |
 | An output-head correction layer? | **Yes — cheapest experiment here, lowest blast radius.** Fills a gap HRA structurally cannot reach (the tied LM head). ~0.8–2.4M params, zero-init so a failed run costs nothing. Fixes tying bias/calibration, not knowledge. §7 |
+| Adaptive expert count (variable top-k)? | **Defer, don't shrink.** Real technique, but its payoff scales with E and this model is E=8 by deliberate choice. Breaks the fixed shapes that buy fullgraph compile, and introduces an always-max-k degenerate solution. Revisit at E≥32. §8 |
 
 ---
 
@@ -34,7 +35,7 @@ rather than getting re-litigated later.
 run yet… The model is in CPU pre-flight." `docs/AGENT_HANDOFF.md:47-63`
 documents pretrain → midtrain → midtrain2 → SFT v1/v2 as *done*, with a GSM8K
 result. `CLAUDE.md` should be corrected — a reader trusting it will prioritise
-completely wrong. **(Open item, §8.)**
+completely wrong. **(Open item, §9.)**
 
 ---
 
@@ -437,7 +438,7 @@ a training run, and it does not recur per step.
 
 ### 6.8 Caveats
 
-- Hints make the GRPO budget go further; they **do not add knowledge** (§10). If
+- Hints make the GRPO budget go further; they **do not add knowledge** (§11). If
   the base genuinely cannot do multi-step arithmetic, an L3 hint yields a
   completion the model could not have reached and likely cannot generalise from
   — closer to distillation than RL. **The tell is whether hinted performance
@@ -543,7 +544,7 @@ h = h + self.down(F.silu(self.up(self.norm(h))))   # up: dim→r, down: r→dim 
 ### 7.6 Measurement protocol and limits
 
 - **Cannot add knowledge.** "Fluent but wrong math" stays wrong — same ceiling
-  as §10.
+  as §11.
 - What it can plausibly fix is the systematic output bias tying imposes
   (over-favouring tokens with large embedding norm, independent of context) — a
   known effect and a plausible contributor to the repetition behaviour at
@@ -555,7 +556,121 @@ h = h + self.down(F.silu(self.up(self.norm(h))))   # up: dim→r, down: r→dim 
 
 ---
 
-## 8. Open items
+## 8. Adaptive expert count (variable top-k)
+
+### 8.1 The proposal
+
+> Make MoE routing fluid in the number of experts — up to x active, so in a
+> model with 50 experts a token might use anywhere from 2 to 10.
+
+**Assessment: a real technique aimed at the wrong host.** Defer to a
+larger-E model rather than shrinking it to fit E=8.
+
+### 8.2 Scale — the payoff scales with E, and E=8 was a deliberate choice
+
+`presets.py:24-27` records the reasoning for 12 → 8 experts:
+
+> 8 experts (not the original 12) trades sparsity for per-token capacity: each
+> token sees a larger fraction of the routed knowledge base, less risk of expert
+> under-utilization at this scale.
+
+Top-2 of 8 is already **25% routing density**. Adaptive-k is a technique for
+E=64/128/256, where routing is fine-grained enough that "how many experts does
+this token need" is a meaningful question. At E=8 the achievable range is roughly
+1–4, against a design decision that already moved *toward* density. The 50-expert
+framing in the original proposal is the right scale — that is simply a different
+model.
+
+### 8.3 The fixed-shape blocker
+
+`_dispatch_grouped` (`model.py:594-627`) is built around static shapes — its
+docstring: *"Fixed-shape ops only (argsort, bincount, cumsum, index_add) so the
+path is torch.compile-clean."* `presets.py:57-62` states the stakes:
+
+> Removes the per-expert `.nonzero()` — the only torch.compile graph break — so
+> the model compiles fullgraph. Validated on H100: … ~9-12% faster steady-state.
+
+The precise distinction, easy to get wrong: **per-expert counts already vary** —
+that is exactly what `bincount` → `cumsum` → `offs` exists to handle. What must
+stay fixed is the **total** `N*K`:
+
+```python
+K = self.top_k
+pair_expert = top_idx.reshape(-1)                       # (N*K,)
+pair_token  = torch.arange(N).repeat_interleave(K)      # (N*K,)
+```
+
+Variable k makes `sum(k_i)` data-dependent → dynamic leading dimension into
+grouped-GEMM → recompilation or graph break. The 9–12% is forfeit.
+
+### 8.4 Two escapes, each with a catch
+
+**(a) Pad to `max_k`, zero the gates on unused slots.** Shapes fixed, fullgraph
+survives. But grouped-GEMM computes every padded row regardless, so a "2–10"
+model costs exactly what fixed top-10 costs. **Adaptive allocation, zero compute
+saving.**
+
+**(b) Fixed global budget, variable per-token split.** Take the global
+top-`(N·K)` (token, expert) pairs across the batch — confident tokens contribute
+fewer, ambiguous ones more, total stays exactly `N·K`. Shapes fixed, compute
+constant, allocation adaptive. But it is **batch-coupled**: a token's k depends
+on which other tokens share its batch. That breaks autoregressive decode
+(batch=1, one token at a time) — the same property that makes Expert-Choice
+routing awkward for generation.
+
+> Summary: per-token adaptive works at inference but breaks shapes; batch-budget
+> keeps shapes but breaks decode.
+
+### 8.5 The new degenerate solution
+
+Given `LEARNINGS.md` is largely about router collapse, this deserves weight:
+**with variable k and no explicit penalty, more experts always lowers loss**, so
+the router learns to always select `max_k`. Sparsity is not self-enforcing the
+way it is at fixed top-k.
+
+Preventing it needs a compute-budget penalty on `E[k]` — another coefficient in
+an objective already carrying task + balance (0.10) + z-loss (1e-3) +
+seq-balance + aux-loop (0.05) + MTP (0.3), a system the configs document as
+tuning-fragile.
+
+### 8.6 Surface area
+
+`self.top_k` is load-bearing in ~15 sites. The balance machinery in particular
+assumes every token contributes exactly K pairs — **each normalizer divides by
+`N * self.top_k`**:
+
+| site | what breaks |
+|---|---|
+| `model.py:807, 836, 889, 938, 967` | balance `f_i`, seq-balance, prebias and clean variants — denominator becomes `sum(k_i)` |
+| `model.py:785, 788` | capacity calc `capacity_factor * top_k * N / num_routed` |
+| `model.py:915, 942, 971` | `if self.top_k >= 2` co-activation guards |
+| `_accumulate_balance_counts` (`model.py`) | bias controller assumes K counts per token |
+| `compute_budget.py:66` | `sparse_frac = top_k / num_routed` — **the headline active-param number** |
+
+The last is not just bookkeeping: "278M active per token" becomes a
+*distribution* rather than a number (~278M mean, roughly 180–520M range). That
+figure appears in the repo name, the preset names, and the `ARCHITECTURE.md`
+§14.2 deployment memory math, which assumes a fixed active set.
+
+**Recursion compounds it:** 18 routing decisions per token (6 loops × 3 blocks),
+each with variable k, so per-token compute variance stacks and step time becomes
+unpredictable. Per-loop accounting (`balance_count_accum[loop_idx]`) needs
+reworking at every site.
+
+### 8.7 If it is tried here anyway
+
+Route (a), padded to a small `max_k` — adaptive 1–4 padded to 4. Fullgraph
+survives, the balance denominators become `sum(k_i)` (a contained change), and it
+answers whether adaptive allocation helps at all.
+
+⚠️ **Evaluate at equal FLOPs.** If the padded path pays top-4 compute, the
+baseline is **fixed top-4, not fixed top-2**. Adaptive-1-to-4 beating top-2
+proves nothing — it has 2× the FLOPs. The question is only whether it beats
+top-4 at equal cost.
+
+---
+
+## 9. Open items
 
 Not started. Roughly in priority order:
 
@@ -602,9 +717,16 @@ Correction-head track (§7) — independent of the above, can run in parallel:
 - [ ] Label the outcome honestly: entropy moves but accuracy flat = a calibration
       layer, which is useful for sampling and **not** a reasoning result. (§7.6)
 
+Deferred — revisit only if a larger-E model is on the table (§8):
+
+- [ ] Adaptive top-k. **Not queued for this model.** If a future config goes to
+      E≥32, re-read §8 before designing the router: the fixed-shape constraint
+      (§8.3) and the always-max-k degenerate solution (§8.5) are the two things
+      that must be designed for up front, not retrofitted.
+
 ---
 
-## 9. Rejected, with reasons — do not re-litigate without new evidence
+## 10. Rejected, with reasons — do not re-litigate without new evidence
 
 | option | why rejected |
 |---|---|
@@ -617,10 +739,14 @@ Correction-head track (§7) — independent of the above, can run in parallel:
 | Single-strength hints | GRPO needs within-group variance, not success. One strength cannot land different-difficulty prompts near the p=0.5 variance peak. §6.3 |
 | A correction layer applied to the *logits* (monotone `f(z)`) | Cannot change greedy argmax — accuracy is bit-identical. Only calibration/sampling moves. Use `g(h)` before the tied projection instead. §7.3 |
 | Reaching the output head via HRA | `inject_hra` wraps `nn.Linear`; the head is a bare `F.linear` against `embedding.weight`, so no wrapper can attach. Needs its own module. §7.4 |
+| Variable top-k at E=8 | Payoff scales with E; 25% density already, and 12→8 was a deliberate move *toward* density. Deferred to E≥32, not rejected outright. §8.2 |
+| Unpadded variable-k dispatch | `sum(k_i)` is data-dependent → dynamic shape into grouped-GEMM → loses the fullgraph compile worth 9-12%. §8.3 |
+| Batch-global expert budget | Keeps shapes and compute fixed, but couples a token's k to its batch-mates — breaks autoregressive decode at batch=1. §8.4 |
+| Benchmarking padded adaptive-k against fixed top-2 | Padding to `max_k` pays `max_k` FLOPs; the honest baseline is fixed top-`max_k`. §8.7 |
 
 ---
 
-## 10. Standing constraint
+## 11. Standing constraint
 
 `docs/AGENT_HANDOFF.md:57-63`: the base has seen **~2.2B tokens ≈ 0.4× Chinchilla**
 for 278M active params. SFT and GRPO *elicit* latent capability; they do not
