@@ -20,6 +20,7 @@ findings below are reads of the current tree at `claude/model-precision-sarrdk`.
 | Are model-written hints for GRPO worth building? | **Yes — best of the ideas.** Targets the documented zero-gradient trap; ~66% of rollout budget currently produces no gradient. But hints must target *variance*, not success, and the simplest correct form is rejection-sampling SFT, not GRPO. §6 |
 | An output-head correction layer? | **Yes — cheapest experiment here, lowest blast radius.** Fills a gap HRA structurally cannot reach (the tied LM head). ~0.8–2.4M params, zero-init so a failed run costs nothing. Fixes tying bias/calibration, not knowledge. §7 |
 | Adaptive expert count (variable top-k)? | **Defer, don't shrink.** Real technique, but its payoff scales with E and this model is E=8 by deliberate choice. Breaks the fixed shapes that buy fullgraph compile, and introduces an always-max-k degenerate solution. Revisit at E≥32. §8 |
+| RAG / web search into the training pipeline? | **Keep the mechanism, drop the retrieval.** The with/without-context objective is *context distillation* — real, and it supersedes the §6.6 plan. But build no retriever: apply it to the §6 hints instead. Live web search is strictly worse than the frozen dump already streaming. §9 |
 
 ---
 
@@ -35,7 +36,7 @@ rather than getting re-litigated later.
 run yet… The model is in CPU pre-flight." `docs/AGENT_HANDOFF.md:47-63`
 documents pretrain → midtrain → midtrain2 → SFT v1/v2 as *done*, with a GSM8K
 result. `CLAUDE.md` should be corrected — a reader trusting it will prioritise
-completely wrong. **(Open item, §9.)**
+completely wrong. **(Open item, §10.)**
 
 ---
 
@@ -420,6 +421,13 @@ and never appears in the trained policy's input.
 If it must be GRPO: Option A with adaptive selection, tracking hinted-vs-unhinted
 pass rate separately, adding importance weighting only if a transfer gap shows up.
 
+> **Superseded — see §9.** Context distillation is a strictly better objective
+> than rejection-sampling SFT for the same hint pipeline: it uses the full hinted
+> distribution at every position (including from rollouts that were *wrong*)
+> rather than discarding failures and reducing successes to one-hot targets. It
+> also dissolves the §6.5 off-policy problem, since KL distillation is not a
+> policy gradient and needs no importance weighting. Build §9.4, not this.
+
 ### 6.7 Two guards worth building in
 
 **Leakage.** `LEARNINGS.md` is largely about reward hacking biting v5. A hint
@@ -438,7 +446,7 @@ a training run, and it does not recur per step.
 
 ### 6.8 Caveats
 
-- Hints make the GRPO budget go further; they **do not add knowledge** (§11). If
+- Hints make the GRPO budget go further; they **do not add knowledge** (§12). If
   the base genuinely cannot do multi-step arithmetic, an L3 hint yields a
   completion the model could not have reached and likely cannot generalise from
   — closer to distillation than RL. **The tell is whether hinted performance
@@ -544,7 +552,7 @@ h = h + self.down(F.silu(self.up(self.norm(h))))   # up: dim→r, down: r→dim 
 ### 7.6 Measurement protocol and limits
 
 - **Cannot add knowledge.** "Fluent but wrong math" stays wrong — same ceiling
-  as §11.
+  as §12.
 - What it can plausibly fix is the systematic output bias tying imposes
   (over-favouring tokens with large embedding norm, independent of context) — a
   known effect and a plausible contributor to the repetition behaviour at
@@ -670,7 +678,117 @@ top-4 at equal cost.
 
 ---
 
-## 9. Open items
+## 9. Retrieval and context distillation
+
+### 9.1 The proposal
+
+> Add RAG to the SFT and/or RL pipeline to help the model learn complex topics.
+> Maybe web search too, but the model does not call these as tools. Generate
+> responses with and without, and use the difference in the output distribution
+> to update the weights.
+
+**Assessment: the mechanism is correctly identified and worth building. The
+retrieval infrastructure around it is not — not at this stage.**
+
+### 9.2 The mechanism has a name: context distillation
+
+"Generate with and without, use the difference to update the weights" is the
+context-distillation objective — the standard method for internalising a context
+(system prompts, few-shot examples, scratchpads, retrieved documents) into
+weights.
+
+⚠️ **The teacher branch must be stop-grad.** This is the detail that decides
+whether it works at all:
+
+```python
+with torch.no_grad():
+    p_ctx = F.log_softmax(model(question + docs + y).logits, -1)   # teacher, detached
+p_bare = F.log_softmax(model(question + y).logits, -1)             # student, trainable
+loss = F.kl_div(p_bare, p_ctx, log_target=True, reduction="batchmean")
+```
+
+Backprop through **both** branches and the objective has a trivial degenerate
+solution: make the output *invariant to the context*. KL → 0 and the model has
+been trained to ignore retrieval entirely — the exact opposite of the goal, and
+it fails quietly because the loss curve looks excellent.
+
+Both branches must also be scored on the **same continuation `y`**, and their
+`prompt_len` differs — the same prefix-alignment problem as §6.5.
+
+### 9.3 What this can do that the other proposals cannot
+
+This and the hint pipeline (§6) are the **only two ideas in these notes that
+bring external information into the weights**. Focal loss (§5), the correction
+head (§7), and adaptive routing (§8) all rearrange what is already there.
+Retrieved documents are genuinely new information, so context distillation is
+not capped by the §12 "elicit, don't create" ceiling.
+
+That makes it the first proposal here with a real knowledge-transfer channel —
+and also the one most easily mistaken for a cheaper alternative to pretraining,
+which it is not (§9.4).
+
+### 9.4 Why the retrieval half is the wrong tool *for this bottleneck*
+
+Reaching 1× Chinchilla needs ~+3.4B tokens. Per useful token:
+
+| approach | cost |
+|---|---|
+| plain next-token training on the corpus | 1 forward, no questions needed |
+| context distillation | 2 forwards + question generation + the teacher's context tokens |
+
+**If the goal is facts in the weights and a corpus exists, pretrain on it** —
+roughly 3× cheaper per token, and it is what §12 has been pointing at
+throughout. Context distillation earns its cost when the context is *procedural*
+(a format, a reasoning pattern, a system prompt you don't want to pay for at
+inference), not when it is factual.
+
+The corpus side is also already solved: `train_config.py:205, 272, 516` stream
+FineWeb-Edu, with CodeParrot and Wikipedia in the knowledge phase. **There is no
+retrieval infrastructure in the repo** — no faiss, no embedding model, no index —
+so this would mean building a retriever, chunker and vector store from scratch
+against a custom 65K tokenizer.
+
+**On web search specifically:** for a training pipeline, live search is strictly
+worse than a frozen dump — non-reproducible runs, quality variance, licensing
+exposure, no determinism across resumes. FineWeb-Edu *is* the frozen web dump,
+and it is already streaming.
+
+### 9.5 A fork to decide explicitly
+
+Keeping retrieval out of the model's hands (no tool-calling) is the right call —
+tool use is a large ask for a 601M undertrained base and it changes the
+deployment story. But it creates a fork:
+
+| where retrieval lives | what to train |
+|---|---|
+| inference **and** training | just train with context present — standard RAG fine-tuning, **no distillation needed** |
+| training only | context distillation, to internalise it — the proposal as described |
+
+Only the second needs the with/without machinery.
+
+### 9.6 Recommendation — keep the mechanism, drop the retrieval
+
+**Apply context distillation to the §6 hints.** A hint *is* a context, just a
+short generated one rather than a retrieved one. This gives:
+
+- No retriever, no index, no corpus, no new subsystem
+- **No sequence-budget hit.** SFT runs at `seq_len 2048`
+  (`train_config.py:1215`), where retrieved documents would consume most of the
+  window; hints are a line or two
+- A **strictly better objective than §6.6's rejection-sampling SFT**: full-
+  distribution KL uses the whole hinted distribution at every position —
+  including from rollouts that were *wrong* — instead of discarding failures and
+  flattening successes to one-hot targets. Far more signal per generation
+- **The §6.5 off-policy problem dissolves.** KL distillation is not a policy
+  gradient, so no importance weighting is needed
+
+Cost is still 2 forward passes per step with a longer teacher branch, which
+lands on the §4 memory constraints. That is a far smaller bill than a retrieval
+stack.
+
+---
+
+## 10. Open items
 
 Not started. Roughly in priority order:
 
@@ -699,9 +817,11 @@ Hint track (§6), roughly in order:
       `{question_hash: [L1, L2, L3]}` (streaming rules out a lazy join). (§6.3, §6.7)
 - [ ] **Leakage filter** — reject any hint whose text yields the gold value under
       `extract_numeric_answer` / `_strict`; manual-read ~50. (§6.7)
-- [ ] **Hint-assisted rejection sampling → SFT** — the recommended first build:
-      generate with hints, keep correct completions, plain CE on the *unhinted*
-      question. Reuses the SFT stack, no off-policy correction. (§6.6)
+- [ ] **Hint context distillation** — the recommended first build (supersedes the
+      rejection-sampling plan in §6.6): teacher = model with hint in context
+      (**stop-grad**), student = model without, KL between them on the same
+      continuation. No off-policy correction, and it learns from wrong rollouts
+      too. (§9.2, §9.6)
 - [ ] Only if going into GRPO proper: adaptive selection targeting ~50% group
       pass rate, hinted-vs-unhinted pass rate logged separately, and the
       `prompt_len` / ratio≈1 fixes at `app.py:3098`, `:3186`, `:3202-3203`. (§6.4, §6.5)
@@ -726,7 +846,7 @@ Deferred — revisit only if a larger-E model is on the table (§8):
 
 ---
 
-## 10. Rejected, with reasons — do not re-litigate without new evidence
+## 11. Rejected, with reasons — do not re-litigate without new evidence
 
 | option | why rejected |
 |---|---|
@@ -743,10 +863,13 @@ Deferred — revisit only if a larger-E model is on the table (§8):
 | Unpadded variable-k dispatch | `sum(k_i)` is data-dependent → dynamic shape into grouped-GEMM → loses the fullgraph compile worth 9-12%. §8.3 |
 | Batch-global expert budget | Keeps shapes and compute fixed, but couples a token's k to its batch-mates — breaks autoregressive decode at batch=1. §8.4 |
 | Benchmarking padded adaptive-k against fixed top-2 | Padding to `max_k` pays `max_k` FLOPs; the honest baseline is fixed top-`max_k`. §8.7 |
+| Building a retriever / vector store for training | ~3× the cost per token of just pretraining on the same corpus, and FineWeb-Edu + Wikipedia already stream. Use context distillation on hints instead. §9.4, §9.6 |
+| Live web search in the training loop | Non-reproducible across resumes, variable quality, licensing exposure. A frozen dump is strictly better, and is what is already in use. §9.4 |
+| Context distillation with a differentiable teacher | Degenerate solution: make the output invariant to the context. KL → 0 while the model learns to *ignore* retrieval, and the loss curve looks great. Teacher must be stop-grad. §9.2 |
 
 ---
 
-## 11. Standing constraint
+## 12. Standing constraint
 
 `docs/AGENT_HANDOFF.md:57-63`: the base has seen **~2.2B tokens ≈ 0.4× Chinchilla**
 for 278M active params. SFT and GRPO *elicit* latent capability; they do not
