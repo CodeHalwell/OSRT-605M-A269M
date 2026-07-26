@@ -18,6 +18,7 @@ findings below are reads of the current tree at `claude/model-precision-sarrdk`.
 | Is "group-relative SFT" worth building? | The weighting instinct is sound and **already has an exact closed form (focal loss)**. The sample-and-count step adds variance for nothing. §5 |
 | Anything genuinely new in the idea? | Yes — a **consistency loss over stochastic routing passes**. Architecture-specific, real experiment. §5.5 |
 | Are model-written hints for GRPO worth building? | **Yes — best of the ideas.** Targets the documented zero-gradient trap; ~66% of rollout budget currently produces no gradient. But hints must target *variance*, not success, and the simplest correct form is rejection-sampling SFT, not GRPO. §6 |
+| An output-head correction layer? | **Yes — cheapest experiment here, lowest blast radius.** Fills a gap HRA structurally cannot reach (the tied LM head). ~0.8–2.4M params, zero-init so a failed run costs nothing. Fixes tying bias/calibration, not knowledge. §7 |
 
 ---
 
@@ -33,7 +34,7 @@ rather than getting re-litigated later.
 run yet… The model is in CPU pre-flight." `docs/AGENT_HANDOFF.md:47-63`
 documents pretrain → midtrain → midtrain2 → SFT v1/v2 as *done*, with a GSM8K
 result. `CLAUDE.md` should be corrected — a reader trusting it will prioritise
-completely wrong. **(Open item, §7.)**
+completely wrong. **(Open item, §8.)**
 
 ---
 
@@ -436,7 +437,7 @@ a training run, and it does not recur per step.
 
 ### 6.8 Caveats
 
-- Hints make the GRPO budget go further; they **do not add knowledge** (§9). If
+- Hints make the GRPO budget go further; they **do not add knowledge** (§10). If
   the base genuinely cannot do multi-step arithmetic, an L3 hint yields a
   completion the model could not have reached and likely cannot generalise from
   — closer to distillation than RL. **The tell is whether hinted performance
@@ -448,7 +449,113 @@ a training run, and it does not recur per step.
 
 ---
 
-## 7. Open items
+## 7. Output-head correction layer
+
+### 7.1 The proposal
+
+> A post-training "correction factor" layer whose sole job is to nudge the
+> output distribution to better match the target — some non-linear function
+> applied on top of the existing head.
+
+**Assessment: the cheapest experiment in this note and the lowest blast radius.**
+It fills a structural gap the existing adapter path cannot reach. It does not
+add knowledge.
+
+### 7.2 The shape already exists in-tree
+
+`MTPHead` (`model.py:1353-1376`) is exactly this construct:
+
+```python
+class MTPHead(nn.Module):
+    """Small projection applied to the FINAL post-norm_out hidden state before
+    the WEIGHT-TIED LM head (the embedding) turns it into vocab logits."""
+    def __init__(self, dim):
+        self.norm = nn.RMSNorm(dim)
+        self.proj = nn.Linear(dim, dim, bias=False)
+```
+
+The +2/+3 MTP heads each get an `RMSNorm + Linear(dim, dim)` before the tied
+projection. **The main +1 path does not** — `model.py:1873` applies the tied
+embedding directly:
+
+```python
+logits = F.linear(hidden, self.model.embedding.weight)
+```
+
+So the primary head is *less* parameterised than the auxiliary ones. The
+proposal amounts to giving the +1 path what the MTP paths already have, plus a
+non-linearity.
+
+### 7.3 Be precise about the input
+
+| variant | can it change greedy argmax? | what it is |
+|---|---|---|
+| `z' = f(z)` — function of logits, monotone per-coordinate | **No.** Greedy decoding is bit-identical | temperature/calibration scaling |
+| `z' = F.linear(g(h), E)` — function of the hidden state | Yes | **added output-layer capacity** |
+
+The first version cannot affect accuracy at all — worth knowing before building,
+since "better match the target" sounds like an accuracy claim.
+
+The second is the one worth building, but name it honestly: it is capacity, not
+correction. **Hard ceiling: no function of `h` recovers information `h` does not
+encode.** If the final hidden state doesn't represent the answer, no non-linear
+map produces it.
+
+### 7.4 Why it pays *here* — the tying gap
+
+The LM head is **weight-tied to the embedding** (`model.py:1783-1784`, ~100M
+params saved at 65K vocab). Tying forces the output projection to *be* the input
+representation matrix — it cannot specialise. A learned `g(h)` before the tied
+projection is the standard escape valve, and is why `MTPHead` exists at all.
+
+The non-obvious part — **HRA structurally cannot reach the output head:**
+
+```python
+target_modules = ("q_proj", "kv_down", "v_from_k", "out_proj",
+                  "w_gate", "w_up", "w_down")     # hra.py:96-99
+```
+
+`inject_hra` wraps `nn.Linear` modules (`hra.py:121`). The head is not one — it
+is a bare `F.linear` call against `embedding.weight`, so no wrapper can ever
+attach. The existing parameter-efficient path (used by GRPO, `app.py:2976`)
+covers attention and expert FFN across every block and the output projection
+**not at all**. A correction head fills that gap rather than duplicating HRA.
+
+### 7.5 Implementation sketch
+
+Mirror the HRA init convention (`hra.py:59-62` — A random, B zeros) so the layer
+is an **exact no-op at step 0** and can be dropped onto an existing checkpoint
+without perturbing it:
+
+```python
+# residual, zero-init `down` → exact identity before any training
+h = h + self.down(F.silu(self.up(self.norm(h))))   # up: dim→r, down: r→dim (zeros)
+```
+
+- `r=256` → ~790K params; full `Linear(1536,1536)` → ~2.4M. Negligible vs 601M.
+- Zero-init means a failed experiment costs nothing — the checkpoint is unchanged
+  until the layer learns something.
+- Base frozen → last-layer fine-tuning. Unfrozen alongside HRA → composes with
+  the path GRPO already uses.
+- Gate behind an `OSRTConfig` field defaulting to off, as with
+  `fused_cross_entropy_chunks`, so the default forward stays bit-identical.
+
+### 7.6 Measurement protocol and limits
+
+- **Cannot add knowledge.** "Fluent but wrong math" stays wrong — same ceiling
+  as §10.
+- What it can plausibly fix is the systematic output bias tying imposes
+  (over-favouring tokens with large embedding norm, independent of context) — a
+  known effect and a plausible contributor to the repetition behaviour at
+  `lm_eval_wrapper.py:136-149`.
+- **Measure unhinted greedy accuracy *and* output entropy, before/after, on a
+  frozen base.** If entropy moves but accuracy doesn't, what got built is a
+  calibration layer: useful for sampling, not for GSM8K. That is a legitimate
+  outcome — just label it correctly rather than reporting it as a reasoning win.
+
+---
+
+## 8. Open items
 
 Not started. Roughly in priority order:
 
@@ -484,9 +591,20 @@ Hint track (§6), roughly in order:
       pass rate, hinted-vs-unhinted pass rate logged separately, and the
       `prompt_len` / ratio≈1 fixes at `app.py:3098`, `:3186`, `:3202-3203`. (§6.4, §6.5)
 
+Correction-head track (§7) — independent of the above, can run in parallel:
+
+- [ ] **Zero-init residual correction head** behind a config flag, applied to
+      `hidden` before the tied projection at `model.py:1873`. Exact no-op at
+      step 0, so it drops onto an existing checkpoint safely. (§7.5)
+- [ ] **Baseline first:** unhinted greedy accuracy + output entropy on the frozen
+      base, so the before/after comparison exists. Shares the entropy
+      instrumentation with the §5.6 item — do that one first and this is free. (§7.6)
+- [ ] Label the outcome honestly: entropy moves but accuracy flat = a calibration
+      layer, which is useful for sampling and **not** a reasoning result. (§7.6)
+
 ---
 
-## 8. Rejected, with reasons — do not re-litigate without new evidence
+## 9. Rejected, with reasons — do not re-litigate without new evidence
 
 | option | why rejected |
 |---|---|
@@ -497,10 +615,12 @@ Hint track (§6), roughly in order:
 | Uniform label smoothing at ε=0.1 | V=65,536 → parks ~10% of mass on junk tokens. §5.6 |
 | Hints on a fixed random x% of prompts | Spends hints on already-solved problems, *adding* all-8-right zero-gradient groups. Adaptive 0/8-triggered selection dominates it at the same cost. §6.4 |
 | Single-strength hints | GRPO needs within-group variance, not success. One strength cannot land different-difficulty prompts near the p=0.5 variance peak. §6.3 |
+| A correction layer applied to the *logits* (monotone `f(z)`) | Cannot change greedy argmax — accuracy is bit-identical. Only calibration/sampling moves. Use `g(h)` before the tied projection instead. §7.3 |
+| Reaching the output head via HRA | `inject_hra` wraps `nn.Linear`; the head is a bare `F.linear` against `embedding.weight`, so no wrapper can attach. Needs its own module. §7.4 |
 
 ---
 
-## 9. Standing constraint
+## 10. Standing constraint
 
 `docs/AGENT_HANDOFF.md:57-63`: the base has seen **~2.2B tokens ≈ 0.4× Chinchilla**
 for 278M active params. SFT and GRPO *elicit* latent capability; they do not
