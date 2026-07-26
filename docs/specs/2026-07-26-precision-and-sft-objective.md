@@ -17,6 +17,7 @@ findings below are reads of the current tree at `claude/model-precision-sarrdk`.
 | Does fp8 let us use a smaller GPU? | **Wrong tool.** fp8 mixed precision is a speed technique; gradient checkpointing already claimed the memory it would save. §4 |
 | Is "group-relative SFT" worth building? | The weighting instinct is sound and **already has an exact closed form (focal loss)**. The sample-and-count step adds variance for nothing. §5 |
 | Anything genuinely new in the idea? | Yes — a **consistency loss over stochastic routing passes**. Architecture-specific, real experiment. §5.5 |
+| Are model-written hints for GRPO worth building? | **Yes — best of the ideas.** Targets the documented zero-gradient trap; ~66% of rollout budget currently produces no gradient. But hints must target *variance*, not success, and the simplest correct form is rejection-sampling SFT, not GRPO. §6 |
 
 ---
 
@@ -32,7 +33,7 @@ rather than getting re-litigated later.
 run yet… The model is in CPU pre-flight." `docs/AGENT_HANDOFF.md:47-63`
 documents pretrain → midtrain → midtrain2 → SFT v1/v2 as *done*, with a GSM8K
 result. `CLAUDE.md` should be corrected — a reader trusting it will prioritise
-completely wrong. **(Open item, §6.)**
+completely wrong. **(Open item, §7.)**
 
 ---
 
@@ -303,7 +304,151 @@ missing knowledge.** Good if the goal is generation variety; will not move GSM8K
 
 ---
 
-## 6. Open items
+## 6. Hint-augmented GRPO
+
+### 6.1 The proposal
+
+> Use a frontier model to write hints for GRPO questions. Hints guide *how* to
+> answer without answering. Apply to x% of questions so the model doesn't come
+> to rely on them.
+
+**Assessment: the best-aimed of the ideas in this note.** It attacks a failure
+mode the configs already document, and it buys sample efficiency rather than
+attempting to create knowledge.
+
+### 6.2 The problem it solves — quantified
+
+`compute_group_advantages` (`rewards.py`) returns `[0.0]*n` whenever
+`std < 1e-8`. `train_config.py:36-41` records run 2 hitting exactly this:
+
+> acc 12.5 % (0) → 18.8 % (10) → 0 % (20, 30) → 3.1 % … the rest were stuck in
+> GRPO's "all-rollouts-uniform-rewards" trap where group-relative advantage
+> normalisation produces zero [gradient]
+
+At GSM8K ~0.05 per-rollout (`AGENT_HANDOFF.md:54`) with `group_size=8`
+(`train_config.py:56`):
+
+```
+P(all 8 wrong) = 0.95^8 ≈ 66%     ← two thirds of the rollout budget, zero gradient
+P(all 8 wrong) = 0.80^8 ≈ 17%     ← if hints lift per-rollout success to 20%
+                                  → ~3× more usable samples per dollar
+```
+
+Full generation cost is paid regardless (`max_gen_len=384` × 8,
+`train_config.py:61`).
+
+**This got worse when format was solved, which is easy to miss.**
+`AGENT_HANDOFF.md:53` reports `format_ok_on = 1.0`. With format saturated,
+`match_format_exactly_score` and `match_format_approximately_score`
+(`rewards.py:195`, `:210`) are **constant within every group** and contribute no
+variance. Correctness is the only remaining varying term — so when all 8 are
+wrong, `std` genuinely collapses. Solving format removed the consolation-prize
+gradient that used to mask this.
+
+### 6.3 The symmetry that breaks the naive design
+
+`std < 1e-8` fires when **all 8 are right** exactly as it does when all 8 are
+wrong. GRPO needs *variance*, not success. A hint strong enough to make every
+rollout land reproduces the zero gradient it was meant to escape.
+
+Within-group Bernoulli variance `p(1-p)` peaks at **p = 0.5**. So the design
+target is not "make the hint helpful":
+
+> **Calibrate hint strength so the group lands near a 50% pass rate.**
+
+Which argues for graded hints rather than one flavour:
+
+| level | content | for |
+|---|---|---|
+| L1 | nudge — name the relevant concept | prompts already near threshold |
+| L2 | strategy — the solution shape, no numbers | mid-difficulty |
+| L3 | partial work — first step done, rest open | all-8-fail prompts |
+
+### 6.4 Random x% is the wrong selection rule
+
+The instinct that hints must not be universal is right, but random selection
+spends them on problems the model already solves — *adding* zero-gradient groups
+at the top end.
+
+**Adaptive selection is strictly better and cheap:** track per-prompt pass rate,
+hint only prompts sitting at 0/8, escalate L1→L3 until the group is mixed,
+withdraw the hint once a prompt reaches ~50%. Every hint is then spent where a
+zero-gradient group would otherwise have been.
+
+### 6.5 The decision that determines whether it transfers
+
+Injection is trivial — `app.py:3095` is one line:
+
+```python
+prompt_text = f"{cfg.user_tag}{question}{cfg.assistant_tag}"
+```
+
+**Option A — hint present for both sampling and scoring.** On-policy, no loss
+changes. But it trains π(y | question, **hint**), and the trap is that hinted
+prompts are precisely the ones producing nonzero advantage — so a
+disproportionate share of the actual gradient teaches the hint-conditioned
+policy. The x% mixing does **not** save this, because the unhinted remainder is
+mostly the zero-gradient set. You would be optimising the mode you don't ship.
+
+**Option B — sample with hint, score without.** Generate rollouts with the hint
+so good trajectories exist, then compute log-probs on
+`(unhinted prompt + completion)`. The gradient teaches "given only the question,
+produce this reasoning" — the STaR-style rationalisation mechanism: use
+privileged information to *find* trajectories, train without it.
+
+⚠️ **Two concrete breakages in the current loop if you do Option B:**
+
+1. `app.py:3202-3203` states *"importance-sampling ratio ~= 1, so PPO clipping is
+   a no-op here."* Sampling with a hint and scoring without makes sampler and
+   scored policy genuinely different distributions. **That ratio is not 1**, and
+   the no-op clipping becomes silently wrong. Needs real importance weighting.
+2. `prompt_len` (`app.py:3098`) is computed from the hinted prompt and slices
+   `shift_logits` (`app.py:3186`). It must be recomputed against the unhinted
+   prefix or the labels misalign.
+
+### 6.6 Recommendation — do this outside GRPO first
+
+The simplest correct form of Option B is **hint-assisted rejection sampling →
+SFT**: generate with hints, keep only correct completions, train plain CE on
+`(unhinted question → completion)`. No advantage math, no off-policy correction,
+no KL anchor, no variance calibration — and it reuses the existing SFT stack.
+The hint does exactly its job (surface trajectories the model can't reach alone)
+and never appears in the trained policy's input.
+
+If it must be GRPO: Option A with adaptive selection, tracking hinted-vs-unhinted
+pass rate separately, adding importance weighting only if a transfer gap shows up.
+
+### 6.7 Two guards worth building in
+
+**Leakage.** `LEARNINGS.md` is largely about reward hacking biting v5. A hint
+like *"the answer is a multiple of 7 near 90"* is an answer. Cheap filter reusing
+existing code: run every generated hint through `extract_numeric_answer`
+(`rewards.py:14`) and `extract_numeric_answer_strict` (`:63`), reject any that
+yields the gold value. Manual-read a sample of ~50 on top.
+
+**Streaming join.** `app.py:2986-2989` loads the prompt dataset with
+`streaming=True`, so hints cannot be joined lazily. Pre-generate offline into a
+`{question_hash: [L1, L2, L3]}` mapping loaded as a dict, or build a derived HF
+dataset with hint columns.
+
+Generation cost is a one-time offline pass over the prompt set — trivial next to
+a training run, and it does not recur per step.
+
+### 6.8 Caveats
+
+- Hints make the GRPO budget go further; they **do not add knowledge** (§9). If
+  the base genuinely cannot do multi-step arithmetic, an L3 hint yields a
+  completion the model could not have reached and likely cannot generalise from
+  — closer to distillation than RL. **The tell is whether hinted performance
+  transfers to unhinted eval; track both from step 1.**
+- Eval must always run with **no hints**, on the unmodified prompt path.
+- Frontier-model outputs used as training data carry provider-specific ToS
+  conditions. This repo is public and ships HF artifacts — worth checking before
+  release.
+
+---
+
+## 7. Open items
 
 Not started. Roughly in priority order:
 
@@ -323,9 +468,25 @@ Not started. Roughly in priority order:
 - [ ] Profile `mhc_sinkhorn_iters=20` — Sinkhorn typically converges in 3–5;
       that's 20 bandwidth-bound passes × 18 effective layers. (§3.2)
 
+Hint track (§6), roughly in order:
+
+- [ ] **Instrument first** — log the fraction of GRPO groups with `std < 1e-8`,
+      split into all-wrong vs all-right. Confirms the ~66% estimate before any
+      hint is generated, and is the metric every later step is judged against. (§6.2)
+- [ ] **Generate graded L1/L2/L3 hints** offline over the prompt set; store as
+      `{question_hash: [L1, L2, L3]}` (streaming rules out a lazy join). (§6.3, §6.7)
+- [ ] **Leakage filter** — reject any hint whose text yields the gold value under
+      `extract_numeric_answer` / `_strict`; manual-read ~50. (§6.7)
+- [ ] **Hint-assisted rejection sampling → SFT** — the recommended first build:
+      generate with hints, keep correct completions, plain CE on the *unhinted*
+      question. Reuses the SFT stack, no off-policy correction. (§6.6)
+- [ ] Only if going into GRPO proper: adaptive selection targeting ~50% group
+      pass rate, hinted-vs-unhinted pass rate logged separately, and the
+      `prompt_len` / ratio≈1 fixes at `app.py:3098`, `:3186`, `:3202-3203`. (§6.4, §6.5)
+
 ---
 
-## 7. Rejected, with reasons — do not re-litigate without new evidence
+## 8. Rejected, with reasons — do not re-litigate without new evidence
 
 | option | why rejected |
 |---|---|
@@ -334,10 +495,12 @@ Not started. Roughly in priority order:
 | GRPO-style group-relative SFT | User explicitly out of scope; the existing GRPO stack (`rewards.py::compute_group_advantages`, `app.py:3200-3215`) already implements it if ever wanted. |
 | Sampling 4 next-token candidates | Forward pass is deterministic (§5.2); any `f(k)` has an exact closed form (§5.3). Pure added variance. |
 | Uniform label smoothing at ε=0.1 | V=65,536 → parks ~10% of mass on junk tokens. §5.6 |
+| Hints on a fixed random x% of prompts | Spends hints on already-solved problems, *adding* all-8-right zero-gradient groups. Adaptive 0/8-triggered selection dominates it at the same cost. §6.4 |
+| Single-strength hints | GRPO needs within-group variance, not success. One strength cannot land different-difficulty prompts near the p=0.5 variance peak. §6.3 |
 
 ---
 
-## 8. Standing constraint
+## 9. Standing constraint
 
 `docs/AGENT_HANDOFF.md:57-63`: the base has seen **~2.2B tokens ≈ 0.4× Chinchilla**
 for 278M active params. SFT and GRPO *elicit* latent capability; they do not
