@@ -273,6 +273,13 @@ def main() -> int:  # noqa: PLR0915
         if L > MAX_SEQ_TOKENS:
             stats["toolong"] += 1
             continue
+        # Gate through the same GSM8K-test decontamination + problem-hash dedup
+        # as slices 1-3. OpenHermes-2.5 (a chat source) contains GSM8K-style
+        # math, so skipping admit() let test contamination and cross-slice
+        # duplicates into the corpus, silently invalidating any GSM8K claim.
+        # (docs/specs/2026-07-26-ckpt-sync §3)
+        if not admit(q):
+            continue
         records.append({"system": sysp, "prompt": q, "thinking": "",
                         "response": ans, "mode": "chat", "source": "chat"})
         n_chat += 1

@@ -763,6 +763,7 @@ def _run_sft_v2(cfg_cls):
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
+    cfg = cfg_cls()
     model_config = build_config(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
@@ -770,8 +771,13 @@ def _run_sft_v2(cfg_cls):
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         fused_cross_entropy_chunks=8,
+        # Thread loop dropout. SFTv2Config declares loop_dropout_prob=0.10 but
+        # it was never passed here, so sft_v2 silently trained at the
+        # build_config default while every other post-training stage (loop_fix,
+        # system_sft, mopd) threads its own. (docs/specs/2026-07-26-precision §5.2)
+        loop_dropout_prob=cfg.loop_dropout_prob,
+        loop_dropout_min_loops=cfg.loop_dropout_min_loops,
     )
-    cfg = cfg_cls()
     if not os.path.exists(cfg.rollout_dataset_path):
         raise FileNotFoundError(
             f"SFT-v2 corpus not found at {cfg.rollout_dataset_path}. Upload it: "

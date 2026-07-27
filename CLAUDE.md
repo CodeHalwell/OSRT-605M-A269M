@@ -17,9 +17,16 @@ that combines three ideas no released frontier model puts together at once:
   numbers in the repo name and presets are *stale* — see "Naming" below).
 - Trained with **Muon (hidden 2D matrices) + AdamW (embeddings/norms/biases)**.
 
-**Status:** the architecture is fully implemented in `src/osrt/`; 193 unit tests
-plus CPU smoke tests pass. GPU bring-up has started but there is **no completed
-GPU training run yet**. The model is in CPU pre-flight.
+**Status:** the architecture is fully implemented in `src/osrt/`; the unit-test
+suite plus CPU smoke tests pass. **GPU training is well underway:** the pipeline
+has run pretrain → midtrain → midtrain2 → SFT v1/v2 (GSM8K measured, near-floor:
+diagnosed as an undertrained base, not an architecture ceiling), and is currently
+extending the base via **midtrain3** — a long continued-pretraining push toward
+Chinchilla-optimal, driven from a Colab GPU notebook with cross-session
+checkpointing to a private HF repo (`notebooks/midtrain3_colab.ipynb`,
+`scripts/lightning_midtrain3.py`, `scripts/hf_ckpt_sync.py`). See
+`docs/AGENT_HANDOFF.md` for the live state and
+`docs/specs/2026-07-26-*.md` for the latest investigation notes.
 
 ## Repository map
 
