@@ -135,6 +135,13 @@ def save_checkpoint(
 ) -> None:
     """Save a training checkpoint (v5 format)."""
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    # Atomic save: serialize to a temp file, then os.replace onto the final
+    # name. torch.save writes directly, and a ~4.9GB checkpoint takes several
+    # seconds to serialize — so the glob-matched final name would otherwise
+    # exist while still truncated, and the HF sync daemon (or a crash mid-write)
+    # could capture/resume a partial file. os.replace is atomic, so `path` only
+    # ever appears complete. (docs/specs/2026-07-26-ckpt-sync §1)
+    tmp_path = f"{path}.tmp"
     torch.save(
         {
             "step": step,
@@ -142,8 +149,9 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "training_stage": "pretrain_v5",
         },
-        path,
+        tmp_path,
     )
+    os.replace(tmp_path, path)
     print(f"  -> Checkpoint saved: {path}")
 
 
@@ -1835,7 +1843,27 @@ def run_pretrain_extend(
             labels = labels.to(device, non_blocking=True)
 
             if step == start_step and micro == 0:
-                print(f"First batch fetched in {time.time() - batch_t:.1f}s")
+                # Fingerprint the very first batch. Across resumed sessions this
+                # reveals whether the stream restarts at position 0: an identical
+                # hash at *different* resume steps means the drip is silently
+                # re-training the stream head (oversampling that wastes the
+                # token budget). Compare `first_batch_sha` across W&B runs.
+                # (docs/specs/2026-07-26-precision-and-sft-objective §14.1)
+                import hashlib
+
+                fb_sha = hashlib.sha256(
+                    input_ids.detach().to("cpu").numpy().tobytes()
+                ).hexdigest()[:16]
+                print(
+                    f"First batch fetched in {time.time() - batch_t:.1f}s | "
+                    f"resume_step={start_step} first_batch_sha={fb_sha}",
+                    flush=True,
+                )
+                if use_wandb:
+                    wandb.run.summary["data/first_batch_sha"] = fb_sha
+                    wandb.run.summary["data/first_batch_resume_step"] = (
+                        start_step
+                    )
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 outputs = model(input_ids, labels=labels)
@@ -2018,9 +2046,24 @@ def run_pretrain_extend(
 
         step += 1
 
-    # Final checkpoint
+    # Final checkpoint. Also expose it under a step-numbered name (hardlink — no
+    # extra disk) so the HF sync daemon (which globs `_step_*`) uploads it and
+    # the resume-scan can rank it by step. `_final.pt` alone is unsyncable and
+    # has no trailing step to sort on, so a completed run's tail otherwise lived
+    # only on the ephemeral VM disk. Downstream configs that resume from
+    # `_final.pt` keep working unchanged. (docs/specs/2026-07-26-ckpt-sync §2)
     final_path = f"{ckpt_dir}/osrt_v5_{prefix}_final.pt"
     save_checkpoint(model, optimizer, step, final_path)
+    step_alias = f"{ckpt_dir}/osrt_v5_{prefix}_step_{step}.pt"
+    if os.path.abspath(step_alias) != os.path.abspath(final_path) and not (
+        os.path.exists(step_alias)
+    ):
+        try:
+            os.link(final_path, step_alias)
+        except OSError:
+            import shutil
+
+            shutil.copy2(final_path, step_alias)
     vol.commit()
     elapsed_total = time.time() - start_time
     print(

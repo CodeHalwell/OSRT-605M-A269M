@@ -169,6 +169,14 @@ def main() -> int:
 
     run_pretrain_extend(model_config, cfg, _LocalVol(), args.tokenizer,
                         ckpt_dir=args.ckpt_dir)
+
+    # The rescue/final checkpoints are written moments before this process
+    # exits; the background push daemon (daemon=True) can miss that last poll
+    # window and the file dies with the VM. Flush synchronously so the tail of
+    # training is durable on HF. (docs/specs/2026-07-26-ckpt-sync §2)
+    if args.hf_repo and not args.sanity:
+        from hf_ckpt_sync import flush
+        flush(args.hf_repo, args.ckpt_dir, "osrt_v5_midtrain3")
     return 0
 
 
