@@ -42,7 +42,11 @@ def pull_latest(repo_id: str, ckpt_dir: str, prefix: str,
             hf_hub_download(repo_id, base_name, repo_type="model",
                             local_dir=ckpt_dir)
 
-    steps = [f for f in files if re.match(rf"{prefix}_step_\d+\.pt$", f)]
+    # Include rescue checkpoints: the 23h-cap `_rescue_step_*.pt` is often the
+    # newest artifact of a capped session, and the local resume-scan already
+    # ranks it. `_step_of` matches both names. (ckpt-sync §2)
+    steps = [f for f in files
+             if re.match(rf"{prefix}_(?:rescue_)?step_\d+\.pt$", f)]
     if steps:
         latest = max(steps, key=_step_of)
         print(f"[hf-sync] resuming: pulling {latest}...", flush=True)
@@ -67,7 +71,9 @@ def start_push_daemon(repo_id: str, ckpt_dir: str, prefix: str,
         while True:
             try:
                 local = sorted(
-                    glob.glob(os.path.join(ckpt_dir, f"{prefix}_step_*.pt")),
+                    glob.glob(os.path.join(ckpt_dir, f"{prefix}_step_*.pt"))
+                    + glob.glob(os.path.join(
+                        ckpt_dir, f"{prefix}_rescue_step_*.pt")),
                     key=_step_of)
                 for path in local:
                     name = os.path.basename(path)
@@ -79,7 +85,7 @@ def start_push_daemon(repo_id: str, ckpt_dir: str, prefix: str,
                     pushed.add(name)
                 # prune remote to newest keep_remote
                 remote = [f for f in api.list_repo_files(repo_id, repo_type="model")
-                          if re.match(rf"{prefix}_step_\d+\.pt$", f)]
+                          if re.match(rf"{prefix}_(?:rescue_)?step_\d+\.pt$", f)]
                 for old in sorted(remote, key=_step_of)[:-keep_remote]:
                     api.delete_file(old, repo_id, repo_type="model")
                     print(f"[hf-sync] pruned remote {old}", flush=True)
@@ -91,3 +97,39 @@ def start_push_daemon(repo_id: str, ckpt_dir: str, prefix: str,
     threading.Thread(target=_loop, daemon=True).start()
     print(f"[hf-sync] push daemon started → {repo_id} (every {interval}s, "
           f"keep {keep_remote})", flush=True)
+
+
+def flush(repo_id: str, ckpt_dir: str, prefix: str) -> None:
+    """Synchronously upload any local step/rescue/final checkpoint not already
+    on the remote, then return. The push daemon is `daemon=True` and both the
+    23h-rescue and the end-of-run paths exit within one poll interval of their
+    final save — so the single most important file can miss its upload window.
+    Call this from the trainer entrypoint after training returns, before the
+    process exits, to make the tail durable. (ckpt-sync §2)"""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    try:
+        remote = set(api.list_repo_files(repo_id, repo_type="model"))
+    except Exception as e:  # noqa: BLE001 — nothing to flush against a dead repo
+        print(f"[hf-sync] flush: cannot list repo ({type(e).__name__}); "
+              "skipping", flush=True)
+        return
+
+    local: list[str] = []
+    for pat in (f"{prefix}_step_*.pt", f"{prefix}_rescue_step_*.pt",
+                f"{prefix}_final.pt"):
+        local += glob.glob(os.path.join(ckpt_dir, pat))
+
+    for path in sorted(set(local), key=_step_of):
+        name = os.path.basename(path)
+        if name in remote:
+            continue
+        try:
+            print(f"[hf-sync] flush uploading {name}...", flush=True)
+            api.upload_file(path_or_fileobj=path, path_in_repo=name,
+                            repo_id=repo_id, repo_type="model")
+        except Exception as e:  # noqa: BLE001 — best-effort, never raise at exit
+            print(f"[hf-sync] flush WARN {type(e).__name__}: {str(e)[:120]}",
+                  flush=True)
+    print("[hf-sync] flush complete", flush=True)
