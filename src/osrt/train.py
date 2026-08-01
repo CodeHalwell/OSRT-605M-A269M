@@ -840,6 +840,8 @@ def run_training(
         muon_params, adamw_groups = build_param_groups(
             inner_model.named_parameters(),
             weight_decay=train_cfg.weight_decay,
+            per_head_attn=getattr(train_cfg, "per_head_muon", False),
+            head_dim=model_config.head_dim,
         )
         # Muon LR is much smaller-magnitude than Lion/AdamW because the
         # Newton-Schulz update is normalised. Keep it as a separate
@@ -867,11 +869,13 @@ def run_training(
             pg["_peak_lr"] = train_cfg.peak_lr
             pg["_min_lr"] = train_cfg.min_lr
         optimizer = HybridMuonAdamW(muon, adamw)
-        n_muon = len(muon_params)
+        n_muon = sum(len(g["params"]) for g in muon.param_groups)
         n_adamw = sum(len(g["params"]) for g in adamw_groups)
+        per_head = getattr(train_cfg, "per_head_muon", False)
         print(
             f"Using Muon+AdamW hybrid: {n_muon} matrix tensors → Muon "
-            f"(lr={muon_lr}), {n_adamw} other tensors → AdamW "
+            f"(lr={muon_lr}{', per-head attn' if per_head else ''}), "
+            f"{n_adamw} other tensors → AdamW "
             f"(lr={train_cfg.peak_lr}, wd={train_cfg.weight_decay} "
             f"on non-norm/non-embed only)"
         )
@@ -1581,6 +1585,8 @@ def run_pretrain_extend(
         muon_params, adamw_groups = build_param_groups(
             inner_model.named_parameters(),
             weight_decay=extend_cfg.weight_decay,
+            per_head_attn=getattr(extend_cfg, "per_head_muon", False),
+            head_dim=model_config.head_dim,
         )
         muon_lr = getattr(extend_cfg, "muon_lr", extend_cfg.peak_lr)
         muon = Muon(
@@ -1604,12 +1610,13 @@ def run_pretrain_extend(
             pg["_peak_lr"] = extend_cfg.peak_lr
             pg["_min_lr"] = extend_cfg.min_lr
         optimizer = HybridMuonAdamW(muon, adamw)
-        n_muon = len(muon_params)
+        n_muon = sum(len(g["params"]) for g in muon.param_groups)
         n_adamw = sum(len(g["params"]) for g in adamw_groups)
+        per_head = getattr(extend_cfg, "per_head_muon", False)
         print(
             f"Muon+AdamW hybrid: {n_muon} matrix tensors → Muon "
-            f"(lr={muon_lr}), {n_adamw} other tensors → AdamW "
-            f"(lr={extend_cfg.peak_lr})",
+            f"(lr={muon_lr}{', per-head attn' if per_head else ''}), "
+            f"{n_adamw} other tensors → AdamW (lr={extend_cfg.peak_lr})",
         )
     else:
         router_params = []

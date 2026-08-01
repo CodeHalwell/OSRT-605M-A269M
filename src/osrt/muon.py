@@ -84,6 +84,34 @@ def newton_schulz5(g: Tensor, steps: int = _DEFAULT_NS_STEPS) -> Tensor:
     return x.to(dtype=g.dtype)
 
 
+def newton_schulz5_perhead(
+    g: Tensor, head_dim: int, steps: int = _DEFAULT_NS_STEPS,
+) -> Tensor:
+    """Per-head Muon orthogonalisation (Kimi K3 §2.5).
+
+    `g` is an attention projection update of shape (out, in) with
+    out = n_heads * head_dim. Instead of orthogonalising the full (out, in)
+    matrix — which treats all heads as one coupled block, so heads with larger
+    gradient/momentum scale dominate the shared update direction — reshape to
+    (n_heads, head_dim, in) and run Newton-Schulz on each head's (head_dim, in)
+    block independently, then reassemble. Equalises the update scale across
+    heads. NS on the tall thin per-head blocks is also cheaper than on the full
+    matrix.
+    """
+    out, cols = g.shape
+    if out % head_dim != 0:
+        raise ValueError(
+            f"newton_schulz5_perhead: out dim {out} not divisible by "
+            f"head_dim {head_dim}"
+        )
+    n_heads = out // head_dim
+    blocks = g.reshape(n_heads, head_dim, cols)
+    ortho = torch.stack(
+        [newton_schulz5(blocks[h], steps=steps) for h in range(n_heads)]
+    )
+    return ortho.reshape(out, cols)
+
+
 class Muon(torch.optim.Optimizer):
     """Muon optimizer for 2D matrix parameters.
 
@@ -169,15 +197,29 @@ class Muon(torch.optim.Optimizer):
                 buf.mul_(momentum).add_(grad_fp32)
                 update = grad_fp32.add(buf, alpha=momentum) if nesterov else buf
 
-                # Newton-Schulz orthogonalisation of the update. Cast back
-                # to the parameter dtype before the in-place apply below.
-                ortho = newton_schulz5(update, steps=ns_steps).to(dtype=p.dtype)
-
-                # Shape-aware scale. For fat matrices (rows < cols, e.g.
-                # SwiGLU's w_down) we shrink the update so the per-element
-                # variance matches what Adam-scale optimisers produce.
+                # Newton-Schulz orthogonalisation of the update, cast back to
+                # the parameter dtype before the in-place apply below. When the
+                # group carries a `head_dim` (per-head Muon, Kimi K3 §2.5) and
+                # the update is an attention projection whose out dim splits
+                # into n_heads * head_dim, orthogonalise each head's block
+                # independently so no single head dominates the shared update.
                 rows, cols = p.shape
-                shape_scale = max(1.0, rows / cols) ** 0.5
+                head_dim = group.get("head_dim")
+                if head_dim and rows % head_dim == 0 and rows > head_dim:
+                    ortho = newton_schulz5_perhead(
+                        update, head_dim, steps=ns_steps,
+                    ).to(dtype=p.dtype)
+                    # Per-BLOCK shape scale so the per-head update magnitude
+                    # matches the full-matrix path — keeps the effective LR the
+                    # same, isolating the per-head effect for a clean A/B.
+                    shape_scale = max(1.0, head_dim / cols) ** 0.5
+                else:
+                    ortho = newton_schulz5(update, steps=ns_steps).to(
+                        dtype=p.dtype)
+                    # Shape-aware scale. For fat matrices (rows < cols, e.g.
+                    # SwiGLU's w_down) we shrink the update so the per-element
+                    # variance matches what Adam-scale optimisers produce.
+                    shape_scale = max(1.0, rows / cols) ** 0.5
 
                 # Decoupled weight decay (AdamW-style — applied to the
                 # parameter, not added to the gradient).
@@ -238,10 +280,20 @@ class HybridMuonAdamW:
         self.adamw.load_state_dict(state_dict["adamw"])
 
 
+# Attention projections whose output dim is n_heads * head_dim, so per-head
+# Muon (Kimi K3 §2.5) can partition them: q_proj (query heads), kv_down (the
+# per-kv-head K latent), v_from_k (per-kv-head V). out_proj is head-structured
+# on its INPUT, not output, so it stays full-matrix.
+_PER_HEAD_ATTN_KEYS = ("q_proj", "kv_down", "v_from_k")
+
+
 def build_param_groups(
     named_params: Iterable[tuple[str, torch.nn.Parameter]],
     weight_decay: float,
-) -> tuple[list[torch.nn.Parameter], list[dict]]:
+    *,
+    per_head_attn: bool = False,
+    head_dim: int | None = None,
+) -> tuple[list[torch.nn.Parameter] | list[dict], list[dict]]:
     """Split a model's parameters into (muon_params, adamw_groups).
 
     Routing rules — kept here so the choice is reviewable in one
@@ -264,8 +316,10 @@ def build_param_groups(
     # Names are needed both to detect embeddings and to apply the
     # router/loop_embedding wd=0 carve-out, so iterate named_parameters.
     muon_params: list[torch.nn.Parameter] = []
+    muon_attn: list[torch.nn.Parameter] = []  # per-head group (opt-in)
     adamw_decay: list[torch.nn.Parameter] = []
     adamw_no_decay: list[torch.nn.Parameter] = []
+    split_attn = per_head_attn and head_dim is not None
 
     for name, param in named_params:
         if not param.requires_grad:
@@ -291,7 +345,10 @@ def build_param_groups(
             continue
 
         if param.ndim == 2:
-            muon_params.append(param)
+            if split_attn and any(k in name for k in _PER_HEAD_ATTN_KEYS):
+                muon_attn.append(param)
+            else:
+                muon_params.append(param)
         else:
             # ndim > 2 (e.g. conv filters). Not present in OSRT
             # but flag if a future change adds them.
@@ -306,4 +363,15 @@ def build_param_groups(
         adamw_groups.append({"params": adamw_decay, "weight_decay": weight_decay})
     if adamw_no_decay:
         adamw_groups.append({"params": adamw_no_decay, "weight_decay": 0.0})
+
+    # Per-head Muon: return the attention projections as their own group tagged
+    # with `head_dim` (Muon.step orthogonalises them per-head), and everything
+    # else as a plain group. Both inherit the Muon lr passed to the optimizer.
+    # Default (per_head_attn=False) returns the flat list unchanged, so the
+    # existing path is untouched.
+    if muon_attn:
+        muon_return: list[dict] = [{"params": muon_attn, "head_dim": head_dim}]
+        if muon_params:
+            muon_return.append({"params": muon_params})
+        return muon_return, adamw_groups
     return muon_params, adamw_groups
