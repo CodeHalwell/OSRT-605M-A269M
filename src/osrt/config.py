@@ -64,6 +64,17 @@ class OSRTConfig(PretrainedConfig):
         # None disables it (bit-identical to the un-clamped path).
         swiglu_clamp: float | None = None,
 
+        # SiTU-GLU (Kimi K3 §2.3.2): a smooth-capped GLU that bounds both the
+        # gate's linear factor and the up branch so |expert output| <=
+        # situ_beta_gate * situ_beta_up. It is a differentiable alternative to
+        # the hard swiglu_clamp above (keeps nonzero gradients away from the
+        # cap). When True it REPLACES SwiGLU + swiglu_clamp in every expert.
+        # Adds NO parameters, so a checkpoint loads identically under either
+        # setting — a pure activation swap, which makes it a clean A/B toggle.
+        situ_glu: bool = False,
+        situ_beta_gate: float = 4.0,
+        situ_beta_up: float = 25.0,
+
         # Attention sink (ARCHITECTURE.md §6.6). When True, each RecursiveBlock
         # carries a per-head learnable sink logit that is added to the softmax
         # DENOMINATOR only (the sink has a zero "value", so it never contributes
@@ -316,6 +327,9 @@ class OSRTConfig(PretrainedConfig):
         self.n_hc = n_hc
         self.mhc_sinkhorn_iters = mhc_sinkhorn_iters
         self.swiglu_clamp = swiglu_clamp
+        self.situ_glu = situ_glu
+        self.situ_beta_gate = situ_beta_gate
+        self.situ_beta_up = situ_beta_up
         self.attention_sink = attention_sink
 
         self.num_routed_experts = num_routed_experts
