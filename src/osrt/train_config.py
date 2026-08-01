@@ -151,6 +151,11 @@ class PretrainConfig:
     # keeps using peak_lr / min_lr.
     muon_lr: float = 0.02
     muon_min_lr: float = 2e-3
+    # Per-head Muon (Kimi K3 §2.5): orthogonalise each attention head's block
+    # of q_proj / kv_down / v_from_k separately instead of the full matrix, so
+    # no single head dominates the shared update. Adds no params and the update
+    # magnitude is held constant, so it's a clean A/B toggle. Default off.
+    per_head_muon: bool = False
 
     # Weights & Biases
     wandb_log: bool = True
