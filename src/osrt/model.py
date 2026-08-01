@@ -94,10 +94,57 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 # ── Expert FFN ──────────────────────────────────────────────────────────
 
 
-class ExpertFFN(nn.Module):
-    """SwiGLU feed-forward. Used for both shared and routed experts."""
+def _glu_combine(
+    gate: Tensor,
+    up: Tensor,
+    *,
+    clamp: float | None,
+    situ: bool,
+    b_gate: float,
+    b_up: float,
+) -> Tensor:
+    """Combine the gate and up branches of a (Swi)GLU expert.
 
-    def __init__(self, dim: int, hidden: int, clamp: float | None = None) -> None:
+    Shared by the eager `ExpertFFN.forward` and the grouped-GEMM path so the
+    two stay bit-identical.
+
+    Default (`situ=False`): SwiGLU — `F.silu(gate) * up` — with the optional
+    hard `clamp` on the pre-activations. Unchanged from the original path.
+
+    `situ=True`: SiTU-GLU (Kimi K3 §2.3.2). Smoothly caps the linear factor of
+    the Swish gate and the up branch:
+
+        gate' = b_gate * tanh(gate / b_gate) * sigmoid(gate)   # capped Swish
+        up'   = b_up   * tanh(up   / b_up)
+        out   = gate' * up'                                    # |out| <= b_gate*b_up
+
+    It matches SwiGLU to first order near the origin, bounds large activations,
+    and — unlike the hard clamp — keeps nonzero gradients past the cap. Adds no
+    parameters, so it REPLACES the hard clamp rather than stacking with it.
+    """
+    if situ:
+        gate = b_gate * torch.tanh(gate / b_gate) * torch.sigmoid(gate)
+        up = b_up * torch.tanh(up / b_up)
+        return gate * up
+    if clamp is not None:
+        gate = gate.clamp(max=clamp)
+        up = up.clamp(min=-clamp, max=clamp)
+    return F.silu(gate) * up
+
+
+class ExpertFFN(nn.Module):
+    """SwiGLU / SiTU-GLU feed-forward. Used for both shared and routed experts."""
+
+    def __init__(
+        self,
+        dim: int,
+        hidden: int,
+        clamp: float | None = None,
+        *,
+        situ: bool = False,
+        situ_beta_gate: float = 4.0,
+        situ_beta_up: float = 25.0,
+    ) -> None:
         super().__init__()
         hidden = 64 * ((hidden + 63) // 64)  # TC-align
         self.w_gate = nn.Linear(dim, hidden, bias=False)
@@ -108,14 +155,19 @@ class ExpertFFN(nn.Module):
         # activation can't blow up the product. None → no clamp (no-op for a
         # healthy model; the bound just caps tails).
         self.clamp = clamp
+        # SiTU-GLU (Kimi K3 §2.3.2): param-free smooth cap; when on it replaces
+        # SwiGLU + the hard clamp. See `_glu_combine`.
+        self.situ = situ
+        self.situ_beta_gate = situ_beta_gate
+        self.situ_beta_up = situ_beta_up
 
     def forward(self, x: Tensor) -> Tensor:
         gate = self.w_gate(x)
         up = self.w_up(x)
-        if self.clamp is not None:
-            gate = gate.clamp(max=self.clamp)
-            up = up.clamp(min=-self.clamp, max=self.clamp)
-        return self.w_down(F.silu(gate) * up)
+        return self.w_down(_glu_combine(
+            gate, up, clamp=self.clamp, situ=self.situ,
+            b_gate=self.situ_beta_gate, b_up=self.situ_beta_up,
+        ))
 
 
 def orthogonal_expert_init(expert: ExpertFFN, seed: int, gain: float = 1.0) -> None:
@@ -226,13 +278,18 @@ class MoELayer(nn.Module):
         # Shared expert: always active, larger hidden than routed experts.
         # Replaces v4's parallel dense FFN.
         clamp = getattr(config, "swiglu_clamp", None)
+        situ_kw = {
+            "situ": getattr(config, "situ_glu", False),
+            "situ_beta_gate": getattr(config, "situ_beta_gate", 4.0),
+            "situ_beta_up": getattr(config, "situ_beta_up", 25.0),
+        }
         self.shared_expert = ExpertFFN(
-            config.dim, config.shared_expert_hidden, clamp=clamp,
+            config.dim, config.shared_expert_hidden, clamp=clamp, **situ_kw,
         )
 
         # Routed experts
         self.experts = nn.ModuleList([
-            ExpertFFN(config.dim, config.expert_hidden, clamp=clamp)
+            ExpertFFN(config.dim, config.expert_hidden, clamp=clamp, **situ_kw)
             for _ in range(self.num_routed)
         ])
 
@@ -580,11 +637,11 @@ class MoELayer(nn.Module):
             dt = x_sorted.dtype
             gate = _ref_grouped_mm(x_sorted, w_gate.to(dt), offs)
             up = _ref_grouped_mm(x_sorted, w_up.to(dt), offs)
-        clamp = self.experts[0].clamp
-        if clamp is not None:
-            gate = gate.clamp(max=clamp)
-            up = up.clamp(min=-clamp, max=clamp)
-        h = F.silu(gate) * up
+        e0 = self.experts[0]
+        h = _glu_combine(
+            gate, up, clamp=e0.clamp, situ=e0.situ,
+            b_gate=e0.situ_beta_gate, b_up=e0.situ_beta_up,
+        )
         if use_kernel:
             out = torch._grouped_mm(h.to(cdt), w_down.to(cdt), offs=offs)
         else:
