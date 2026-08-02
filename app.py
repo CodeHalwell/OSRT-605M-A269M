@@ -972,27 +972,32 @@ def run_sft_sample(step: str = "final", n: int = 3):
     image=image,
     volumes={"/vol/hf_cache": hf_cache_vol},
     secrets=[modal.Secret.from_name("hf-secret")],
-    timeout=1800,
+    timeout=3600,
 )
 def ppl_eval(
     step: str = "latest",
+    dataset: str = "math",
     eval_steps: int = 40,
     batch: int = 6,
-    skip: int = 2_000_000,
+    skip: int | None = None,
     hf_repo: str = "HallD/osrt-v6-ckpt",
 ) -> dict:
-    """Held-out in-distribution perplexity of ONE base checkpoint, on GPU.
+    """Held-out perplexity of ONE base checkpoint, on GPU.
 
     Pulls the checkpoint straight from the HF repo (no volume needed) and the
     tokenizer from the image, so this runs on any fresh workspace with only
-    `hf-secret`. Evaluates a held-out slice of Nemotron-CC-Math (the dominant
-    reasoning source midtrain3 trains on) read from a `skip` offset PAST the
-    training budget, so the samples are genuinely unseen. This is the honest
-    "is pretraining helping" signal for a BASE checkpoint — GSM8K/capability
-    waits for the SFT stage (the base can't follow the Q->A format). Does NOT
-    touch the running Colab drip. Same math as notebook cell 6b.
+    `hf-secret`. Reads a held-out slice from a `skip` offset PAST the training
+    budget, so the samples are genuinely unseen. This is the honest "is
+    pretraining helping" signal for a BASE checkpoint — GSM8K/capability waits
+    for the SFT stage (the base can't follow the Q->A format). Does NOT touch
+    the running Colab drip. Same math as notebook cell 6b.
 
     `step`: "latest" (highest step/rescue on HF) or a number like "8700".
+    `dataset`:
+      - "math"    → Nemotron-CC-Math 4plus, skip=2M (in-distribution; the
+                    dominant reasoning source; ppl ~3 is normal — low-entropy).
+      - "fineweb" → FineWeb-Edu, skip=100M (general web; comparable to the
+                    ~28-30 midtrain2 baseline; the skip build costs ~10-20 min).
     """
     import math
     import re
@@ -1036,14 +1041,28 @@ def ppl_eval(
     )
     model.eval()
 
-    loader = make_loader(
-        dataset_configs=[{
+    if dataset == "math":
+        ds_cfg = {
             "name": "nemotron-cc-math-heldout",
             "hf_id": "nvidia/Nemotron-CC-Math-v1",
             "hf_config": "4plus",
             "weight": 1.0,
-            "skip": skip,
-        }],
+            "skip": skip if skip is not None else 2_000_000,
+        }
+        label = "Nemotron-CC-Math (in-distribution)"
+    elif dataset == "fineweb":
+        ds_cfg = {
+            "name": "fineweb-edu-heldout",
+            "hf_id": "HuggingFaceFW/fineweb-edu",
+            "weight": 1.0,
+            "skip": skip if skip is not None else 100_000_000,
+        }
+        label = "FineWeb-Edu (general web; midtrain2 baseline ~28-30)"
+    else:
+        raise ValueError(f"dataset must be 'math' or 'fineweb', got {dataset!r}")
+
+    loader = make_loader(
+        dataset_configs=[ds_cfg],
         seq_len=4096, tokenizer_name="/root/v6_tokenizer_export",
         batch_size=batch, step_num=999999, num_workers=0,
     )
@@ -1060,27 +1079,31 @@ def ppl_eval(
             total_tok += n
     mean_loss = total_loss / max(total_tok, 1)
     ppl = math.exp(min(mean_loss, 20.0))
-    res = {"step": resolved, "loss": mean_loss, "ppl": ppl, "tokens": total_tok}
-    print(f"\n== held-out Nemotron-CC-Math ppl (in-distribution) ==\n{res}",
-          flush=True)
+    res = {"step": resolved, "dataset": dataset, "loss": mean_loss,
+           "ppl": ppl, "tokens": total_tok}
+    print(f"\n== held-out {label} ppl ==\n{res}", flush=True)
     return res
 
 
 @app.local_entrypoint()
-def run_ppl_eval(step: str = "latest", eval_steps: int = 40):
-    """Held-out in-distribution perplexity of a base checkpoint on GPU (blocking).
+def run_ppl_eval(step: str = "latest", dataset: str = "math", eval_steps: int = 40):
+    """Held-out perplexity of a base checkpoint on GPU (blocking).
 
-    Pulls the checkpoint from HF, so it never touches the Colab drip. `step`:
-    "latest" or a number like "8700". Run it, then re-run at a later step to
-    read the trend (ppl should DROP as pretraining helps).
+    Pulls the checkpoint from HF, so it never touches the Colab drip.
+    `step`: "latest" or a number like "8700".
+    `dataset`: "math" (Nemotron-CC-Math, in-distribution) or "fineweb"
+      (FineWeb-Edu, comparable to the ~28-30 midtrain2 baseline; slower — the
+      skip=100M held-out build costs ~10-20 min).
+    Re-run at a later step to read the trend (ppl should DROP as pretraining helps).
     """
-    print(f"Evaluating step={step} (held-out Nemotron-CC-Math ppl) on A100...")
-    res = ppl_eval.remote(step=step, eval_steps=eval_steps)
+    print(f"Evaluating step={step} dataset={dataset} (held-out ppl) on A100...")
+    res = ppl_eval.remote(step=step, dataset=dataset, eval_steps=eval_steps)
     print("\n=== RESULT ===")
-    print(f"  step:   {res['step']}")
-    print(f"  loss:   {res['loss']:.4f}")
-    print(f"  ppl:    {res['ppl']:.2f}   (in-distribution; watch the trend down)")
-    print(f"  tokens: {res['tokens']:,}")
+    print(f"  step:    {res['step']}")
+    print(f"  dataset: {res['dataset']}")
+    print(f"  loss:    {res['loss']:.4f}")
+    print(f"  ppl:     {res['ppl']:.2f}")
+    print(f"  tokens:  {res['tokens']:,}")
 
 
 @app.local_entrypoint()
