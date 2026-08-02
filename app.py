@@ -1051,11 +1051,16 @@ def ppl_eval(
         }
         label = "Nemotron-CC-Math (in-distribution)"
     elif dataset == "fineweb":
+        # skip=5M: training has consumed only ~360k FineWeb records by step
+        # ~8800 (0.15 weight), so 5M is ~14x past that = safely held-out, and
+        # ~20x faster than 100M (which timed out the 60-min job on Modal's HF
+        # streaming). Different held-out slice than the old 100M baseline, but
+        # FineWeb is homogeneous enough that the ppl is comparable.
         ds_cfg = {
             "name": "fineweb-edu-heldout",
             "hf_id": "HuggingFaceFW/fineweb-edu",
             "weight": 1.0,
-            "skip": skip if skip is not None else 100_000_000,
+            "skip": skip if skip is not None else 5_000_000,
         }
         label = "FineWeb-Edu (general web; midtrain2 baseline ~28-30)"
     else:
@@ -1086,18 +1091,24 @@ def ppl_eval(
 
 
 @app.local_entrypoint()
-def run_ppl_eval(step: str = "latest", dataset: str = "math", eval_steps: int = 40):
+def run_ppl_eval(
+    step: str = "latest",
+    dataset: str = "math",
+    eval_steps: int = 40,
+    skip: int | None = None,
+):
     """Held-out perplexity of a base checkpoint on GPU (blocking).
 
     Pulls the checkpoint from HF, so it never touches the Colab drip.
     `step`: "latest" or a number like "8700".
-    `dataset`: "math" (Nemotron-CC-Math, in-distribution) or "fineweb"
-      (FineWeb-Edu, comparable to the ~28-30 midtrain2 baseline; slower — the
-      skip=100M held-out build costs ~10-20 min).
+    `dataset`: "math" (Nemotron-CC-Math, skip=2M) or "fineweb" (FineWeb-Edu,
+      skip=5M — safely held-out and fast; general-web baseline ~28-30).
+    `skip`: override the held-out offset (records) if needed.
     Re-run at a later step to read the trend (ppl should DROP as pretraining helps).
     """
     print(f"Evaluating step={step} dataset={dataset} (held-out ppl) on A100...")
-    res = ppl_eval.remote(step=step, dataset=dataset, eval_steps=eval_steps)
+    res = ppl_eval.remote(
+        step=step, dataset=dataset, eval_steps=eval_steps, skip=skip)
     print("\n=== RESULT ===")
     print(f"  step:    {res['step']}")
     print(f"  dataset: {res['dataset']}")
