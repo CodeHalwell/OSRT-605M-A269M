@@ -83,6 +83,9 @@ image = (
     )
     .add_local_dir("src/osrt", remote_path="/root/osrt")
     .add_local_dir("scripts", remote_path="/root/scripts")
+    # Bake the tokenizer into the image so workspace-portable functions (e.g.
+    # ppl_eval, which pulls the checkpoint from HF) need no tokenizer volume.
+    .add_local_dir("v6_tokenizer_export", remote_path="/root/v6_tokenizer_export")
 )
 
 # v5 gets its own checkpoint volume so we can run v4 and v5 in parallel.
@@ -962,6 +965,122 @@ def run_sft_sample(step: str = "final", n: int = 3):
     name = ("osrt_v5_sft_v2_final.pt" if step == "final"
             else f"osrt_v5_sft_v2_step_{step}.pt")
     sft_sample.remote(name, n)
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=1800,
+)
+def ppl_eval(
+    step: str = "latest",
+    eval_steps: int = 40,
+    batch: int = 6,
+    skip: int = 2_000_000,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """Held-out in-distribution perplexity of ONE base checkpoint, on GPU.
+
+    Pulls the checkpoint straight from the HF repo (no volume needed) and the
+    tokenizer from the image, so this runs on any fresh workspace with only
+    `hf-secret`. Evaluates a held-out slice of Nemotron-CC-Math (the dominant
+    reasoning source midtrain3 trains on) read from a `skip` offset PAST the
+    training budget, so the samples are genuinely unseen. This is the honest
+    "is pretraining helping" signal for a BASE checkpoint — GSM8K/capability
+    waits for the SFT stage (the base can't follow the Q->A format). Does NOT
+    touch the running Colab drip. Same math as notebook cell 6b.
+
+    `step`: "latest" (highest step/rescue on HF) or a number like "8700".
+    """
+    import math
+    import re
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.data import make_loader
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    if step == "latest":
+        name = max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+    else:
+        cand = [f for f in ckpts if re.search(rf"step_{step}\.pt$", f)]
+        if not cand:
+            raise FileNotFoundError(
+                f"step {step} not on {hf_repo}; available: {sorted(ckpts)}"
+            )
+        name = cand[0]
+    resolved = int(re.search(r"step_(\d+)", name).group(1))
+    print(f"pulling {name} from {hf_repo}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device)  # eager; autocast bf16 in forward
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    assert not missing and not unexpected, (
+        f"state mismatch: missing={missing[:3]} unexpected={unexpected[:3]}"
+    )
+    model.eval()
+
+    loader = make_loader(
+        dataset_configs=[{
+            "name": "nemotron-cc-math-heldout",
+            "hf_id": "nvidia/Nemotron-CC-Math-v1",
+            "hf_config": "4plus",
+            "weight": 1.0,
+            "skip": skip,
+        }],
+        seq_len=4096, tokenizer_name="/root/v6_tokenizer_export",
+        batch_size=batch, step_num=999999, num_workers=0,
+    )
+    it = iter(loader)
+    total_loss = total_tok = 0
+    with torch.inference_mode():
+        for _ in range(eval_steps):
+            input_ids, labels = next(it)
+            input_ids, labels = input_ids.to(device), labels.to(device)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = model(input_ids, labels=labels)
+            n = int((labels != -100).sum())
+            total_loss += out.loss.item() * n
+            total_tok += n
+    mean_loss = total_loss / max(total_tok, 1)
+    ppl = math.exp(min(mean_loss, 20.0))
+    res = {"step": resolved, "loss": mean_loss, "ppl": ppl, "tokens": total_tok}
+    print(f"\n== held-out Nemotron-CC-Math ppl (in-distribution) ==\n{res}",
+          flush=True)
+    return res
+
+
+@app.local_entrypoint()
+def run_ppl_eval(step: str = "latest", eval_steps: int = 40):
+    """Held-out in-distribution perplexity of a base checkpoint on GPU (blocking).
+
+    Pulls the checkpoint from HF, so it never touches the Colab drip. `step`:
+    "latest" or a number like "8700". Run it, then re-run at a later step to
+    read the trend (ppl should DROP as pretraining helps).
+    """
+    print(f"Evaluating step={step} (held-out Nemotron-CC-Math ppl) on A100...")
+    res = ppl_eval.remote(step=step, eval_steps=eval_steps)
+    print("\n=== RESULT ===")
+    print(f"  step:   {res['step']}")
+    print(f"  loss:   {res['loss']:.4f}")
+    print(f"  ppl:    {res['ppl']:.2f}   (in-distribution; watch the trend down)")
+    print(f"  tokens: {res['tokens']:,}")
 
 
 @app.local_entrypoint()
