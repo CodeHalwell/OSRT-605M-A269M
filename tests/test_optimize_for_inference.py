@@ -86,6 +86,54 @@ def test_generate_actually_compiles_via_fwd():
     )
 
 
+def test_prepack_matches_per_call_stack_and_is_nonpersistent():
+    """prepack_expert_weights must build exactly the tensors _grouped_ffn
+    builds per call (stack fp32 -> transpose -> cast bf16), and must NOT
+    change the checkpoint layout (non-persistent buffers)."""
+    torch.manual_seed(0)
+    model = OSRTForCausalLM(tiny_config())
+    moe = model.model.blocks[0].moe
+    keys_before = set(model.state_dict())
+
+    moe.prepack_expert_weights()
+
+    ref_gate = torch.stack(
+        [e.w_gate.weight.t() for e in moe.experts]).to(torch.bfloat16)
+    ref_down = torch.stack(
+        [e.w_down.weight.t() for e in moe.experts]).to(torch.bfloat16)
+    assert torch.equal(moe._packed_w_gate, ref_gate)
+    assert torch.equal(moe._packed_w_down, ref_down)
+    assert moe._packed_w_gate.dtype == torch.bfloat16
+    # state_dict unchanged -> old checkpoints load strict into a prepacked model
+    assert set(model.state_dict()) == keys_before
+
+
+def test_optimize_for_inference_prepacks_every_block():
+    model = OSRTForCausalLM(tiny_config())
+    model.optimize_for_inference(compile_model=False)
+    for blk in model.model.blocks:
+        assert getattr(blk.moe, "_packed_w_up", None) is not None
+
+
+def test_prepack_invalidated_by_train_and_load():
+    """Stale-pack guards: .train(True) and load_state_dict must drop the packs
+    (weights are about to change / just changed), and eval() must NOT."""
+    model = OSRTForCausalLM(tiny_config())
+    moe = model.model.blocks[0].moe
+
+    moe.prepack_expert_weights()
+    model.train()
+    assert moe._packed_w_gate is None          # train() invalidates
+
+    moe.prepack_expert_weights()
+    model.eval()
+    assert moe._packed_w_gate is not None      # eval() keeps the packs
+
+    sd = model.state_dict()
+    model.load_state_dict(sd, strict=True)
+    assert moe._packed_w_gate is None          # new weights invalidate
+
+
 def test_fwd_falls_back_to_eager_when_not_optimized():
     """Without optimize_for_inference, _fwd must be the plain eager forward
     (bit-identical) — the default training/eval path is untouched."""

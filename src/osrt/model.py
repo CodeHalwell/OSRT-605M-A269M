@@ -604,6 +604,61 @@ class MoELayer(nn.Module):
             )
         return moe_out, total_dropped
 
+    def prepack_expert_weights(self) -> None:
+        """Pre-stack + pre-cast the routed experts' SwiGLU weights for decode.
+
+        _grouped_ffn otherwise torch.stack's all E experts' weights AND casts
+        them fp32->bf16 on EVERY call — at decode that is 3 stacks x 18 MoE
+        invocations x every token (~2.5B weight elements, ~35 GB/token of pure
+        memory traffic; measured as ~the entire 20ms/token GPU floor on A100).
+        The weights are frozen at inference, so build the exact same
+        (E, in, out) bf16 tensors ONCE and reuse. Non-persistent buffers:
+        excluded from state_dict (checkpoint layout unchanged), moved by
+        .to(device) with the module. Inference-only — call via
+        optimize_for_inference(); training keeps the per-call stacking (weights
+        change every step). Stale after any weight update; re-call to refresh.
+        """
+        cdt = torch.bfloat16
+        self.register_buffer(
+            "_packed_w_gate",
+            torch.stack([e.w_gate.weight.t() for e in self.experts]).to(cdt),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_packed_w_up",
+            torch.stack([e.w_up.weight.t() for e in self.experts]).to(cdt),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_packed_w_down",
+            torch.stack([e.w_down.weight.t() for e in self.experts]).to(cdt),
+            persistent=False,
+        )
+
+    def _invalidate_packed_weights(self) -> None:
+        """Drop the prepacked buffers (fast path falls back to per-call
+        stacking). Registered-buffer assignment to None keeps the names valid
+        for getattr while freeing the memory."""
+        if getattr(self, "_packed_w_gate", None) is not None:
+            self._packed_w_gate = None
+            self._packed_w_up = None
+            self._packed_w_down = None
+
+    def train(self, mode: bool = True) -> "MoELayer":
+        # Entering training invalidates the packs: optimizer steps mutate the
+        # expert weights in place and the packed copies would go silently
+        # stale. Zero cost on the decode hot path (eval stays packed).
+        if mode:
+            self._invalidate_packed_weights()
+        return super().train(mode)
+
+    def _load_from_state_dict(self, *args, **kwargs) -> None:
+        # New weights (checkpoint swap into a live model) invalidate any packs
+        # built from the old ones. Re-run prepack_expert_weights() (or
+        # optimize_for_inference()) after loading to re-enable the fast path.
+        self._invalidate_packed_weights()
+        super()._load_from_state_dict(*args, **kwargs)
+
     def _grouped_ffn(
         self, x_sorted: Tensor, offs: Tensor, use_kernel: bool | None = None,
     ) -> Tensor:
@@ -616,9 +671,30 @@ class MoELayer(nn.Module):
         CUDA (fused, compile-friendly) and the CPU-safe reference otherwise
         (the kernel's CPU backward is broken). Weights are cast to the token
         dtype so the matmul precision matches the loop path's autocast.
+
+        When prepack_expert_weights() has run (inference), the pre-stacked bf16
+        buffers are used instead — same values, zero per-call stack/cast cost.
         """
         if use_kernel is None:
             use_kernel = x_sorted.is_cuda
+        packed = getattr(self, "_packed_w_gate", None)
+        if packed is not None and use_kernel:
+            # Inference fast path: identical (E, in, out) bf16 tensors, built
+            # once. bf16(w) commutes with stack/t(), so values match the
+            # per-call path bit-for-bit.
+            w_gate_b, w_up_b, w_down_b = (
+                self._packed_w_gate, self._packed_w_up, self._packed_w_down,
+            )
+            cdt = torch.bfloat16
+            xs = x_sorted.to(cdt)
+            gate = torch._grouped_mm(xs, w_gate_b, offs=offs)
+            up = torch._grouped_mm(xs, w_up_b, offs=offs)
+            e0 = self.experts[0]
+            h = _glu_combine(
+                gate, up, clamp=e0.clamp, situ=e0.situ,
+                b_gate=e0.situ_beta_gate, b_up=e0.situ_beta_up,
+            )
+            return torch._grouped_mm(h.to(cdt), w_down_b, offs=offs)
         # nn.Linear weight is (out, in); grouped_mm wants b = (E, in, out).
         w_gate = torch.stack([e.w_gate.weight.t() for e in self.experts])
         w_up = torch.stack([e.w_up.weight.t() for e in self.experts])
@@ -1261,9 +1337,18 @@ class RecursiveBlock(nn.Module):
             attn_out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, enable_gqa=gqa,
             )
+        elif S > 1:
+            # Explicit branch instead of is_causal=(S > 1): under
+            # torch.compile(dynamic=True) S is a SymInt, so (S > 1) is a
+            # SymBool, which SDPA rejects (fullgraph break). The `elif`
+            # inserts a shape guard -> two specializations (prefill S>1,
+            # decode S==1), each passing a plain Python bool. Same math.
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, enable_gqa=gqa,
+            )
         else:
             attn_out = F.scaled_dot_product_attention(
-                q, k, v, is_causal=(S > 1), enable_gqa=gqa,
+                q, k, v, is_causal=False, enable_gqa=gqa,
             )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
         return self.out_proj(attn_out) + adapter_out, present_kv
@@ -1923,11 +2008,36 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         would NOT take effect on the decode path — dynamo wraps __call__, but
         generate() historically called self.forward() directly (bypassing it).
         A CompileCounter test guards that generate() actually compiles.
+
+        Sets the same two dynamo flags the training loop sets (train.py, B4
+        grouped-GEMM block): torch._grouped_mm's data-dependent per-expert
+        offsets otherwise graph-break on .item()/.tolist() — measured at
+        inference as ~432 host syncs/token (18 MoE layers x 3 grouped_mm x 8
+        offsets) and ~40 graph segments. With the flags, training verified
+        fullgraph compiles with 0 breaks; fullgraph=True here asserts the same
+        so any future capture-blocker fails loudly instead of silently
+        fragmenting the decode step.
         """
         self.eval()
         self.set_moe_telemetry(False)
+        # Prepack routed-expert weights: kills the per-call stack + fp32->bf16
+        # cast in _grouped_ffn (~35 GB/token of traffic at decode — the bulk of
+        # the GPU-time floor). Weights are frozen at inference, so this is
+        # value-identical (same stack-then-cast, done once). Call AFTER
+        # load_state_dict; buffers are non-persistent and move with .to().
+        for blk in self.model.blocks:
+            blk.moe.prepack_expert_weights()
         if compile_model:
-            self._compiled_forward = torch.compile(self.forward)
+            import torch._dynamo as _dynamo
+            _dynamo.config.capture_scalar_outputs = True
+            _dynamo.config.capture_dynamic_output_shape_ops = True
+            # dynamic=True: decode's KV-cache length grows every token; without
+            # it dynamo re-specializes (an expensive unbacked-symint compile)
+            # per cache length — measured as a >30 min compile stall on A100.
+            # One symbolic-shape graph covers all lengths instead.
+            self._compiled_forward = torch.compile(
+                self.forward, fullgraph=True, dynamic=True,
+            )
         return self
 
     def _fwd(self, *args, **kwargs) -> CausalLMOutputWithPast:

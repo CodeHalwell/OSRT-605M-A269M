@@ -1125,6 +1125,21 @@ def run_ppl_eval(
 # loops on a base model, so the greedy view uses a repetition penalty; a sampled
 # view (temp/top-p) shows the more natural distribution. Mirrors ppl_eval's
 # proven HF-pull + tokenizer-from-image loading; never touches any training run.
+def _use_inductor_cache() -> None:
+    """Point torch.compile's inductor cache at the persistent Modal volume.
+
+    The fullgraph+dynamic trace of the 18-effective-layer forward costs
+    ~10-15 min of A100 time. Caching the compiled artifacts on the volume
+    turns every later run's compile into a warm load (~1 min). Call FIRST
+    in any Modal function that compiles, before torch compiles anything.
+    """
+    import os
+
+    os.environ.setdefault(
+        "TORCHINDUCTOR_CACHE_DIR", "/vol/hf_cache/torchinductor_cache",
+    )
+
+
 _SAMPLE_PROMPTS = [
     "Problem: What is the value of 12 multiplied by 8?\nSolution:",
     "To find the area of a rectangle we multiply its length by its width. "
@@ -1156,6 +1171,8 @@ def sample_base(
     """Generate continuations from a base checkpoint. Returns per-prompt dicts
     with a greedy(+rep_penalty) view and a sampled view."""
     import re
+
+    _use_inductor_cache()
 
     import torch
     from huggingface_hub import HfApi, hf_hub_download
@@ -1605,7 +1622,7 @@ def run_bench_compile(step: str = "latest", ctx_len: int = 64):
     image=image,
     volumes={"/vol/hf_cache": hf_cache_vol},
     secrets=[modal.Secret.from_name("hf-secret")],
-    timeout=1800,
+    timeout=3600,  # fullgraph+dynamic compile can take several minutes
 )
 def bench_generate(
     step: str = "latest",
@@ -1625,6 +1642,8 @@ def bench_generate(
     genuinely wired through generate() now (the earlier bug: it was not)."""
     import re
     import time
+
+    _use_inductor_cache()
 
     import torch
     from huggingface_hub import HfApi, hf_hub_download
@@ -1730,7 +1749,7 @@ def run_bench_generate(step: str = "latest", new_tokens: int = 64):
     image=image,
     volumes={"/vol/hf_cache": hf_cache_vol},
     secrets=[modal.Secret.from_name("hf-secret")],
-    timeout=1800,
+    timeout=3600,  # eager ppl+gens + fullgraph trace + compiled ppl+gens
 )
 def verify_compile_identity(
     step: str = "latest",
@@ -1740,6 +1759,9 @@ def verify_compile_identity(
     """QUALITY GATE for compile: is the REAL compiled path (generate via
     self._fwd -> self._compiled_forward) a quality regression, or just benign
     bf16 fused-reduction noise?
+
+    Persists the inductor cache on the volume (see _use_inductor_cache) so the
+    ~15-min fullgraph trace is paid once, then warm-loaded on later runs.
 
     Three checks vs eager, on the SAME weights, using the REAL _compiled_forward
     (not the old model.compile()+self.forward bug):
@@ -1755,6 +1777,8 @@ def verify_compile_identity(
     """
     import math
     import re
+
+    _use_inductor_cache()
 
     import torch
     from huggingface_hub import HfApi, hf_hub_download
