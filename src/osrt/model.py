@@ -1877,6 +1877,13 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # raw CE loss for predicting next-token from that loop's hidden.
         self.last_per_loop_aux_losses: list[Tensor] = []
         self.last_aux_loop_total: Tensor | None = None
+
+        # Optional compiled forward for inference (set by
+        # optimize_for_inference). generate()/speculative call self._fwd, which
+        # dispatches here when present so compilation is actually EXERCISED on
+        # the decode path — self.forward() alone bypasses model.compile()'s
+        # __call__ wrapping (dynamo compiles __call__, not a direct .forward()).
+        self._compiled_forward = None
         # MTP telemetry (when mtp_heads > 0 + training + labels). last_mtp_loss
         # is the detached weighted sum added to the training loss; None when MTP
         # is off or the head contributed nothing. last_mtp_losses holds the
@@ -1910,12 +1917,26 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         warmup forwards amortise it. `mode="reduce-overhead"` (CUDA graphs) is
         deliberately NOT used — capture fails on the MoE data-dependent ops
         (needs the static-KV-cache refactor first).
+
+        IMPORTANT: compiles self.forward into self._compiled_forward, which
+        generate()/speculative dispatch to via self._fwd. A bare self.compile()
+        would NOT take effect on the decode path — dynamo wraps __call__, but
+        generate() historically called self.forward() directly (bypassing it).
+        A CompileCounter test guards that generate() actually compiles.
         """
         self.eval()
         self.set_moe_telemetry(False)
         if compile_model:
-            self.compile()
+            self._compiled_forward = torch.compile(self.forward)
         return self
+
+    def _fwd(self, *args, **kwargs) -> CausalLMOutputWithPast:
+        """Dispatch to the compiled forward when inference-optimized, else the
+        eager forward. Decode paths (generate/speculative) call this so
+        torch.compile is actually exercised — see optimize_for_inference."""
+        if self._compiled_forward is not None:
+            return self._compiled_forward(*args, **kwargs)
+        return self.forward(*args, **kwargs)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embedding
@@ -2271,7 +2292,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         attn = None
         if attention_mask is not None:
             attn = attention_mask[:, -self.config.max_position_embeddings:]
-        out = self.forward(
+        out = self._fwd(
             context, use_cache=True, num_loops=num_loops, attention_mask=attn,
         )
         past_key_values = cast("PastKV | None", out.past_key_values)
@@ -2336,7 +2357,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                         )],
                         dim=1,
                     )
-                out = self.forward(
+                out = self._fwd(
                     new_tok,
                     past_key_values=past_key_values,
                     use_cache=True,
@@ -2558,9 +2579,9 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
 
         if prompt_len > 1:
             seed = context[:, :-1]
-            v_out = self.forward(seed, use_cache=True, num_loops=full_loops)
+            v_out = self._fwd(seed, use_cache=True, num_loops=full_loops)
             verify_past = cast("PastKV | None", v_out.past_key_values)
-            d_out = self.forward(seed, use_cache=True, num_loops=draft_loops)
+            d_out = self._fwd(seed, use_cache=True, num_loops=draft_loops)
             draft_past = cast("PastKV | None", d_out.past_key_values)
             cache_len = prompt_len - 1
         else:
@@ -2583,7 +2604,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             running = generated
             draft_tokens: list[Tensor] = []
             for _ in range(D):
-                dd = self.forward(
+                dd = self._fwd(
                     draft_input, past_key_values=draft_past,
                     use_cache=True, num_loops=draft_loops,
                 )
@@ -2605,7 +2626,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             # The forward grows verify_past by D + 1 positions; we keep only the
             # accepted prefix's latents (drop the speculative tail).
             verify_input = torch.cat([pending, drafts], dim=1)  # (B, D+1)
-            vv = self.forward(
+            vv = self._fwd(
                 verify_input, past_key_values=verify_past,
                 use_cache=True, num_loops=full_loops,
             )
@@ -2687,7 +2708,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                 d_have = 0
             if d_have < keep:
                 ext_toks = generated[:, d_have:keep]
-                de = self.forward(
+                de = self._fwd(
                     ext_toks, past_key_values=draft_past,
                     use_cache=True, num_loops=draft_loops,
                 )

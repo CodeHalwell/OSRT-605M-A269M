@@ -60,3 +60,40 @@ def test_optimize_for_inference_disables_telemetry_on_all_blocks():
     model.optimize_for_inference(compile_model=False)
     for blk in model.model.blocks:
         assert blk.moe.telemetry_enabled is False
+
+
+def test_generate_actually_compiles_via_fwd():
+    """Regression guard for the 'compile bypassed in generate()' bug: a bare
+    model.compile() wraps __call__, but generate() dispatches through
+    self._fwd, which must hit self._compiled_forward. Prove a graph compiled
+    by routing self._compiled_forward through a counting backend and asserting
+    generate() triggered it (frame_count > 0). CompileCounter is a no-codegen
+    backend, so this is fast and CPU-safe."""
+    from torch._dynamo.testing import CompileCounter
+
+    torch.manual_seed(0)
+    model = OSRTForCausalLM(tiny_config()).eval()
+    model.set_moe_telemetry(False)
+    cnt = CompileCounter()
+    model._compiled_forward = torch.compile(model.forward, backend=cnt)
+
+    ids = torch.randint(0, 512, (1, 8))
+    with torch.no_grad():
+        model.generate(ids, max_new_tokens=3, temperature=0.0)
+
+    assert cnt.frame_count > 0, (
+        "generate() did not exercise the compiled forward — compile is bypassed"
+    )
+
+
+def test_fwd_falls_back_to_eager_when_not_optimized():
+    """Without optimize_for_inference, _fwd must be the plain eager forward
+    (bit-identical) — the default training/eval path is untouched."""
+    torch.manual_seed(0)
+    model = OSRTForCausalLM(tiny_config()).eval()
+    x = _fixed_input(model.config)
+    with torch.no_grad():
+        assert model._compiled_forward is None
+        a = model.forward(x).logits
+        b = model._fwd(x).logits
+    assert torch.equal(a, b)

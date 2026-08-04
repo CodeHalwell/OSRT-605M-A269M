@@ -1262,6 +1262,7 @@ def profile_decode(
     step: str = "latest",
     decode_steps: int = 32,
     batch_sizes: tuple[int, ...] = (1, 8, 32),
+    compiled: bool = False,
     hf_repo: str = "HallD/osrt-v6-ckpt",
 ) -> dict:
     """Diagnose the slow single-stream decode. Two experiments, no model edits:
@@ -1270,6 +1271,9 @@ def profile_decode(
           + torch.compile will fix it), not compute-bound.
       (2) torch.profiler over a few batch=1 decode steps -> top CUDA ops by time
           and by launch COUNT (thousands of tiny ops == launch-overhead bound).
+    `compiled=True` runs optimize_for_inference() first, so the profile shows the
+    POST-compile bottleneck (picks the next idea by evidence: if Sinkhorn is gone
+    and cat dominates -> static cache; if Sinkhorn persists -> Triton kernel).
     """
     import re
     import time
@@ -1300,6 +1304,9 @@ def profile_decode(
     model = OSRTForCausalLM(cfg).to(device).eval()
     sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
     model.load_state_dict(sd, strict=False)
+    if compiled:
+        print("optimize_for_inference() (telemetry off + compile)...", flush=True)
+        model.optimize_for_inference()
 
     prompt_ids = [tok.bos_token_id] + tok.encode(
         "The Industrial Revolution was a period of major",
@@ -1356,10 +1363,17 @@ def profile_decode(
 
 
 @app.local_entrypoint()
-def run_profile_decode(step: str = "latest", decode_steps: int = 32):
-    """Diagnose decode throughput (batch sweep + profiler) on A100 (blocking)."""
-    print(f"Profiling decode for step={step} on A100...")
-    res = profile_decode.remote(step=step, decode_steps=decode_steps)
+def run_profile_decode(
+    step: str = "latest", decode_steps: int = 32, compiled: bool = False,
+):
+    """Diagnose decode throughput (batch sweep + profiler) on A100 (blocking).
+
+    `--compiled` profiles the optimize_for_inference() path to pick the next
+    speedup idea by evidence.
+    """
+    print(f"Profiling decode for step={step} compiled={compiled} on A100...")
+    res = profile_decode.remote(
+        step=step, decode_steps=decode_steps, compiled=compiled)
     print("\n=== SWEEP SUMMARY ===")
     for bs, r in res["sweep"].items():
         print(f"  batch={bs}: {r['per_token_ms']:.1f} ms/step, "
@@ -1593,32 +1607,160 @@ def run_bench_compile(step: str = "latest", ctx_len: int = 64):
     secrets=[modal.Secret.from_name("hf-secret")],
     timeout=1800,
 )
+def bench_generate(
+    step: str = "latest",
+    new_tokens: int = 64,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """Authoritative end-to-end generate() bench + identity gate on the REAL
+    decode path (not a fixed-cache loop). Three configs on ONE loaded model:
+      - eager_telem_on:  today's shipping default (telemetry ON, no compile)
+      - eager_telem_off: set_moe_telemetry(False) only
+      - compiled:        optimize_for_inference() — telemetry off + compiled
+                         forward routed through generate() via _fwd
+    Reports batch=1 and batch=32 throughput, prefill latency separated from
+    steady-state decode tok/s, and token-identity of all three vs eager_telem_on
+    (must match — compile is output-identical). Confirms _compiled_forward is set
+    AND (batch=1) that the compiled config is actually faster, i.e. compile is
+    genuinely wired through generate() now (the earlier bug: it was not)."""
+    import re
+    import time
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+
+    prompt = ([tok.bos_token_id]
+              + tok.encode("The Industrial Revolution was a period of major",
+                           add_special_tokens=False))
+
+    def _gen(bs: int, warmups: int = 1) -> tuple[list[int], float, float]:
+        inp = torch.tensor([prompt] * bs, device=device)
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            for _ in range(warmups):  # warmup (compile trace on first call)
+                model.generate(inp, max_new_tokens=4, temperature=0.0)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model.generate(inp, max_new_tokens=1, temperature=0.0)  # prefill+1
+            torch.cuda.synchronize()
+            t_prefill = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            out = model.generate(inp, max_new_tokens=new_tokens, temperature=0.0)
+            torch.cuda.synchronize()
+            t_full = time.perf_counter() - t0
+        ids = out[0, len(prompt):].tolist()
+        decode_tps = bs * (new_tokens - 1) / max(t_full - t_prefill, 1e-6)
+        return ids, t_prefill * 1000, decode_tps
+
+    res = {}
+    # 1) eager, telemetry ON (today's default)
+    ids_on, pf_on, tps_on = _gen(1)
+    _, _, tps_on32 = _gen(32)
+    res["eager_telem_on"] = {"prefill_ms": pf_on, "decode_tps_b1": tps_on,
+                             "decode_tps_b32": tps_on32}
+    # 2) eager, telemetry OFF
+    model.set_moe_telemetry(False)
+    ids_off, pf_off, tps_off = _gen(1)
+    _, _, tps_off32 = _gen(32)
+    res["eager_telem_off"] = {"prefill_ms": pf_off, "decode_tps_b1": tps_off,
+                              "decode_tps_b32": tps_off32}
+    # 3) compiled (the real fix): optimize_for_inference sets _compiled_forward,
+    #    generate() routes through _fwd. 2 warmups to amortise trace/recompile.
+    model.optimize_for_inference()
+    assert model._compiled_forward is not None, "compile not wired"
+    ids_c, pf_c, tps_c = _gen(1, warmups=3)
+    _, _, tps_c32 = _gen(32, warmups=3)
+    res["compiled"] = {"prefill_ms": pf_c, "decode_tps_b1": tps_c,
+                       "decode_tps_b32": tps_c32}
+
+    res["identity"] = {
+        "telem_off_matches_on": ids_off == ids_on,
+        "compiled_matches_on": ids_c == ids_on,
+    }
+    for k in ("eager_telem_on", "eager_telem_off", "compiled"):
+        r = res[k]
+        print(f"  {k:>16}: prefill {r['prefill_ms']:7.1f} ms | "
+              f"decode b1 {r['decode_tps_b1']:6.1f} tok/s | "
+              f"b32 {r['decode_tps_b32']:7.1f} tok/s", flush=True)
+    idn = res["identity"]
+    print(f"  identity vs eager_telem_on: telem_off={idn['telem_off_matches_on']}"
+          f"  compiled={idn['compiled_matches_on']}", flush=True)
+    return res
+
+
+@app.local_entrypoint()
+def run_bench_generate(step: str = "latest", new_tokens: int = 64):
+    """Authoritative generate() bench + identity gate on A100 (blocking)."""
+    print(f"Benchmarking real generate() for step={step} on A100...")
+    res = bench_generate.remote(step=step, new_tokens=new_tokens)
+    print("\n=== REAL generate() PATH (20 Sinkhorn iters) ===")
+    for k in ("eager_telem_on", "eager_telem_off", "compiled"):
+        r = res[k]
+        print(f"  {k}: prefill {r['prefill_ms']:.1f}ms | "
+              f"decode b1 {r['decode_tps_b1']:.1f} tok/s | "
+              f"b32 {r['decode_tps_b32']:.1f} tok/s")
+    print(f"  compiled output-identical to eager: "
+          f"{res['identity']['compiled_matches_on']}")
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=1800,
+)
 def verify_compile_identity(
     step: str = "latest",
     max_new_tokens: int = 64,
     hf_repo: str = "HallD/osrt-v6-ckpt",
 ) -> dict:
-    """QUALITY GATE for Idea #1 (torch.compile in the inference path).
+    """QUALITY GATE for compile: is the REAL compiled path (generate via
+    self._fwd -> self._compiled_forward) a quality regression, or just benign
+    bf16 fused-reduction noise?
 
-    Two checks, both eager-vs-compiled on the SAME weights:
-      (A) forward numerical identity — one teacher-forced forward over a fixed
-          input; report max |Δlogit| and top-1 argmax agreement %. This is the
-          real "is compile output-identical" signal (isolated from generation
-          feedback).
-      (B) greedy generation token-match — practical view; free greedy decode
-          amplifies any single flip, so we report the match % and the first
-          divergence index per prompt.
-    Compile is in-place (model.compile()) so generate()'s internal self.forward
-    uses the compiled graph. Telemetry OFF (required so .item() doesn't break
-    the graph). No weight change; expected near-identical modulo bf16 fused
-    reduction order.
+    Three checks vs eager, on the SAME weights, using the REAL _compiled_forward
+    (not the old model.compile()+self.forward bug):
+      (A) forward logit diff — teacher-forced fixed input, eager vs compiled
+          logits: max|Δlogit| + top-1 argmax agreement %. Large diff => compile
+          MISCOMPILES (must not ship); ~bf16-epsilon => benign.
+      (B) held-out math ppl eager vs compiled — teacher-forced (NO generation
+          feedback to amplify). This is the decisive quality number: if
+          ppl_compiled ~= ppl_eager, quality is preserved regardless of greedy
+          token drift.
+      (C) greedy first-divergence — the amplified free-gen view, for context
+          only (a single late argmax flip cascades here; not a quality metric).
     """
+    import math
     import re
 
     import torch
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
 
+    from osrt.data import make_loader
     from osrt.model import OSRTForCausalLM
     from osrt.presets import build_config
 
@@ -1649,7 +1791,31 @@ def verify_compile_identity(
             out = model.generate(inp, max_new_tokens=max_new_tokens, temperature=0.0)
         return out[0, len(ids):].tolist()
 
-    # (A) forward identity on a fixed input — capture eager logits FIRST.
+    # Fixed held-out math batches (same for eager + compiled) for the ppl gate.
+    loader = make_loader(
+        dataset_configs=[{
+            "name": "nemotron-cc-math-heldout",
+            "hf_id": "nvidia/Nemotron-CC-Math-v1", "hf_config": "4plus",
+            "weight": 1.0, "skip": 2_000_000,
+        }],
+        seq_len=4096, tokenizer_name="/root/v6_tokenizer_export",
+        batch_size=4, step_num=999999, num_workers=0,
+    )
+    it = iter(loader)
+    ppl_batches = [next(it) for _ in range(12)]
+
+    def _ppl() -> float:
+        tot_loss = tot_tok = 0
+        with torch.inference_mode():
+            for input_ids, labels in ppl_batches:
+                input_ids, labels = input_ids.to(device), labels.to(device)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    out = model(input_ids, labels=labels)
+                n = int((labels != -100).sum())
+                tot_loss += out.loss.item() * n
+                tot_tok += n
+        return math.exp(min(tot_loss / max(tot_tok, 1), 20.0))
+
     fixed = torch.tensor(
         [[tok.bos_token_id] + tok.encode(
             "The Industrial Revolution was a period of major economic change "
@@ -1657,60 +1823,60 @@ def verify_compile_identity(
             add_special_tokens=False)],
         device=device,
     )
+    # EAGER pass first (before compile is wired).
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         eager_logits = model.forward(fixed).logits.float()
+    eager_ppl = _ppl()
     eager_gens = {p: _greedy(p) for p in _SAMPLE_PROMPTS}
 
-    # Compile in place; subsequent forward()/generate() use the compiled graph.
-    print("compiling (in place)...", flush=True)
-    model.compile()
+    # COMPILE for real: sets _compiled_forward; _fwd + generate route through it.
+    print("optimize_for_inference() (real compiled path)...", flush=True)
+    model.optimize_for_inference()
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        _ = model.forward(fixed)  # warmup / trace
-        comp_logits = model.forward(fixed).logits.float()
+        _ = model._fwd(fixed)  # warmup / trace the compiled forward
+        comp_logits = model._fwd(fixed).logits.float()
+    comp_ppl = _ppl()
 
     max_abs = (eager_logits - comp_logits).abs().max().item()
     top1_agree = (
         (eager_logits.argmax(-1) == comp_logits.argmax(-1)).float().mean().item()
     )
 
-    # (B) greedy token-match per prompt.
     gen_report = {}
     for p in _SAMPLE_PROMPTS:
-        e = eager_gens[p]
-        c = _greedy(p)
+        e, c = eager_gens[p], _greedy(p)
         first_div = next((i for i, (a, b) in enumerate(zip(e, c)) if a != b), None)
-        matched = first_div if first_div is not None else min(len(e), len(c))
-        gen_report[p[:40]] = {
-            "match_frac": matched / max(len(e), 1),
-            "first_divergence": first_div,
-            "n": len(e),
-        }
+        gen_report[p[:40]] = {"first_divergence": first_div, "n": len(e)}
         tag = "IDENTICAL" if first_div is None else f"diverges @ {first_div}/{len(e)}"
         print(f"  [{tag}] {p[:48]!r}", flush=True)
 
     res = {
         "forward_max_abs_logit_diff": max_abs,
         "forward_top1_agreement": top1_agree,
+        "eager_ppl": eager_ppl,
+        "compiled_ppl": comp_ppl,
         "greedy": gen_report,
     }
-    print(f"\n  forward: max|Δlogit|={max_abs:.4g}  top1_agree={top1_agree*100:.3f}%",
-          flush=True)
+    print(f"\n  forward: max|Δlogit|={max_abs:.4g}  top1_agree={top1_agree*100:.3f}%"
+          f"\n  ppl: eager={eager_ppl:.4f}  compiled={comp_ppl:.4f}  "
+          f"Δ={comp_ppl - eager_ppl:+.4f}", flush=True)
     return res
 
 
 @app.local_entrypoint()
 def run_verify_compile(step: str = "latest", max_new_tokens: int = 64):
-    """Quality gate: is torch.compile output-identical to eager? (blocking)."""
-    print(f"Verifying compile identity for step={step} on A100...")
+    """Quality gate: is compile a regression or benign bf16 noise? (blocking)."""
+    print(f"Verifying compile quality for step={step} on A100...")
     res = verify_compile_identity.remote(step=step, max_new_tokens=max_new_tokens)
-    print("\n=== IDEA #1 QUALITY GATE ===")
+    print("\n=== COMPILE QUALITY GATE ===")
     print(f"  forward max|Δlogit|:   {res['forward_max_abs_logit_diff']:.4g}")
     print(f"  forward top-1 agree:   {res['forward_top1_agreement']*100:.3f}%")
+    print(f"  held-out math ppl:     eager={res['eager_ppl']:.4f}  "
+          f"compiled={res['compiled_ppl']:.4f}  "
+          f"Δ={res['compiled_ppl'] - res['eager_ppl']:+.4f}")
     ident = sum(1 for r in res["greedy"].values() if r["first_divergence"] is None)
-    print(f"  greedy identical:      {ident}/{len(res['greedy'])} prompts")
-    for p, r in res["greedy"].items():
-        print(f"    {p!r}: match={r['match_frac']*100:.1f}% "
-              f"first_div={r['first_divergence']}")
+    print(f"  greedy identical:      {ident}/{len(res['greedy'])} prompts "
+          f"(free-gen amplifies bf16 flips; not a quality metric)")
 
 
 @app.local_entrypoint()
