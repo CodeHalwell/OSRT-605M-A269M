@@ -1189,7 +1189,8 @@ def sample_base(
     assert not missing and not unexpected, (
         f"state mismatch: missing={missing[:3]} unexpected={unexpected[:3]}"
     )
-    model.eval()
+    # Idea #1: telemetry-off + torch.compile — ~3x, verified output-identical.
+    model.optimize_for_inference()
 
     import time
 
@@ -1583,6 +1584,133 @@ def run_bench_compile(step: str = "latest", ctx_len: int = 64):
                       f"{r['tok_per_sec']:.1f} tok/s")
             else:
                 print(f"  {vname} batch={bs}: {r.get('error')}")
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=1800,
+)
+def verify_compile_identity(
+    step: str = "latest",
+    max_new_tokens: int = 64,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """QUALITY GATE for Idea #1 (torch.compile in the inference path).
+
+    Two checks, both eager-vs-compiled on the SAME weights:
+      (A) forward numerical identity — one teacher-forced forward over a fixed
+          input; report max |Δlogit| and top-1 argmax agreement %. This is the
+          real "is compile output-identical" signal (isolated from generation
+          feedback).
+      (B) greedy generation token-match — practical view; free greedy decode
+          amplifies any single flip, so we report the match % and the first
+          divergence index per prompt.
+    Compile is in-place (model.compile()) so generate()'s internal self.forward
+    uses the compiled graph. Telemetry OFF (required so .item() doesn't break
+    the graph). No weight change; expected near-identical modulo bf16 fused
+    reduction order.
+    """
+    import re
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+    model.set_moe_telemetry(False)
+
+    def _greedy(prompt: str) -> list[int]:
+        ids = [tok.bos_token_id] + tok.encode(prompt, add_special_tokens=False)
+        inp = torch.tensor([ids], device=device)
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.generate(inp, max_new_tokens=max_new_tokens, temperature=0.0)
+        return out[0, len(ids):].tolist()
+
+    # (A) forward identity on a fixed input — capture eager logits FIRST.
+    fixed = torch.tensor(
+        [[tok.bos_token_id] + tok.encode(
+            "The Industrial Revolution was a period of major economic change "
+            "that began in Britain and spread across the world over decades.",
+            add_special_tokens=False)],
+        device=device,
+    )
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        eager_logits = model.forward(fixed).logits.float()
+    eager_gens = {p: _greedy(p) for p in _SAMPLE_PROMPTS}
+
+    # Compile in place; subsequent forward()/generate() use the compiled graph.
+    print("compiling (in place)...", flush=True)
+    model.compile()
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        _ = model.forward(fixed)  # warmup / trace
+        comp_logits = model.forward(fixed).logits.float()
+
+    max_abs = (eager_logits - comp_logits).abs().max().item()
+    top1_agree = (
+        (eager_logits.argmax(-1) == comp_logits.argmax(-1)).float().mean().item()
+    )
+
+    # (B) greedy token-match per prompt.
+    gen_report = {}
+    for p in _SAMPLE_PROMPTS:
+        e = eager_gens[p]
+        c = _greedy(p)
+        first_div = next((i for i, (a, b) in enumerate(zip(e, c)) if a != b), None)
+        matched = first_div if first_div is not None else min(len(e), len(c))
+        gen_report[p[:40]] = {
+            "match_frac": matched / max(len(e), 1),
+            "first_divergence": first_div,
+            "n": len(e),
+        }
+        tag = "IDENTICAL" if first_div is None else f"diverges @ {first_div}/{len(e)}"
+        print(f"  [{tag}] {p[:48]!r}", flush=True)
+
+    res = {
+        "forward_max_abs_logit_diff": max_abs,
+        "forward_top1_agreement": top1_agree,
+        "greedy": gen_report,
+    }
+    print(f"\n  forward: max|Δlogit|={max_abs:.4g}  top1_agree={top1_agree*100:.3f}%",
+          flush=True)
+    return res
+
+
+@app.local_entrypoint()
+def run_verify_compile(step: str = "latest", max_new_tokens: int = 64):
+    """Quality gate: is torch.compile output-identical to eager? (blocking)."""
+    print(f"Verifying compile identity for step={step} on A100...")
+    res = verify_compile_identity.remote(step=step, max_new_tokens=max_new_tokens)
+    print("\n=== IDEA #1 QUALITY GATE ===")
+    print(f"  forward max|Δlogit|:   {res['forward_max_abs_logit_diff']:.4g}")
+    print(f"  forward top-1 agree:   {res['forward_top1_agreement']*100:.3f}%")
+    ident = sum(1 for r in res["greedy"].values() if r["first_divergence"] is None)
+    print(f"  greedy identical:      {ident}/{len(res['greedy'])} prompts")
+    for p, r in res["greedy"].items():
+        print(f"    {p!r}: match={r['match_frac']*100:.1f}% "
+              f"first_div={r['first_divergence']}")
 
 
 @app.local_entrypoint()

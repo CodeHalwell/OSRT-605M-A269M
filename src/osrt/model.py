@@ -1888,6 +1888,35 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         """Delegate to OSRTModel.set_moe_telemetry — see docstring there."""
         self.model.set_moe_telemetry(enabled)
 
+    def optimize_for_inference(self, compile_model: bool = True) -> "OSRTForCausalLM":
+        """Prepare this model for fast generation/eval. Returns self.
+
+        Two output-IDENTICAL steps (verified bit-exact on midtrain3_final, A100:
+        max|Δlogit|=0, 100% greedy token-match):
+          1. set_moe_telemetry(False) — drops the ~21 .item()/.tolist() CUDA
+             syncs per MoE forward (x18 effective layers). These are training
+             collapse-guards; at inference they are pure overhead AND their
+             .item() calls graph-break torch.compile.
+          2. self.compile() (in place) — torch.compile(default) fuses the mHC
+             Sinkhorn logsumexp (5 ops -> 1) and elementwise ops. ~3x decode
+             throughput (A100: batch=1 5.4->16.9, batch=32 163->479 tok/s).
+             In-place so generate()'s internal self.forward uses the compiled
+             graph. Data-dependent MoE ops (topk/index_add) fall back to eager
+             kernels without breaking the graph.
+
+        NOT applied automatically — training must keep telemetry ON and stay
+        uncompiled. Call this only on a model dedicated to inference. Compiles
+        lazily on the first forward of each new (batch, seq) shape; a couple of
+        warmup forwards amortise it. `mode="reduce-overhead"` (CUDA graphs) is
+        deliberately NOT used — capture fails on the MoE data-dependent ops
+        (needs the static-KV-cache refactor first).
+        """
+        self.eval()
+        self.set_moe_telemetry(False)
+        if compile_model:
+            self.compile()
+        return self
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embedding
 
