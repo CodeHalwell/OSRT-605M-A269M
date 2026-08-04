@@ -1117,6 +1117,474 @@ def run_ppl_eval(
     print(f"  tokens:  {res['tokens']:,}")
 
 
+# =============================================================================
+# SAMPLE — free-form generation from a BASE checkpoint (eyeball the outputs)
+# =============================================================================
+# This is a BASE (never-SFT'd) model, so it does raw next-token CONTINUATION,
+# not Q->A / chat. Prompts are text PREFIXES the model continues. Pure greedy
+# loops on a base model, so the greedy view uses a repetition penalty; a sampled
+# view (temp/top-p) shows the more natural distribution. Mirrors ppl_eval's
+# proven HF-pull + tokenizer-from-image loading; never touches any training run.
+_SAMPLE_PROMPTS = [
+    "Problem: What is the value of 12 multiplied by 8?\nSolution:",
+    "To find the area of a rectangle we multiply its length by its width. "
+    "A rectangle with length 5 cm and width 3 cm has an area of",
+    "Photosynthesis is the process by which plants",
+    "def is_prime(n):\n    ",
+    "The Industrial Revolution was a period of major",
+    "In mathematics, a prime number is a natural number that",
+]
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=1800,
+)
+def sample_base(
+    step: str = "latest",
+    max_new_tokens: int = 160,
+    rep_penalty: float = 1.3,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    top_k: int = 40,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+    prompts: list[str] | None = None,
+) -> list[dict]:
+    """Generate continuations from a base checkpoint. Returns per-prompt dicts
+    with a greedy(+rep_penalty) view and a sampled view."""
+    import re
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    if step == "latest":
+        name = max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+    elif step == "final":
+        name = "osrt_v5_midtrain3_final.pt"
+    else:
+        name = next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    print(f"pulling {name} from {hf_repo}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device)
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    assert not missing and not unexpected, (
+        f"state mismatch: missing={missing[:3]} unexpected={unexpected[:3]}"
+    )
+    model.eval()
+
+    import time
+
+    def _gen(prompt: str, *, temp: float, rp: float) -> tuple[str, int, float]:
+        ids = [tok.bos_token_id] if tok.bos_token_id is not None else []
+        ids += tok.encode(prompt, add_special_tokens=False)
+        inp = torch.tensor([ids], device=device)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.generate(
+                inp, max_new_tokens=max_new_tokens, temperature=temp,
+                top_p=top_p, top_k=top_k, repetition_penalty=rp,
+                eos_token_id=tok.eos_token_id,
+            )
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        gen = out[0, len(ids):].tolist()
+        return tok.decode(gen, skip_special_tokens=True), len(gen), dt
+
+    # Warmup so the first timed call isn't paying CUDA lazy-init / kernel compile.
+    print("warmup generation (untimed)...", flush=True)
+    _gen(_SAMPLE_PROMPTS[0], temp=0.0, rp=rep_penalty)
+
+    prompts = prompts or _SAMPLE_PROMPTS
+    results = []
+    tps_all = []
+    for p in prompts:
+        greedy, gn, gdt = _gen(p, temp=0.0, rp=rep_penalty)
+        sampled, sn, sdt = _gen(p, temp=temperature, rp=1.2)
+        g_tps, s_tps = gn / gdt, sn / sdt
+        tps_all += [g_tps, s_tps]
+        results.append({"prompt": p, "greedy": greedy, "sampled": sampled,
+                        "greedy_tok_per_sec": g_tps, "sampled_tok_per_sec": s_tps,
+                        "greedy_tokens": gn, "sampled_tokens": sn})
+        print(f"\n{'='*70}\nPROMPT: {p!r}\n"
+              f"--- greedy(rp={rep_penalty}) [{gn} tok, {g_tps:.1f} tok/s] ---\n"
+              f"{greedy}\n"
+              f"--- sampled(t={temperature},p={top_p}) "
+              f"[{sn} tok, {s_tps:.1f} tok/s] ---\n"
+              f"{sampled}", flush=True)
+    avg_tps = sum(tps_all) / len(tps_all)
+    print(f"\n{'='*70}\nTHROUGHPUT: mean {avg_tps:.1f} tok/s "
+          f"(batch=1, A100, {len(tps_all)} gens, max_new={max_new_tokens})",
+          flush=True)
+    return results
+
+
+@app.local_entrypoint()
+def run_sample(step: str = "latest", max_new_tokens: int = 160):
+    """Eyeball free-form generations from a base checkpoint (blocking).
+
+    `step`: "latest" (=step_12600), "final" (=osrt_v5_midtrain3_final.pt), or a
+    number. It's a BASE model -> continuations of text prefixes, not chat.
+    """
+    print(f"Sampling base step={step} on A100 (max_new={max_new_tokens})...")
+    res = sample_base.remote(step=step, max_new_tokens=max_new_tokens)
+    print(f"\n=== {len(res)} prompts generated ===")
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=1800,
+)
+def profile_decode(
+    step: str = "latest",
+    decode_steps: int = 32,
+    batch_sizes: tuple[int, ...] = (1, 8, 32),
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """Diagnose the slow single-stream decode. Two experiments, no model edits:
+      (1) batch-size sweep -> per-token latency + aggregate tok/s. If tok/s
+          scales ~linearly with batch, decode is launch/occupancy-bound (batching
+          + torch.compile will fix it), not compute-bound.
+      (2) torch.profiler over a few batch=1 decode steps -> top CUDA ops by time
+          and by launch COUNT (thousands of tiny ops == launch-overhead bound).
+    """
+    import re
+    import time
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from torch.profiler import ProfilerActivity, profile
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+
+    prompt_ids = [tok.bos_token_id] + tok.encode(
+        "The Industrial Revolution was a period of major",
+        add_special_tokens=False,
+    )
+
+    def _run(bs: int) -> tuple[float, float]:
+        inp = torch.tensor([prompt_ids] * bs, device=device)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            model.generate(inp, max_new_tokens=4, temperature=0.0)  # warmup
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model.generate(inp, max_new_tokens=decode_steps, temperature=0.0)
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        per_tok_ms = dt / decode_steps * 1000
+        agg_tps = bs * decode_steps / dt
+        return per_tok_ms, agg_tps
+
+    sweep = {}
+    print("\n=== batch-size sweep ===", flush=True)
+    for bs in batch_sizes:
+        ms, tps = _run(bs)
+        sweep[bs] = {"per_token_ms": ms, "aggregate_tok_per_sec": tps}
+        print(f"  batch={bs:>3}: {ms:7.1f} ms/token-step | {tps:8.1f} tok/s aggregate",
+              flush=True)
+
+    # torch.profiler on batch=1 decode
+    print("\n=== profiler: batch=1, 8 decode steps ===", flush=True)
+    inp = torch.tensor([prompt_ids], device=device)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        model.generate(inp, max_new_tokens=4, temperature=0.0)  # warmup
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            model.generate(inp, max_new_tokens=8, temperature=0.0)
+    ka = prof.key_averages()
+
+    def _dev_us(e):  # torch renamed self_cuda_time_total -> self_device_time_total
+        return getattr(e, "self_device_time_total",
+                       getattr(e, "self_cuda_time_total", 0.0))
+
+    total_dev_us = sum(_dev_us(e) for e in ka)
+    total_calls = sum(e.count for e in ka)
+    print(f"  total op launches (8 steps): {total_calls}  (~{total_calls // 8}/token)",
+          flush=True)
+    print(f"  total self-device time: {total_dev_us / 1000:.1f} ms", flush=True)
+    sort_key = ("self_device_time_total"
+                if hasattr(next(iter(ka)), "self_device_time_total")
+                else "self_cuda_time_total")
+    print("  top ops by device time:", flush=True)
+    print(ka.table(sort_by=sort_key, row_limit=12), flush=True)
+    print("  top ops by launch count:", flush=True)
+    print(ka.table(sort_by="count", row_limit=12), flush=True)
+    return {"sweep": sweep, "launches_per_token": total_calls // 8}
+
+
+@app.local_entrypoint()
+def run_profile_decode(step: str = "latest", decode_steps: int = 32):
+    """Diagnose decode throughput (batch sweep + profiler) on A100 (blocking)."""
+    print(f"Profiling decode for step={step} on A100...")
+    res = profile_decode.remote(step=step, decode_steps=decode_steps)
+    print("\n=== SWEEP SUMMARY ===")
+    for bs, r in res["sweep"].items():
+        print(f"  batch={bs}: {r['per_token_ms']:.1f} ms/step, "
+              f"{r['aggregate_tok_per_sec']:.1f} tok/s aggregate")
+    print(f"  launches/token: {res['launches_per_token']}")
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=3600,
+)
+def ppl_sinkhorn_ab(
+    step: str = "latest",
+    iters_list: tuple[int, ...] = (20, 8, 5, 3),
+    eval_steps: int = 24,
+    batch: int = 6,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """A/B: does held-out math ppl hold as we cut Sinkhorn iterations?
+
+    The Sinkhorn iteration count is NOT a weight — it's a runtime attribute on
+    every ManifoldHyperConnection. So we load once, fix a set of held-out
+    batches, and re-score them at each iters setting by overriding the attr.
+    If ppl@5 ~= ppl@20, the inference decode can drop 20->5 (the top hotspot,
+    89% of decode wall time) for free.
+    """
+    import math
+    import re
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.data import make_loader
+    from osrt.mhc import ManifoldHyperConnection
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+
+    mhcs = [m for m in model.modules() if isinstance(m, ManifoldHyperConnection)]
+    print(f"{len(mhcs)} mHC modules; default sinkhorn_iters="
+          f"{mhcs[0].sinkhorn_iters}", flush=True)
+
+    # Fix the SAME held-out batches for every setting (fair comparison).
+    loader = make_loader(
+        dataset_configs=[{
+            "name": "nemotron-cc-math-heldout",
+            "hf_id": "nvidia/Nemotron-CC-Math-v1", "hf_config": "4plus",
+            "weight": 1.0, "skip": 2_000_000,
+        }],
+        seq_len=4096, tokenizer_name="/root/v6_tokenizer_export",
+        batch_size=batch, step_num=999999, num_workers=0,
+    )
+    it = iter(loader)
+    batches = [next(it) for _ in range(eval_steps)]
+
+    results = {}
+    for iters in iters_list:
+        for m in mhcs:
+            m.sinkhorn_iters = iters
+        total_loss = total_tok = 0
+        with torch.inference_mode():
+            for input_ids, labels in batches:
+                input_ids, labels = input_ids.to(device), labels.to(device)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    out = model(input_ids, labels=labels)
+                n = int((labels != -100).sum())
+                total_loss += out.loss.item() * n
+                total_tok += n
+        mean_loss = total_loss / max(total_tok, 1)
+        ppl = math.exp(min(mean_loss, 20.0))
+        results[iters] = {"loss": mean_loss, "ppl": ppl}
+        print(f"  sinkhorn_iters={iters:>2}: loss={mean_loss:.4f}  ppl={ppl:.3f}",
+              flush=True)
+    return {"tokens": total_tok, "by_iters": results}
+
+
+@app.local_entrypoint()
+def run_ppl_sinkhorn_ab(step: str = "latest", eval_steps: int = 24):
+    """A/B held-out math ppl vs Sinkhorn iteration count (blocking)."""
+    print(f"Sinkhorn-iters ppl A/B for step={step} on A100...")
+    res = ppl_sinkhorn_ab.remote(step=step, eval_steps=eval_steps)
+    print(f"\n=== RESULT ({res['tokens']:,} tok) ===")
+    base = res["by_iters"].get(20, {}).get("ppl")
+    for iters, r in res["by_iters"].items():
+        delta = f"  (Δ {r['ppl'] - base:+.4f} vs 20)" if base else ""
+        print(f"  iters={iters:>2}: ppl={r['ppl']:.3f}{delta}")
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=3600,
+)
+def bench_compile(
+    step: str = "latest",
+    ctx_len: int = 64,
+    timed_steps: int = 50,
+    batch_sizes: tuple[int, ...] = (1, 32),
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """Measure the OUTPUT-IDENTICAL decode ceiling (20 Sinkhorn iters kept).
+
+    Isolates the static-cache steady state: prefill once to a length-`ctx_len`
+    cache, then repeatedly run a 1-token decode step against that FIXED cache
+    (discarding the grown cache), so shapes stay static — exactly what the
+    static-KV-cache refactor would give. Compares eager vs
+    torch.compile(reduce-overhead) (CUDA graphs). tok/s = batch / step_time.
+    """
+    import re
+    import time
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+    # Inference: turn OFF the MoE/loop-collapse telemetry. It does ~21 .item()
+    # GPU->CPU syncs per MoE forward (x18 effective layers) that are pure
+    # overhead here AND graph-break torch.compile. Training keeps it on.
+    model.set_moe_telemetry(False)
+
+    def _bench(fwd, bs: int) -> float:
+        ctx = torch.randint(0, cfg.real_vocab_size, (bs, ctx_len), device=device)
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.forward(ctx, use_cache=True)  # prefill (eager, once)
+            cache = out.past_key_values
+            new_tok = torch.randint(0, cfg.real_vocab_size, (bs, 1), device=device)
+            for _ in range(8):  # warmup (triggers compile + CUDA-graph capture)
+                fwd(new_tok, past_key_values=cache, use_cache=True)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(timed_steps):
+                fwd(new_tok, past_key_values=cache, use_cache=True)
+            torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / timed_steps * 1000  # ms/step
+
+    results = {}
+    variants = {"eager": model.forward}
+    # Default mode: fuses kernels (logsumexp 5 ops -> 1, elementwise) WITHOUT
+    # fragile CUDA-graph stream capture. reduce-overhead: adds CUDA graphs
+    # (zero launch overhead) but capture breaks on MoE data-dependent ops / RNG.
+    try:
+        variants["compile_default"] = torch.compile(model, fullgraph=False).forward
+    except Exception as e:  # noqa: BLE001
+        print(f"compile(default) setup failed: {e}", flush=True)
+    try:
+        variants["compile_reduce_overhead"] = torch.compile(
+            model, mode="reduce-overhead", fullgraph=False).forward
+    except Exception as e:  # noqa: BLE001
+        print(f"compile(reduce-overhead) setup failed: {e}", flush=True)
+
+    for vname, fwd in variants.items():
+        results[vname] = {}
+        for bs in batch_sizes:
+            try:
+                ms = _bench(fwd, bs)
+                tps = bs / ms * 1000
+                results[vname][bs] = {"ms_per_step": ms, "tok_per_sec": tps}
+                print(f"  {vname:>24} batch={bs:>3}: {ms:7.2f} ms/step | "
+                      f"{tps:8.1f} tok/s", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"  {vname} batch={bs}: FAILED {type(e).__name__}: {e}",
+                      flush=True)
+                results[vname][bs] = {"error": f"{type(e).__name__}: {e}"}
+    return results
+
+
+@app.local_entrypoint()
+def run_bench_compile(step: str = "latest", ctx_len: int = 64):
+    """Measure output-identical decode ceiling (eager vs compiled) on A100."""
+    print(f"Benchmarking compiled decode for step={step} on A100...")
+    res = bench_compile.remote(step=step, ctx_len=ctx_len)
+    print("\n=== CEILING (20 Sinkhorn iters, outputs unchanged) ===")
+    for vname, by_bs in res.items():
+        for bs, r in by_bs.items():
+            if "tok_per_sec" in r:
+                print(f"  {vname} batch={bs}: {r['ms_per_step']:.2f} ms/step, "
+                      f"{r['tok_per_sec']:.1f} tok/s")
+            else:
+                print(f"  {vname} batch={bs}: {r.get('error')}")
+
+
 @app.local_entrypoint()
 def run_sft_eval(step: str = "final", n: int = 100, max_new_tokens: int = 768):
     """Scored reasoning on/off eval of an SFT-v2 checkpoint on GPU (blocking).
