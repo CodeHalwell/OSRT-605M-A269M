@@ -2201,6 +2201,139 @@ def gate_cudagraph(
     return results
 
 
+def _bench_graphs_impl(
+    step: str,
+    batches: str,
+    new_tokens: int,
+    hf_repo: str,
+) -> dict:
+    """Shared body for the batched CUDA-graph throughput bench (Chain B).
+
+    For each batch size: steady-state decode tok/s (prefill excluded) under
+    the full graphs config (optimize_for_inference(reduce_overhead=True) +
+    cache_impl="static"), plus a compiled-latent reference at the same batch.
+    Each batch size is a distinct static shape -> its own decode trace +
+    capture (the fixed-bucket reality; production precompiles its buckets).
+    """
+    import re
+    import statistics
+    import time
+
+    _use_inductor_cache()
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    gpu_name = torch.cuda.get_device_name(0)
+    print(f"GPU: {gpu_name} | pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+    model.optimize_for_inference(reduce_overhead=True)
+
+    prompt = ([tok.bos_token_id]
+              + tok.encode("The Industrial Revolution was a period of major",
+                           add_special_tokens=False))
+
+    def _timed(bs: int, impl: str, reps: int = 3) -> float:
+        inp = torch.tensor([prompt] * bs, device=device)
+        vals = []
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            # settle: traces/captures on first call for this shape
+            model.generate(inp, max_new_tokens=4, temperature=0.0,
+                           cache_impl=impl)
+            for _ in range(reps):
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                model.generate(inp, max_new_tokens=1, temperature=0.0,
+                               cache_impl=impl)
+                torch.cuda.synchronize()
+                t_pref = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                model.generate(inp, max_new_tokens=new_tokens,
+                               temperature=0.0, cache_impl=impl)
+                torch.cuda.synchronize()
+                t_full = time.perf_counter() - t0
+                vals.append(
+                    bs * (new_tokens - 1) / max(t_full - t_pref, 1e-6))
+        return statistics.median(vals)
+
+    results = {"gpu": gpu_name}
+    for bs in (int(b) for b in batches.split(",")):
+        graphs = _timed(bs, "static")
+        latent = _timed(bs, "latent")
+        results[f"b{bs}"] = {"graphs_tps": graphs, "latent_tps": latent}
+        print(f"  b{bs:>3}: graphs {graphs:8.1f} tok/s | "
+              f"latent(compiled) {latent:8.1f} tok/s | "
+              f"x{graphs / max(latent, 1e-9):.1f}", flush=True)
+    return results
+
+
+_BENCH_GRAPHS_ARGS = dict(
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=7200,
+)
+
+
+@app.function(gpu="A100-80GB", **_BENCH_GRAPHS_ARGS)
+def bench_graphs_a100(step: str = "latest", batches: str = "1,8,32",
+                      new_tokens: int = 64,
+                      hf_repo: str = "HallD/osrt-v6-ckpt") -> dict:
+    return _bench_graphs_impl(step, batches, new_tokens, hf_repo)
+
+
+@app.function(gpu="H100", **_BENCH_GRAPHS_ARGS)
+def bench_graphs_h100(step: str = "latest", batches: str = "1,8,32",
+                      new_tokens: int = 64,
+                      hf_repo: str = "HallD/osrt-v6-ckpt") -> dict:
+    return _bench_graphs_impl(step, batches, new_tokens, hf_repo)
+
+
+@app.function(gpu="B200", **_BENCH_GRAPHS_ARGS)
+def bench_graphs_b200(step: str = "latest", batches: str = "1,8,32",
+                      new_tokens: int = 64,
+                      hf_repo: str = "HallD/osrt-v6-ckpt") -> dict:
+    return _bench_graphs_impl(step, batches, new_tokens, hf_repo)
+
+
+@app.local_entrypoint()
+def run_bench_graphs(
+    gpu: str = "a100", step: str = "latest", batches: str = "1,8,32",
+):
+    """Batched CUDA-graph throughput bench on a100|h100|b200 (blocking)."""
+    fn = {"a100": bench_graphs_a100, "h100": bench_graphs_h100,
+          "b200": bench_graphs_b200}[gpu.lower()]
+    print(f"Batched graphs bench on {gpu.upper()} (batches={batches})...")
+    res = fn.remote(step=step, batches=batches)
+    print(f"\n=== BATCHED GRAPHS THROUGHPUT — {res['gpu']} ===")
+    for k, r in res.items():
+        if k == "gpu":
+            continue
+        print(f"  {k}: graphs {r['graphs_tps']:.1f} tok/s | "
+              f"latent {r['latent_tps']:.1f} | "
+              f"x{r['graphs_tps'] / max(r['latent_tps'], 1e-9):.1f}")
+
+
 @app.local_entrypoint()
 def run_gate_cudagraph(step: str = "latest", new_tokens: int = 48):
     """Sequence-level gate: static+cudagraphs vs latent across ctx (blocking)."""
