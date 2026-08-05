@@ -1945,9 +1945,14 @@ def ab_static(
     step: str = "latest",
     reps: int = 5,
     decode_steps: int = 64,
+    debug_capture: bool = False,
     hf_repo: str = "HallD/osrt-v6-ckpt",
 ) -> dict:
     """Paired latent-vs-static cache A/B on ONE GPU, compiled path.
+
+    debug_capture=True sets TORCH_LOGS=cudagraphs + CUDA_LAUNCH_BLOCKING=1
+    BEFORE torch imports, so a cudagraph capture failure names the actual
+    faulting op instead of an async AcceleratorError at teardown.
 
     (1) Alternating cache_impl timings at b1 (medians) — does the static cache
         pay before CUDA graphs?
@@ -1957,10 +1962,14 @@ def ab_static(
         reviewer: gate on logit error/ppl, not token identity (bf16 GEMV vs
         GEMM accumulation differs by design).
     """
+    import os
     import re
     import statistics
     import time
 
+    if debug_capture:
+        os.environ["TORCH_LOGS"] = "cudagraphs"
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     _use_inductor_cache()
 
     import torch
@@ -2081,8 +2090,11 @@ def ab_static(
         print(f"reduce-overhead static: median {statistics.median(ro):.1f} "
               f"{[f'{t:.1f}' for t in ro]}", flush=True)
     except Exception as e:  # noqa: BLE001
+        import traceback
         ro_err = f"{type(e).__name__}: {e}"
         print(f"reduce-overhead static FAILED: {ro_err}", flush=True)
+        print("--- full traceback (names the faulting op) ---", flush=True)
+        print(traceback.format_exc(), flush=True)
 
     return {
         "latent_median_tps": statistics.median(lat), "latent_all": lat,
@@ -2095,10 +2107,15 @@ def ab_static(
 
 
 @app.local_entrypoint()
-def run_ab_static(step: str = "latest", reps: int = 5):
-    """Paired latent-vs-static cache A/B + quality gate (blocking)."""
+def run_ab_static(
+    step: str = "latest", reps: int = 5, debug_capture: bool = False,
+):
+    """Paired latent-vs-static cache A/B + quality gate (blocking).
+
+    --debug-capture: TORCH_LOGS=cudagraphs + CUDA_LAUNCH_BLOCKING=1 so a
+    capture failure names the faulting op."""
     print(f"Static-cache A/B for step={step} on one A100...")
-    res = ab_static.remote(step=step, reps=reps)
+    res = ab_static.remote(step=step, reps=reps, debug_capture=debug_capture)
     print("\n=== STATIC CACHE PAIRED A/B (same GPU, b1, medians) ===")
     print(f"  latent: {res['latent_median_tps']:.1f} tok/s  {res['latent_all']}")
     print(f"  static: {res['static_median_tps']:.1f} tok/s  {res['static_all']}")

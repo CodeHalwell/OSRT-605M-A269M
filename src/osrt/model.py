@@ -737,9 +737,9 @@ class MoELayer(nn.Module):
         Flatten the (token, rank) pairs, sort by chosen expert, run one grouped
         SwiGLU over the sorted tokens, gate, then scatter-add back per token.
         Equivalent to _dispatch_loop in the no-drop regime; in training it keeps
-        every token (no capacity cap). Fixed-shape ops only (argsort, bincount,
-        cumsum, index_add) so the path is torch.compile-clean. Returns
-        (moe_out_flat (N, D), 0).
+        every token (no capacity cap). Fixed-shape ops only (argsort,
+        scatter_add, cumsum, index_add) so the path is torch.compile-clean AND
+        CUDA-graph capturable. Returns (moe_out_flat (N, D), 0).
         """
         N, D = x_flat.shape
         K = self.top_k
@@ -754,7 +754,14 @@ class MoELayer(nn.Module):
         order = torch.argsort(pair_expert, stable=True)
         sorted_token = pair_token[order]
         sorted_gate = pair_gate[order]
-        counts = torch.bincount(pair_expert, minlength=E)  # (E,)
+        # Per-expert counts via scatter_add, NOT torch.bincount: CUDA bincount
+        # synchronizes internally (device->host max-value inspection), which
+        # invalidates CUDA-graph stream capture (cudaErrorStreamCaptureInvalidated
+        # — located via the generated inductor partition code). scatter_add of
+        # ones is pure device work with identical integer results.
+        counts = torch.zeros(
+            E, dtype=torch.long, device=x_flat.device,
+        ).scatter_add_(0, pair_expert, torch.ones_like(pair_expert))
         offs = counts.cumsum(0).to(torch.int32)            # (E,) cumulative ends
         x_sorted = x_flat[sorted_token]                    # (N*K, D)
         out = self._grouped_ffn(x_sorted, offs)            # (N*K, D)
