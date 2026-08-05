@@ -2316,6 +2316,99 @@ def bench_graphs_b200(step: str = "latest", batches: str = "1,8,32",
     return _bench_graphs_impl(step, batches, new_tokens, hf_repo)
 
 
+@app.function(gpu="H100", **_BENCH_GRAPHS_ARGS)
+def bench_batch_scaling(
+    step: str = "latest",
+    batches: str = "32,64,128,256",
+    new_tokens: int = 64,
+    temperature: float = 1.0,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """Find the tokens/$ peak for GRPO rollouts: aggregate decode tok/s vs
+    batch size on the compiled-latent path (the rollout config — sampled
+    generation, no CUDA graphs; graphs measured x1.1 at b32 and rollouts
+    SAMPLE, which the spec/greedy paths don't serve). temperature=1.0 matches
+    the RL workload (sampling adds softmax+multinomial per step).
+    NOTE: b<=64 rides the bmm dispatch (N*K<=128); b>=128 falls back to the
+    grouped GEMM — the right kernel at that size, but the branch means one
+    extra dynamic-graph specialization (traced once)."""
+    import re
+    import statistics
+    import time
+
+    _use_inductor_cache()
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"GPU: {torch.cuda.get_device_name(0)} | pulling {name}...",
+          flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+    model.optimize_for_inference()  # dynamic compile; no graphs needed here
+
+    prompt = ([tok.bos_token_id]
+              + tok.encode("Problem: A shop sells pencils at 12p each and "
+                           "pens at 30p each. Tom buys 4 pencils and 2 pens.",
+                           add_special_tokens=False))
+
+    results = {}
+    for bs in (int(b) for b in batches.split(",")):
+        inp = torch.tensor([prompt] * bs, device=device)
+        vals = []
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            model.generate(inp, max_new_tokens=4, temperature=temperature)
+            for _ in range(3):
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                model.generate(inp, max_new_tokens=1, temperature=temperature)
+                torch.cuda.synchronize()
+                t_pref = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                model.generate(inp, max_new_tokens=new_tokens,
+                               temperature=temperature)
+                torch.cuda.synchronize()
+                t_full = time.perf_counter() - t0
+                vals.append(
+                    bs * (new_tokens - 1) / max(t_full - t_pref, 1e-6))
+        med = statistics.median(vals)
+        results[bs] = {"agg_tok_per_sec": med,
+                       "vram_gb": torch.cuda.max_memory_allocated() / 1e9}
+        print(f"  b{bs:>4}: {med:8.1f} tok/s | peak VRAM "
+              f"{results[bs]['vram_gb']:.1f} GB", flush=True)
+    return results
+
+
+@app.local_entrypoint()
+def run_bench_batch_scaling(step: str = "latest", batches: str = "32,64,128,256"):
+    """GRPO rollout batch-scaling probe on H100 (blocking)."""
+    print(f"Batch-scaling probe on H100 (batches={batches}, sampled)...")
+    res = bench_batch_scaling.remote(step=step, batches=batches)
+    print("\n=== ROLLOUT BATCH SCALING — H100, sampled, compiled-latent ===")
+    for bs, r in res.items():
+        print(f"  b{bs}: {r['agg_tok_per_sec']:.1f} tok/s "
+              f"(VRAM {r['vram_gb']:.1f} GB)")
+
+
 @app.local_entrypoint()
 def run_bench_graphs(
     gpu: str = "a100", step: str = "latest", batches: str = "1,8,32",
