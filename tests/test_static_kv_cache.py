@@ -73,6 +73,32 @@ def test_static_cache_rejects_attention_mask():
         pass
 
 
+def test_bmm_dispatch_matches_grouped():
+    """The capture-safe small-N bmm dispatch must match _dispatch_grouped
+    (same experts, same gates) — it replaces it at inference decode because
+    torch._grouped_mm is illegal under CUDA-graph stream capture."""
+    torch.manual_seed(0)
+    from test_model import tiny_config as _tc
+    from osrt.model import MoELayer
+    moe = MoELayer(_tc(moe_grouped_gemm=True)).eval()
+    x_flat = torch.randn(4, moe.dim)
+    logits = torch.randn(4, moe.num_routed)
+    top_probs, top_idx = torch.softmax(logits, -1).topk(moe.top_k, dim=-1)
+    top_probs = top_probs / top_probs.sum(-1, keepdim=True)
+
+    out_bmm, _ = moe._dispatch_bmm(x_flat, top_idx, top_probs)
+    out_grp, _ = moe._dispatch_grouped(x_flat, top_idx, top_probs)
+    assert torch.allclose(out_bmm, out_grp, atol=1e-5, rtol=1e-5)
+
+    # And with prepacked weights (the intended inference configuration).
+    # prepack rounds weights to bf16 — on GPU the grouped path casts to bf16
+    # too (identical), but this CPU fp32 reference didn't, so compare at
+    # bf16-rounding tolerance.
+    moe.prepack_expert_weights()
+    out_packed, _ = moe._dispatch_bmm(x_flat, top_idx, top_probs)
+    assert torch.allclose(out_packed, out_grp, atol=3e-2, rtol=3e-2)
+
+
 def test_static_cache_cursor_device_side():
     cache = StaticKVCache(
         num_layers=2, batch=1, kv_heads=2, head_dim=8, max_len=16,

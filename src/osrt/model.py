@@ -771,6 +771,57 @@ class MoELayer(nn.Module):
         moe_out.index_add_(0, sorted_token, out.to(moe_out.dtype))
         return moe_out, 0
 
+    def _dispatch_bmm(
+        self, x_flat: Tensor, top_idx: Tensor, top_probs: Tensor,
+    ) -> tuple[Tensor, int]:
+        """Small-N decode dispatch via gather + bmm. CUDA-graph capture-safe.
+
+        torch._grouped_mm performs CUDA operations that are not permitted
+        during stream capture (cudaErrorStreamCaptureUnsupported — located via
+        the inductor partition traceback), so the decode step cannot use
+        _dispatch_grouped under CUDA graphs. At decode N (=B) is tiny, so
+        instead: index_select each (token, rank) pair's expert weights from
+        the prepacked (E, in, out) stacks and run three bmms. No sort, no
+        counts, no offsets — every op is capture-safe, and for N*K this small
+        it also skips _dispatch_grouped's argsort/scatter entirely.
+
+        Same experts, same weights; bmm-vs-grouped bf16 accumulation order may
+        differ (gate with logits/ppl like every other inference change).
+        Requires prepack_expert_weights() (falls back to stacking on the fly
+        if the packs are absent — correct, just slower).
+        """
+        N, D = x_flat.shape
+        K = self.top_k
+        pair_expert = top_idx.reshape(-1)                    # (N*K,)
+        w_gate = getattr(self, "_packed_w_gate", None)
+        if w_gate is None:
+            cdt = x_flat.dtype
+            w_gate = torch.stack(
+                [e.w_gate.weight.t() for e in self.experts]).to(cdt)
+            w_up = torch.stack(
+                [e.w_up.weight.t() for e in self.experts]).to(cdt)
+            w_down = torch.stack(
+                [e.w_down.weight.t() for e in self.experts]).to(cdt)
+        else:
+            w_up, w_down = self._packed_w_up, self._packed_w_down
+        cdt = w_gate.dtype
+
+        # (N*K, 1, D) @ (N*K, D, H) -> (N*K, 1, H)
+        x_pairs = (
+            x_flat.to(cdt).unsqueeze(1).expand(N, K, D).reshape(N * K, 1, D)
+        )
+        gate = torch.bmm(x_pairs, w_gate.index_select(0, pair_expert))
+        up = torch.bmm(x_pairs, w_up.index_select(0, pair_expert))
+        e0 = self.experts[0]
+        h = _glu_combine(
+            gate, up, clamp=e0.clamp, situ=e0.situ,
+            b_gate=e0.situ_beta_gate, b_up=e0.situ_beta_up,
+        )
+        out = torch.bmm(h.to(cdt), w_down.index_select(0, pair_expert))
+        # Gate and combine the K experts per token.
+        out = out.view(N, K, D) * top_probs.unsqueeze(-1).to(out.dtype)
+        return out.sum(dim=1).to(x_flat.dtype), 0
+
     def forward(
         self,
         x: Tensor,
@@ -1012,9 +1063,17 @@ class MoELayer(nn.Module):
         #            data-dependent .nonzero() is the only torch.compile break.
         #   grouped: sort pairs by expert + one grouped GEMM, dropless.
         if self.grouped_gemm:
-            moe_out, total_dropped = self._dispatch_grouped(
-                x_flat, top_idx, top_probs,
-            )
+            if not self.training and N * self.top_k <= 128:
+                # Inference small-N (decode) path: capture-safe gather+bmm —
+                # torch._grouped_mm is illegal under CUDA-graph capture, and
+                # at N*K this small bmm also skips the argsort/scatter setup.
+                moe_out, total_dropped = self._dispatch_bmm(
+                    x_flat, top_idx, top_probs,
+                )
+            else:
+                moe_out, total_dropped = self._dispatch_grouped(
+                    x_flat, top_idx, top_probs,
+                )
         else:
             moe_out, total_dropped = self._dispatch_loop(
                 x_flat, top_idx, top_probs, capacity,
@@ -2179,6 +2238,10 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         # the decode path — self.forward() alone bypasses model.compile()'s
         # __call__ wrapping (dynamo compiles __call__, not a direct .forward()).
         self._compiled_forward = None
+        # Separate CUDA-graph decode callable (reduce-overhead, static shapes),
+        # used by _fwd ONLY for StaticKVCache steps so prefill's grouped GEMM
+        # (capture-unsupported) never enters stream capture.
+        self._compiled_decode = None
         # MTP telemetry (when mtp_heads > 0 + training + labels). last_mtp_loss
         # is the detached weighted sum added to the training loss; None when MTP
         # is off or the head contributed nothing. last_mtp_losses holds the
@@ -2248,41 +2311,44 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             import torch._dynamo as _dynamo
             _dynamo.config.capture_scalar_outputs = True
             _dynamo.config.capture_dynamic_output_shape_ops = True
+            # dynamic=True: the latent cache length grows every token; without
+            # it dynamo re-specializes (an expensive unbacked-symint compile)
+            # per cache length — measured as a >30 min compile stall on A100.
+            # One symbolic graph instead. Handles prefill + latent decode.
+            self._compiled_forward = torch.compile(
+                self.forward, fullgraph=True, dynamic=True,
+            )
             if reduce_overhead:
-                # CUDA-graph replay of the decode step. Requires the
-                # StaticKVCache decode path (generate(cache_impl="static")):
-                # fixed shapes/addresses (mark_static_address on the buffers),
-                # device-side cursor. dynamic is intentionally OFF — cudagraphs
-                # skip symbolic-shape graphs, so we take per-shape
-                # specialization instead (the S=1 decode step is one shape;
-                # prefill re-specializes per prompt length — bucket prompts
-                # for production).
-                # capture_scalar_outputs is intentionally OFF here: it traces
-                # .item() by inserting device->host syncs inside the compiled
-                # region, and a sync during stream capture is precisely
-                # cudaErrorStreamCaptureInvalidated (the first attempt's
-                # failure). The static decode path should not need it (the
-                # grouped-GEMM offsets stay device tensors); if fullgraph
-                # breaks, the error names the .item() to excise (the
-                # inference-only-router cleanup list).
-                _dynamo.config.capture_scalar_outputs = False
-                self._compiled_forward = torch.compile(
+                # SEPARATE CUDA-graph decode callable, used by _fwd only for
+                # StaticKVCache steps (generate(cache_impl="static")). Why
+                # separate: prefill contains torch._grouped_mm, whose internal
+                # CUDA calls are illegal during stream capture
+                # (cudaErrorStreamCaptureUnsupported) — the decode step avoids
+                # it via _dispatch_bmm, but a shared reduce-overhead callable
+                # would try to capture the prefill graph too and die there.
+                # Requirements already in place: static shapes/addresses
+                # (StaticKVCache + mark_static_address), device-side cursor,
+                # and a decode path with no .item()/sync ops (telemetry off,
+                # bmm dispatch) — capture_scalar_outputs=True is harmless here
+                # because the flag only matters where scalar reads exist.
+                self._compiled_decode = torch.compile(
                     self.forward, fullgraph=True, mode="reduce-overhead",
-                )
-            else:
-                # dynamic=True: the latent cache length grows every token;
-                # without it dynamo re-specializes (an expensive
-                # unbacked-symint compile) per cache length — measured as a
-                # >30 min compile stall on A100. One symbolic graph instead.
-                self._compiled_forward = torch.compile(
-                    self.forward, fullgraph=True, dynamic=True,
                 )
         return self
 
     def _fwd(self, *args, **kwargs) -> CausalLMOutputWithPast:
         """Dispatch to the compiled forward when inference-optimized, else the
         eager forward. Decode paths (generate/speculative) call this so
-        torch.compile is actually exercised — see optimize_for_inference."""
+        torch.compile is actually exercised — see optimize_for_inference.
+
+        StaticKVCache steps route to the separate CUDA-graph decode callable
+        when present (reduce_overhead=True): prefill's grouped GEMM is illegal
+        under stream capture, so the two must not share a compiled callable."""
+        if (
+            self._compiled_decode is not None
+            and isinstance(kwargs.get("past_key_values"), StaticKVCache)
+        ):
+            return self._compiled_decode(*args, **kwargs)
         if self._compiled_forward is not None:
             return self._compiled_forward(*args, **kwargs)
         return self.forward(*args, **kwargs)
