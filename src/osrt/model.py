@@ -1202,6 +1202,17 @@ class StaticKVCache:
         self.cursor = torch.zeros(1, dtype=torch.long, device=device)
         # Fixed position index row for the validity mask (kpos <= cursor-1).
         self.kpos = torch.arange(max_len, device=device)
+        # CUDA-graph contract: these tensors keep one address for the model's
+        # lifetime. mark_static_address tells compile's cudagraph wrapper NOT
+        # to copy them into its private static storage — so the in-graph
+        # index_copy_ mutations land in OUR buffers and persist across replays
+        # (the HF StaticCache pattern). No-op without reduce-overhead.
+        try:
+            from torch._dynamo import mark_static_address
+            for t in (*self.k, *self.v, self.cursor, self.kpos):
+                mark_static_address(t)
+        except ImportError:  # older torch — static cache still works uncaptured
+            pass
 
     def advance(self) -> None:
         """Advance past the token just written. Call once per decode forward."""
@@ -2152,7 +2163,11 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         """Delegate to OSRTModel.set_moe_telemetry — see docstring there."""
         self.model.set_moe_telemetry(enabled)
 
-    def optimize_for_inference(self, compile_model: bool = True) -> "OSRTForCausalLM":
+    def optimize_for_inference(
+        self,
+        compile_model: bool = True,
+        reduce_overhead: bool = False,
+    ) -> "OSRTForCausalLM":
         """Prepare this model for fast generation/eval. Returns self.
 
         Three steps (measured on midtrain3_final, A100, real generate()):
@@ -2206,13 +2221,35 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             import torch._dynamo as _dynamo
             _dynamo.config.capture_scalar_outputs = True
             _dynamo.config.capture_dynamic_output_shape_ops = True
-            # dynamic=True: decode's KV-cache length grows every token; without
-            # it dynamo re-specializes (an expensive unbacked-symint compile)
-            # per cache length — measured as a >30 min compile stall on A100.
-            # One symbolic-shape graph covers all lengths instead.
-            self._compiled_forward = torch.compile(
-                self.forward, fullgraph=True, dynamic=True,
-            )
+            if reduce_overhead:
+                # CUDA-graph replay of the decode step. Requires the
+                # StaticKVCache decode path (generate(cache_impl="static")):
+                # fixed shapes/addresses (mark_static_address on the buffers),
+                # device-side cursor. dynamic is intentionally OFF — cudagraphs
+                # skip symbolic-shape graphs, so we take per-shape
+                # specialization instead (the S=1 decode step is one shape;
+                # prefill re-specializes per prompt length — bucket prompts
+                # for production).
+                # capture_scalar_outputs is intentionally OFF here: it traces
+                # .item() by inserting device->host syncs inside the compiled
+                # region, and a sync during stream capture is precisely
+                # cudaErrorStreamCaptureInvalidated (the first attempt's
+                # failure). The static decode path should not need it (the
+                # grouped-GEMM offsets stay device tensors); if fullgraph
+                # breaks, the error names the .item() to excise (the
+                # inference-only-router cleanup list).
+                _dynamo.config.capture_scalar_outputs = False
+                self._compiled_forward = torch.compile(
+                    self.forward, fullgraph=True, mode="reduce-overhead",
+                )
+            else:
+                # dynamic=True: the latent cache length grows every token;
+                # without it dynamo re-specializes (an expensive
+                # unbacked-symint compile) per cache length — measured as a
+                # >30 min compile stall on A100. One symbolic graph instead.
+                self._compiled_forward = torch.compile(
+                    self.forward, fullgraph=True, dynamic=True,
+                )
         return self
 
     def _fwd(self, *args, **kwargs) -> CausalLMOutputWithPast:

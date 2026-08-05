@@ -1934,6 +1934,184 @@ def ab_prepack(
     return {"ab": ab, "profiles": profs, "ctx_sweep": sweep}
 
 
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=7200,
+)
+def ab_static(
+    step: str = "latest",
+    reps: int = 5,
+    decode_steps: int = 64,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """Paired latent-vs-static cache A/B on ONE GPU, compiled path.
+
+    (1) Alternating cache_impl timings at b1 (medians) — does the static cache
+        pay before CUDA graphs?
+    (2) Quality gate: greedy 64-token generations latent vs static (first
+        divergence per prompt) + max|Δlogit| of the FIRST decode step against
+        the same prefill (teacher-anchored, no feedback amplification). Per
+        reviewer: gate on logit error/ppl, not token identity (bf16 GEMV vs
+        GEMM accumulation differs by design).
+    """
+    import re
+    import statistics
+    import time
+
+    _use_inductor_cache()
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+    model.optimize_for_inference()
+
+    prompt = ([tok.bos_token_id]
+              + tok.encode("The Industrial Revolution was a period of major",
+                           add_special_tokens=False))
+    inp = torch.tensor([prompt], device=device)
+
+    def _timed(impl: str) -> float:
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model.generate(inp, max_new_tokens=1, temperature=0.0,
+                           cache_impl=impl)
+            torch.cuda.synchronize()
+            t_pref = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            model.generate(inp, max_new_tokens=decode_steps, temperature=0.0,
+                           cache_impl=impl)
+            torch.cuda.synchronize()
+            t_full = time.perf_counter() - t0
+        return (decode_steps - 1) / max(t_full - t_pref, 1e-6)
+
+    # settle/trace both variants (first static call traces its new graph)
+    _timed("latent")
+    _timed("static")
+    lat, sta = [], []
+    for _ in range(reps):
+        lat.append(_timed("latent"))
+        sta.append(_timed("static"))
+    print(f"A/B b1: latent median {statistics.median(lat):.1f} "
+          f"{[f'{t:.1f}' for t in lat]} | static median "
+          f"{statistics.median(sta):.1f} {[f'{t:.1f}' for t in sta]}",
+          flush=True)
+
+    # Quality gate (2a): first-decode-step logit diff against the same prefill.
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        pre = model._fwd(inp, use_cache=True)
+        latents = pre.past_key_values
+        tok0 = pre.logits[:, -1, :cfg.real_vocab_size].argmax(-1, keepdim=True)
+        # latent path step
+        o_lat = model._fwd(tok0, past_key_values=latents, use_cache=True)
+        l_lat = o_lat.logits[:, -1, :cfg.real_vocab_size].float()
+        # static path step (build cache from the same latents)
+        from osrt.model import StaticKVCache
+        B, L = inp.shape
+        scache = StaticKVCache(
+            num_layers=len(latents), batch=B, kv_heads=cfg.num_kv_heads,
+            head_dim=cfg.head_dim, max_len=L + 8, device=device,
+        )
+        cos = model.model.rope_cos[:, :L + 8].to(latents[0].dtype)
+        sin = model.model.rope_sin[:, :L + 8].to(latents[0].dtype)
+        for idx, c_kv in enumerate(latents):
+            blk = model.model.blocks[idx % cfg.num_blocks]
+            blk.write_latent_to_static(
+                c_kv, cos, sin, scache.k[idx], scache.v[idx])
+        scache.cursor.fill_(L)
+        o_sta = model._fwd(tok0, past_key_values=scache, use_cache=False)
+        l_sta = o_sta.logits[:, -1, :cfg.real_vocab_size].float()
+    max_abs = (l_lat - l_sta).abs().max().item()
+    top1 = bool((l_lat.argmax(-1) == l_sta.argmax(-1)).all().item())
+
+    # Quality gate (2b): greedy first-divergence over the sample prompts.
+    divs = {}
+    for p in _SAMPLE_PROMPTS:
+        ids = torch.tensor(
+            [[tok.bos_token_id] + tok.encode(p, add_special_tokens=False)],
+            device=device)
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            a = model.generate(ids, max_new_tokens=48, temperature=0.0,
+                               cache_impl="latent")[0, ids.shape[1]:].tolist()
+            b = model.generate(ids, max_new_tokens=48, temperature=0.0,
+                               cache_impl="static")[0, ids.shape[1]:].tolist()
+        divs[p[:32]] = next(
+            (i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+    print(f"step-logit max|Δ|={max_abs:.4g} top1_match={top1} "
+          f"greedy first-div: {divs}", flush=True)
+
+    # (3) CUDA-graph arm: recompile under reduce-overhead (per-shape
+    # specialization; the static decode step is one fixed shape) and time the
+    # captured static decode. Failure here is a finding, not a crash.
+    ro = []
+    ro_err = None
+    try:
+        import torch._dynamo as _dynamo
+        _dynamo.reset()
+        model.optimize_for_inference(reduce_overhead=True)
+        _timed("static")  # trace + capture
+        _timed("static")  # settle replay
+        for _ in range(reps):
+            ro.append(_timed("static"))
+        print(f"reduce-overhead static: median {statistics.median(ro):.1f} "
+              f"{[f'{t:.1f}' for t in ro]}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        ro_err = f"{type(e).__name__}: {e}"
+        print(f"reduce-overhead static FAILED: {ro_err}", flush=True)
+
+    return {
+        "latent_median_tps": statistics.median(lat), "latent_all": lat,
+        "static_median_tps": statistics.median(sta), "static_all": sta,
+        "cudagraph_median_tps": statistics.median(ro) if ro else None,
+        "cudagraph_all": ro, "cudagraph_error": ro_err,
+        "step_logit_max_abs": max_abs, "step_top1_match": top1,
+        "greedy_first_divergence": divs,
+    }
+
+
+@app.local_entrypoint()
+def run_ab_static(step: str = "latest", reps: int = 5):
+    """Paired latent-vs-static cache A/B + quality gate (blocking)."""
+    print(f"Static-cache A/B for step={step} on one A100...")
+    res = ab_static.remote(step=step, reps=reps)
+    print("\n=== STATIC CACHE PAIRED A/B (same GPU, b1, medians) ===")
+    print(f"  latent: {res['latent_median_tps']:.1f} tok/s  {res['latent_all']}")
+    print(f"  static: {res['static_median_tps']:.1f} tok/s  {res['static_all']}")
+    if res.get("cudagraph_median_tps"):
+        print(f"  static+cudagraphs: {res['cudagraph_median_tps']:.1f} tok/s "
+              f"{res['cudagraph_all']}")
+    else:
+        print(f"  static+cudagraphs FAILED: {res.get('cudagraph_error')}")
+    print(f"  first-step logit max|Δ|: {res['step_logit_max_abs']:.4g} "
+          f"(top1 match: {res['step_top1_match']})")
+    print(f"  greedy first-divergence: {res['greedy_first_divergence']}")
+
+
 @app.local_entrypoint()
 def run_ab_prepack(step: str = "latest", reps: int = 5):
     """Paired prepack A/B + restack-kernel check + ctx sweep (blocking)."""
