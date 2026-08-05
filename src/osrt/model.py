@@ -829,14 +829,20 @@ class MoELayer(nn.Module):
         #                     loss consume an affinity-normalised probability
         #                     view (affinity / affinity.sum) so every downstream
         #                     entropy/fraction/z-loss stays well-defined.
+        # Inference fast path (eval + telemetry off): only the deployed
+        # routing decision is needed — balanced affinity -> ONE top-k ->
+        # renormalised gates -> dispatch. The clean/prebias top-k views and
+        # the balance/Z/seq losses exist for training gradient + telemetry;
+        # at eval probs == clean_probs exactly (Gumbel is training-only), so
+        # they are duplicates. Skipping them removes 2 top-ks + 3 fp32
+        # reductions per MoE call (x18/token at decode) and shrinks the
+        # CUDA-graph capture surface.
+        compute_aux = self.training or self.telemetry_enabled
         affinity_mode = self.router_affinity
         if affinity_mode == "sqrt_softplus":
             # Non-negative per-expert affinity. softplus keeps it smooth and
             # strictly positive; sqrt compresses the tail (DeepSeek-V4).
             affinity = torch.sqrt(F.softplus(router_logits))  # (N, E)
-            raw_router_probs = affinity / affinity.sum(
-                dim=-1, keepdim=True,
-            ).clamp_min(1e-9)
             if self.bias_enabled:
                 loop_bias = self.router_balance_bias[loop_idx].view(1, -1)
                 clean_affinity = affinity + loop_bias
@@ -846,9 +852,6 @@ class MoELayer(nn.Module):
             # clamp at 0 so the normalised view and the gating weights stay
             # non-negative (the bias still steers top-k selection via ordering).
             clean_affinity = clean_affinity.clamp_min(0.0)
-            clean_probs = clean_affinity / clean_affinity.sum(
-                dim=-1, keepdim=True,
-            ).clamp_min(1e-9)
 
             # Training-time noisy exploration: Gumbel is added to the balanced
             # AFFINITY (not logits) so cold experts still get explored under the
@@ -866,18 +869,19 @@ class MoELayer(nn.Module):
             probs = selection_affinity / selection_affinity.sum(
                 dim=-1, keepdim=True,
             ).clamp_min(1e-9)
+            if compute_aux:
+                raw_router_probs = affinity / affinity.sum(
+                    dim=-1, keepdim=True,
+                ).clamp_min(1e-9)
+                clean_probs = clean_affinity / clean_affinity.sum(
+                    dim=-1, keepdim=True,
+                ).clamp_min(1e-9)
         else:
-            raw_router_probs = F.softmax(router_logits, dim=-1)
             if self.bias_enabled:
                 loop_bias = self.router_balance_bias[loop_idx].view(1, -1)
                 clean_logits = router_logits + loop_bias
             else:
                 clean_logits = router_logits
-
-            # "Clean" means deterministic deployed routing: bias applied, no
-            # Gumbel. Raw un-biased logits are diagnostic only once the
-            # controller is enabled.
-            clean_probs = F.softmax(clean_logits, dim=-1)  # (N, E)
 
             # Training-time noisy top-k exploration. This prevents experts that
             # lose the first few router updates from going permanently cold. The
@@ -892,15 +896,22 @@ class MoELayer(nn.Module):
 
             # Softmax probabilities
             probs = F.softmax(selection_logits, dim=-1)  # (N, E)
+            if compute_aux:
+                raw_router_probs = F.softmax(router_logits, dim=-1)
+                # "Clean" means deterministic deployed routing: bias applied,
+                # no Gumbel. Raw un-biased logits are diagnostic only once the
+                # controller is enabled.
+                clean_probs = F.softmax(clean_logits, dim=-1)  # (N, E)
 
         # Top-k selection (raw probs, before renormalisation)
         raw_top_probs, top_idx = probs.topk(self.top_k, dim=-1)  # (N, K)
-        clean_raw_top_probs, clean_top_idx = clean_probs.topk(
-            self.top_k, dim=-1,
-        )
-        prebias_raw_top_probs, raw_balance_top_idx = raw_router_probs.topk(
-            self.top_k, dim=-1,
-        )
+        if compute_aux:
+            clean_raw_top_probs, clean_top_idx = clean_probs.topk(
+                self.top_k, dim=-1,
+            )
+            prebias_raw_top_probs, raw_balance_top_idx = raw_router_probs.topk(
+                self.top_k, dim=-1,
+            )
         if self.training and self.balance_accum_enabled:
             self._accumulate_balance_counts(clean_top_idx, loop_idx)
 
@@ -925,59 +936,68 @@ class MoELayer(nn.Module):
         else:
             capacity = N * self.top_k  # effectively unlimited (one pair per slot)
 
-        # Switch balance loss extended to top-k. Compute it on the RAW router
-        # logits, not the noisy dispatch path or the bias-corrected clean path.
-        # Gumbel is exploration and bias is an external controller; the aux
-        # gradient must still push the learned router itself away from collapse.
-        # Dispatch below still uses bias+Gumbel top_idx/probs.
-        #   f_i = fraction of token-expert pairs routed to expert i.
-        #         Count each top-k membership, divide by N*K so sum(f)=1.
-        #   p_i = mean softmax prob for expert i (sums to 1).
-        #   loss = E * sum(f_i * p_i). Minimum at uniform = 1.0.
-        raw_balance_one_hot = F.one_hot(
-            raw_balance_top_idx, num_classes=self.num_routed,
-        )
-        # Compute balance loss in fp32. Under bf16 autocast, f·p can
-        # underflow late in training when both are near 1/E (= 0.125 for
-        # E=8); fp32 keeps the product and sum precise so the gradient
-        # signal survives into long runs.
-        raw_balance_f = (
-            raw_balance_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
-        )
-        raw_balance_p = raw_router_probs.float().mean(dim=0)
-        self.balance_loss = self.num_routed * (
-            raw_balance_f * raw_balance_p
-        ).sum()
+        if compute_aux:
+            # Switch balance loss extended to top-k. Compute it on the RAW
+            # router logits, not the noisy dispatch path or the bias-corrected
+            # clean path. Gumbel is exploration and bias is an external
+            # controller; the aux gradient must still push the learned router
+            # itself away from collapse. Dispatch below still uses bias+Gumbel
+            # top_idx/probs.
+            #   f_i = fraction of token-expert pairs routed to expert i.
+            #         Count each top-k membership, divide by N*K so sum(f)=1.
+            #   p_i = mean softmax prob for expert i (sums to 1).
+            #   loss = E * sum(f_i * p_i). Minimum at uniform = 1.0.
+            raw_balance_one_hot = F.one_hot(
+                raw_balance_top_idx, num_classes=self.num_routed,
+            )
+            # Compute balance loss in fp32. Under bf16 autocast, f·p can
+            # underflow late in training when both are near 1/E (= 0.125 for
+            # E=8); fp32 keeps the product and sum precise so the gradient
+            # signal survives into long runs.
+            raw_balance_f = (
+                raw_balance_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
+            )
+            raw_balance_p = raw_router_probs.float().mean(dim=0)
+            self.balance_loss = self.num_routed * (
+                raw_balance_f * raw_balance_p
+            ).sum()
 
-        # Router Z-loss (ST-MoE §3.2): mean_token (logsumexp(logits))^2.
-        # Bounds the absolute magnitude of router logits so bf16/fp8
-        # softmax exponentials don't overflow, and keeps early softmax
-        # distributions flatter so cold experts retain non-zero gradient
-        # through LR warmup. Computed on raw router logits (pre-bias,
-        # pre-Gumbel) so the penalty acts on the learned router itself.
-        # fp32 for the same precision reasons as balance_loss above.
-        z = torch.logsumexp(router_logits.float(), dim=-1)  # (N,)
-        self.z_loss = (z ** 2).mean()
+            # Router Z-loss (ST-MoE §3.2): mean_token (logsumexp(logits))^2.
+            # Bounds the absolute magnitude of router logits so bf16/fp8
+            # softmax exponentials don't overflow, and keeps early softmax
+            # distributions flatter so cold experts retain non-zero gradient
+            # through LR warmup. Computed on raw router logits (pre-bias,
+            # pre-Gumbel) so the penalty acts on the learned router itself.
+            # fp32 for the same precision reasons as balance_loss above.
+            z = torch.logsumexp(router_logits.float(), dim=-1)  # (N,)
+            self.z_loss = (z ** 2).mean()
 
-        # Sequence-wise balance loss (DeepSeek-V3 §5.2). Penalises
-        # imbalance INSIDE each individual sequence, complementing the
-        # global balance_loss above. Useful at long context (Phase 3
-        # seq_len=8192) where one document can dominate one micro-batch
-        # even when the global batch averages to balanced. Computed
-        # under no_grad would defeat the purpose — we want the per-seq
-        # gradient to push the router away from intra-sequence collapse.
-        # Uses the same raw (un-noised) routing decisions as
-        # balance_loss for a coherent gradient signal.
-        seq_one_hot = raw_balance_one_hot.float().view(
-            B, S, self.top_k, self.num_routed,
-        )
-        f_seq = seq_one_hot.sum(dim=(1, 2)) / (S * self.top_k)  # (B, E)
-        p_seq = raw_router_probs.float().view(B, S, self.num_routed).mean(
-            dim=1,
-        )                                                       # (B, E)
-        self.seq_balance_loss = self.num_routed * (
-            f_seq * p_seq
-        ).sum(dim=-1).mean()
+            # Sequence-wise balance loss (DeepSeek-V3 §5.2). Penalises
+            # imbalance INSIDE each individual sequence, complementing the
+            # global balance_loss above. Useful at long context (Phase 3
+            # seq_len=8192) where one document can dominate one micro-batch
+            # even when the global batch averages to balanced. Computed
+            # under no_grad would defeat the purpose — we want the per-seq
+            # gradient to push the router away from intra-sequence collapse.
+            # Uses the same raw (un-noised) routing decisions as
+            # balance_loss for a coherent gradient signal.
+            seq_one_hot = raw_balance_one_hot.float().view(
+                B, S, self.top_k, self.num_routed,
+            )
+            f_seq = seq_one_hot.sum(dim=(1, 2)) / (S * self.top_k)  # (B, E)
+            p_seq = raw_router_probs.float().view(B, S, self.num_routed).mean(
+                dim=1,
+            )                                                       # (B, E)
+            self.seq_balance_loss = self.num_routed * (
+                f_seq * p_seq
+            ).sum(dim=-1).mean()
+        else:
+            # Inference fast path: consumers null-check these (OSRTModel's
+            # accumulation + the trainer), so None cleanly signals "not
+            # computed this forward" — and drops any stale training tensors.
+            self.balance_loss = None
+            self.z_loss = None
+            self.seq_balance_loss = None
 
         # Dispatch the gated top-k assignment to the routed experts. Two
         # numerically-equivalent (in the no-drop regime) implementations (B4):
