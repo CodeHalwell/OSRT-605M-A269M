@@ -28,7 +28,7 @@ Default config (measured on the actual model):
 import math
 import random
 from contextlib import contextmanager
-from typing import cast
+from typing import NamedTuple, cast
 
 import torch
 import torch.nn as nn
@@ -1154,6 +1154,76 @@ def _checkpoint_block(block_fn, *args, context_fn):
     )
 
 
+class StaticKVCache:
+    """Preallocated post-RoPE/post-norm K/V decode cache ("speed mode").
+
+    The default (latent) cache stores the un-rotated compressed latent and
+    grows by torch.cat, recomputing v_from_k + K-norm + RoPE over the ENTIRE
+    history every decode step. This cache instead stores the finished K and V
+    per effective layer in fixed (B, kv_heads, max_len, head_dim) buffers with
+    a DEVICE-side cursor — no cat, no historical recompute, and (crucially)
+    static tensor shapes/addresses: the prerequisite for CUDA-graph capture.
+
+    Cost: 2x the latent cache's memory (K and V vs one latent), ~150 MB at
+    B=1/ctx-4096 on the 605M preset. Historical K/V are position-frozen, so
+    caching them is mathematically exact; bf16 GEMV-vs-GEMM accumulation order
+    on the new token's v_from_k differs from the latent path -> gate with
+    ppl/logit error, not token identity.
+
+    Decode-only (S=1 steps). Prefill runs the latent path once, then
+    RecursiveBlock.write_latent_to_static converts it into these buffers.
+    The cursor advances ONCE per model forward (advance()), not per layer.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        batch: int,
+        kv_heads: int,
+        head_dim: int,
+        max_len: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self.max_len = max_len
+        self.k = [
+            torch.zeros(batch, kv_heads, max_len, head_dim,
+                        device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ]
+        self.v = [
+            torch.zeros(batch, kv_heads, max_len, head_dim,
+                        device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ]
+        # Number of VALID positions [0, cursor). Device-side: decode indexing
+        # (index_copy_/index_select/mask compare) consumes it without a host
+        # sync, keeping the step CUDA-graph capturable.
+        self.cursor = torch.zeros(1, dtype=torch.long, device=device)
+        # Fixed position index row for the validity mask (kpos <= cursor-1).
+        self.kpos = torch.arange(max_len, device=device)
+
+    def advance(self) -> None:
+        """Advance past the token just written. Call once per decode forward."""
+        self.cursor += 1
+
+    def layer(self, idx: int) -> "_StaticLayerView":
+        return _StaticLayerView(
+            k=self.k[idx], v=self.v[idx],
+            cursor=self.cursor, kpos=self.kpos, max_len=self.max_len,
+        )
+
+
+class _StaticLayerView(NamedTuple):
+    """One effective layer's slice of a StaticKVCache, as _attention sees it."""
+
+    k: Tensor
+    v: Tensor
+    cursor: Tensor
+    kpos: Tensor
+    max_len: int
+
+
 class RecursiveBlock(nn.Module):
     """Physical transformer block: attention + MoE (no dense FFN).
 
@@ -1261,6 +1331,11 @@ class RecursiveBlock(nn.Module):
         Returns (out_proj(attn) + adapter, present_latent). The caller adds it
         into the residual (standard) or mixes it via mHC.
         """
+        if isinstance(past_key_value, _StaticLayerView):
+            return self._attention_static(
+                x_in, adapter_a, adapter_b, adapter_scale,
+                rope_cos, rope_sin, past_key_value,
+            )
         B, S, D = x_in.shape
         adapter_out = adapter_scale * (x_in @ adapter_a @ adapter_b)
 
@@ -1357,6 +1432,80 @@ class RecursiveBlock(nn.Module):
             )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
         return self.out_proj(attn_out) + adapter_out, present_kv
+
+    def _attention_static(
+        self,
+        x_in: Tensor,
+        adapter_a: Tensor,
+        adapter_b: Tensor,
+        adapter_scale: float,
+        rope_cos: Tensor,
+        rope_sin: Tensor,
+        view: _StaticLayerView,
+    ) -> tuple[Tensor, None]:
+        """Single-token decode against a StaticKVCache ("speed mode").
+
+        Computes K/V for the NEW token only (the cached history is finished
+        post-norm/post-RoPE K/V — position-frozen, never recomputed), writes
+        them at the device-side cursor, and runs SDPA over the fixed-length
+        buffer with a validity mask. Static shapes + no host sync: the form
+        CUDA-graph capture requires. Assumes S == 1 (generate's decode steps).
+
+        Math note: per-position values equal the latent path exactly; only the
+        bf16 accumulation order of the new token's v_from_k (GEMV here vs
+        history-wide GEMM there) differs -> gate with ppl/logit error.
+        """
+        B, S, D = x_in.shape
+        adapter_out = adapter_scale * (x_in @ adapter_a @ adapter_b)
+
+        h = self.norm_attn(x_in)
+        q = self.q_proj(h).view(B, S, self.heads, self.head_dim)
+        c_new = self.kv_down(h)                              # (B, 1, kv_dim)
+
+        pos = view.cursor                                    # (1,) device-side
+        cos = rope_cos.index_select(1, pos)                  # (1, 1, 1, hd)
+        sin = rope_sin.index_select(1, pos)
+        q = apply_rope(self.norm_q(q), cos, sin)
+        k_new = apply_rope(
+            self.norm_k(c_new.view(B, S, self.kv_heads, self.head_dim)),
+            cos, sin,
+        )
+        v_new = self.v_from_k(c_new).view(B, S, self.kv_heads, self.head_dim)
+
+        # Write the finished K/V at the cursor (in-place, fixed addresses).
+        view.k.index_copy_(2, pos, k_new.transpose(1, 2).to(view.k.dtype))
+        view.v.index_copy_(2, pos, v_new.transpose(1, 2).to(view.v.dtype))
+
+        # Validity mask over the whole buffer: keep [0, cursor] (history + the
+        # token just written). Device-side compare — no Python :cursor slice.
+        mask = (view.kpos <= pos).view(1, 1, 1, view.max_len)
+        attn_out = F.scaled_dot_product_attention(
+            q.transpose(1, 2).to(view.k.dtype), view.k, view.v,
+            attn_mask=mask, enable_gqa=self.group_size > 1,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, S, D).to(x_in.dtype)
+        return self.out_proj(attn_out) + adapter_out, None
+
+    def write_latent_to_static(
+        self,
+        c_kv: Tensor,
+        rope_cos: Tensor,
+        rope_sin: Tensor,
+        k_buf: Tensor,
+        v_buf: Tensor,
+    ) -> None:
+        """One-time prefill conversion: latent cache -> finished K/V buffers.
+
+        Applies exactly the latent path's K derivation (norm_k then RoPE over
+        [0:L]) and V derivation (v_from_k) to the prefill latent, writing the
+        results into a StaticKVCache's per-layer buffers at positions [0, L).
+        """
+        B, L, _ = c_kv.shape
+        k = self.norm_k(c_kv.view(B, L, self.kv_heads, self.head_dim))
+        k = apply_rope(k, rope_cos[:, :L], rope_sin[:, :L])
+        v = self.v_from_k(c_kv).view(B, L, self.kv_heads, self.head_dim)
+        k_buf[:, :, :L] = k.transpose(1, 2).to(k_buf.dtype)
+        v_buf[:, :, :L] = v.transpose(1, 2).to(v_buf.dtype)
 
     def _attention_with_sink(
         self,
@@ -1704,8 +1853,21 @@ class OSRTModel(OSRTPreTrainedModel):
         # recursive_loops in the default path, so this is unchanged there).
         expected_past_layers = self.config.num_blocks * n_loops_to_run
 
+        # Static ("speed mode") cache: fixed post-RoPE K/V buffers + device
+        # cursor. Blocks receive per-layer views; the RoPE span is the whole
+        # fixed buffer (static shape). Latent validation does not apply.
+        static_cache = (
+            past_key_values if isinstance(past_key_values, StaticKVCache)
+            else None
+        )
         past_length = 0
-        if past_key_values is not None:
+        if static_cache is not None:
+            if len(static_cache.k) != expected_past_layers:
+                raise ValueError(
+                    f"StaticKVCache has {len(static_cache.k)} layers, "
+                    f"expected {expected_past_layers}."
+                )
+        elif past_key_values is not None:
             if len(past_key_values) != expected_past_layers:
                 raise ValueError(
                     f"Invalid past_key_values: expected "
@@ -1728,7 +1890,9 @@ class OSRTModel(OSRTPreTrainedModel):
                         f"KV cache length mismatch at layer {idx}."
                     )
 
-        required_seq_len = past_length + S
+        required_seq_len = (
+            static_cache.max_len if static_cache is not None else past_length + S
+        )
         # Pass the FULL-range [0:required_seq_len] cos/sin to each block: K is
         # rebuilt un-rotated from the cached latent and must be rotated over
         # the whole span, while Q is rotated only at its new positions. The
@@ -1807,9 +1971,12 @@ class OSRTModel(OSRTPreTrainedModel):
                 idx = loop * self.config.num_blocks + block_idx
                 adapter_a = self.adapters_a[idx]
                 adapter_b = self.adapters_b[idx]
-                layer_past = (
-                    past_key_values[idx] if past_key_values is not None else None
-                )
+                if static_cache is not None:
+                    layer_past = static_cache.layer(idx)
+                elif past_key_values is not None:
+                    layer_past = past_key_values[idx]
+                else:
+                    layer_past = None
 
                 # Loop-collapse telemetry: snapshot the residual before this
                 # block so we can record how much it changes it. Gated on
@@ -2327,9 +2494,18 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         num_loops: int | None = None,
         speculative: bool = False,
         spec_draft_tokens: int = 4,
+        cache_impl: str = "latent",
         **kwargs,
     ) -> Tensor:
         """Autoregressive generation with KV cache.
+
+        cache_impl="static" switches decode to the StaticKVCache "speed mode":
+        prefill runs the normal latent path once, is converted into fixed
+        post-RoPE K/V buffers, and every decode step then touches only the new
+        token (no cat, no history recompute, static shapes — CUDA-graph-ready).
+        ~2x cache memory; per-position math identical to "latent" (bf16
+        accumulation order differs — gate with ppl, not token identity).
+        Unsupported with attention_mask (left-padded batches) or speculative.
 
         The model's forward already supports past_key_values + use_cache
         (per-effective-layer KV cache, 18 layers for default v5). This
@@ -2415,6 +2591,39 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         )
         past_key_values = cast("PastKV | None", out.past_key_values)
 
+        # cache_impl="static": convert the prefill latents into fixed K/V
+        # buffers once; decode steps then run _attention_static against them.
+        static_cache: StaticKVCache | None = None
+        if cache_impl == "static":
+            if attn is not None:
+                raise ValueError(
+                    "cache_impl='static' does not support attention_mask "
+                    "(left-padded batches)."
+                )
+            latents = cast("list[Tensor]", past_key_values)
+            B, prompt_len = context.shape
+            max_len = min(
+                self.config.max_position_embeddings,
+                prompt_len + max_new_tokens,
+            )
+            mdl = self.model
+            static_cache = StaticKVCache(
+                num_layers=len(latents), batch=B,
+                kv_heads=self.config.num_kv_heads,
+                head_dim=self.config.head_dim,
+                max_len=max_len, device=context.device,
+                dtype=torch.bfloat16 if context.is_cuda else torch.float32,
+            )
+            cos = mdl.rope_cos[:, :max_len].to(latents[0].dtype)
+            sin = mdl.rope_sin[:, :max_len].to(latents[0].dtype)
+            for idx, c_kv in enumerate(latents):
+                blk = mdl.blocks[idx % self.config.num_blocks]
+                blk.write_latent_to_static(
+                    c_kv, cos, sin, static_cache.k[idx], static_cache.v[idx],
+                )
+            static_cache.cursor.fill_(prompt_len)
+            past_key_values = None  # latents no longer needed
+
         # Precompute stop tensor if any
         stop_tensor = None
         if stop_token_ids:
@@ -2475,14 +2684,23 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                         )],
                         dim=1,
                     )
-                out = self._fwd(
-                    new_tok,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    num_loops=num_loops,
-                    attention_mask=attn,
-                )
-                past_key_values = cast("PastKV | None", out.past_key_values)
+                if static_cache is not None:
+                    out = self._fwd(
+                        new_tok,
+                        past_key_values=static_cache,
+                        use_cache=False,
+                        num_loops=num_loops,
+                    )
+                    static_cache.advance()
+                else:
+                    out = self._fwd(
+                        new_tok,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        num_loops=num_loops,
+                        attention_mask=attn,
+                    )
+                    past_key_values = cast("PastKV | None", out.past_key_values)
                 logits_tensor = cast(Tensor, out.logits)
                 logits_last = (
                     logits_tensor[:, -1, :self.config.real_vocab_size].float()
