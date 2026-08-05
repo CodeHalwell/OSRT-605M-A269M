@@ -609,8 +609,13 @@ class MoELayer(nn.Module):
 
         _grouped_ffn otherwise torch.stack's all E experts' weights AND casts
         them fp32->bf16 on EVERY call — at decode that is 3 stacks x 18 MoE
-        invocations x every token (~2.5B weight elements, ~35 GB/token of pure
-        memory traffic; measured as ~the entire 20ms/token GPU floor on A100).
+        invocations x every token (~2.5B weight elements, ~35 GB/token of
+        nominal traffic). NOTE: the predicted throughput win did NOT materialise
+        under fullgraph torch.compile (paired bench: no b1 gain — Inductor
+        likely already hoists the constant stack/cast, and/or decode is
+        host-bound); kept because it is cheap at load time, value-identical,
+        and may pay once CUDA-graph replay removes the host overhead. Costs
+        ~791 MiB of extra bf16 buffers on the 605M preset.
         The weights are frozen at inference, so build the exact same
         (E, in, out) bf16 tensors ONCE and reuse. Non-persistent buffers:
         excluded from state_dict (checkpoint layout unchanged), moved by
@@ -1983,25 +1988,30 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
     def optimize_for_inference(self, compile_model: bool = True) -> "OSRTForCausalLM":
         """Prepare this model for fast generation/eval. Returns self.
 
-        Two output-IDENTICAL steps (verified bit-exact on midtrain3_final, A100:
-        max|Δlogit|=0, 100% greedy token-match):
+        Three steps (measured on midtrain3_final, A100, real generate()):
           1. set_moe_telemetry(False) — drops the ~21 .item()/.tolist() CUDA
              syncs per MoE forward (x18 effective layers). These are training
              collapse-guards; at inference they are pure overhead AND their
              .item() calls graph-break torch.compile.
-          2. self.compile() (in place) — torch.compile(default) fuses the mHC
-             Sinkhorn logsumexp (5 ops -> 1) and elementwise ops. ~3x decode
-             throughput (A100: batch=1 5.4->16.9, batch=32 163->479 tok/s).
-             In-place so generate()'s internal self.forward uses the compiled
-             graph. Data-dependent MoE ops (topk/index_add) fall back to eager
-             kernels without breaking the graph.
+          2. prepack_expert_weights() per block — value-identical; throughput-
+             neutral under fullgraph compile so far (see its docstring), kept
+             for the post-CUDA-graph regime. ~791 MiB extra bf16 buffers.
+          3. torch.compile(self.forward, fullgraph=True, dynamic=True) into
+             self._compiled_forward. MEASURED end-to-end generate(): decode
+             b1 5.0 -> 24.2 tok/s, b32 153 -> 705.6, prefill 196 -> 46 ms.
+             QUALITY: held-out math ppl unchanged (2.8827 == 2.8827); greedy
+             free-generation is NOT bit-reproducible (bf16 fused-reduction
+             reorder flips ~4% of argmax near-ties; max|Δlogit|~0.9). Accepted
+             tradeoff — gate on ppl/logit error, not token identity.
 
         NOT applied automatically — training must keep telemetry ON and stay
         uncompiled. Call this only on a model dedicated to inference. Compiles
         lazily on the first forward of each new (batch, seq) shape; a couple of
-        warmup forwards amortise it. `mode="reduce-overhead"` (CUDA graphs) is
-        deliberately NOT used — capture fails on the MoE data-dependent ops
-        (needs the static-KV-cache refactor first).
+        warmup forwards amortise it (a cold fullgraph+dynamic trace of this
+        model is tens of minutes; persist the inductor cache across runs).
+        `mode="reduce-overhead"` (CUDA graphs) is deliberately NOT used —
+        capture fails on the MoE data-dependent ops (needs the static-KV-cache
+        refactor first).
 
         IMPORTANT: compiles self.forward into self._compiled_forward, which
         generate()/speculative dispatch to via self._fwd. A bare self.compile()
@@ -2020,11 +2030,9 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         """
         self.eval()
         self.set_moe_telemetry(False)
-        # Prepack routed-expert weights: kills the per-call stack + fp32->bf16
-        # cast in _grouped_ffn (~35 GB/token of traffic at decode — the bulk of
-        # the GPU-time floor). Weights are frozen at inference, so this is
-        # value-identical (same stack-then-cast, done once). Call AFTER
-        # load_state_dict; buffers are non-persistent and move with .to().
+        # Prepack routed-expert weights (value-identical; throughput-neutral
+        # under fullgraph compile so far — see prepack_expert_weights). Call
+        # AFTER load_state_dict; buffers are non-persistent, move with .to().
         for blk in self.model.blocks:
             blk.moe.prepack_expert_weights()
         if compile_model:

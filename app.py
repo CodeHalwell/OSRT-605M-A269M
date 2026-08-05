@@ -1365,10 +1365,19 @@ def profile_decode(
                        getattr(e, "self_cuda_time_total", 0.0))
 
     total_dev_us = sum(_dev_us(e) for e in ka)
-    total_calls = sum(e.count for e in ka)
-    print(f"  total op launches (8 steps): {total_calls}  (~{total_calls // 8}/token)",
-          flush=True)
-    print(f"  total self-device time: {total_dev_us / 1000:.1f} ms", flush=True)
+    # Real kernel launches = the cudaLaunchKernel/cuLaunchKernel host events.
+    # Summing every profiler row (the old bug) counted ATen bookkeeping
+    # (as_strided/empty/slice...) as "launches" and overstated ~5x.
+    kernel_launches = sum(
+        e.count for e in ka
+        if e.key in ("cudaLaunchKernel", "cuLaunchKernel")
+    )
+    total_rows = sum(e.count for e in ka)
+    print(f"  kernel launches (8 steps): {kernel_launches} "
+          f"(~{kernel_launches // 8}/token) | profiler rows incl. ATen "
+          f"bookkeeping: {total_rows}", flush=True)
+    print(f"  total self-device time: {total_dev_us / 1000:.1f} ms "
+          f"(~{total_dev_us / 8000:.1f} ms/token GPU-busy)", flush=True)
     sort_key = ("self_device_time_total"
                 if hasattr(next(iter(ka)), "self_device_time_total")
                 else "self_cuda_time_total")
@@ -1376,7 +1385,7 @@ def profile_decode(
     print(ka.table(sort_by=sort_key, row_limit=12), flush=True)
     print("  top ops by launch count:", flush=True)
     print(ka.table(sort_by="count", row_limit=12), flush=True)
-    return {"sweep": sweep, "launches_per_token": total_calls // 8}
+    return {"sweep": sweep, "kernel_launches_per_token": kernel_launches // 8}
 
 
 @app.local_entrypoint()
@@ -1395,7 +1404,7 @@ def run_profile_decode(
     for bs, r in res["sweep"].items():
         print(f"  batch={bs}: {r['per_token_ms']:.1f} ms/step, "
               f"{r['aggregate_tok_per_sec']:.1f} tok/s aggregate")
-    print(f"  launches/token: {res['launches_per_token']}")
+    print(f"  kernel launches/token: {res['kernel_launches_per_token']}")
 
 
 @app.function(
@@ -1622,11 +1631,13 @@ def run_bench_compile(step: str = "latest", ctx_len: int = 64):
     image=image,
     volumes={"/vol/hf_cache": hf_cache_vol},
     secrets=[modal.Secret.from_name("hf-secret")],
-    timeout=3600,  # fullgraph+dynamic compile can take several minutes
+    timeout=7200,  # cold fullgraph+dynamic trace alone can exceed 30 min
 )
 def bench_generate(
     step: str = "latest",
     new_tokens: int = 64,
+    configs: str = "all",       # "all" | "compiled" (skip re-measuring eager)
+    batches: str = "1,32",      # comma-separated batch sizes
     hf_repo: str = "HallD/osrt-v6-ckpt",
 ) -> dict:
     """Authoritative end-to-end generate() bench + identity gate on the REAL
@@ -1693,55 +1704,253 @@ def bench_generate(
         decode_tps = bs * (new_tokens - 1) / max(t_full - t_prefill, 1e-6)
         return ids, t_prefill * 1000, decode_tps
 
+    bs_list = [int(b) for b in batches.split(",") if b.strip()]
+
+    def _bench_config(label: str, warmups: int = 1) -> dict:
+        out = {}
+        for bs in bs_list:
+            ids, pf, tps = _gen(bs, warmups=warmups)
+            out[f"b{bs}"] = {"prefill_ms": pf, "decode_tps": tps, "ids": ids}
+            print(f"  {label:>16} b{bs:<3}: prefill {pf:7.1f} ms | "
+                  f"decode {tps:7.1f} tok/s", flush=True)
+        return out
+
     res = {}
-    # 1) eager, telemetry ON (today's default)
-    ids_on, pf_on, tps_on = _gen(1)
-    _, _, tps_on32 = _gen(32)
-    res["eager_telem_on"] = {"prefill_ms": pf_on, "decode_tps_b1": tps_on,
-                             "decode_tps_b32": tps_on32}
-    # 2) eager, telemetry OFF
-    model.set_moe_telemetry(False)
-    ids_off, pf_off, tps_off = _gen(1)
-    _, _, tps_off32 = _gen(32)
-    res["eager_telem_off"] = {"prefill_ms": pf_off, "decode_tps_b1": tps_off,
-                              "decode_tps_b32": tps_off32}
-    # 3) compiled (the real fix): optimize_for_inference sets _compiled_forward,
-    #    generate() routes through _fwd. 2 warmups to amortise trace/recompile.
+    if configs == "all":
+        res["eager_telem_on"] = _bench_config("eager_telem_on")
+        model.set_moe_telemetry(False)
+        res["eager_telem_off"] = _bench_config("eager_telem_off")
+    # compiled: optimize_for_inference sets _compiled_forward; generate()
+    # routes through _fwd. Extra warmups amortise trace/recompile.
     model.optimize_for_inference()
     assert model._compiled_forward is not None, "compile not wired"
-    ids_c, pf_c, tps_c = _gen(1, warmups=3)
-    _, _, tps_c32 = _gen(32, warmups=3)
-    res["compiled"] = {"prefill_ms": pf_c, "decode_tps_b1": tps_c,
-                       "decode_tps_b32": tps_c32}
-
-    res["identity"] = {
-        "telem_off_matches_on": ids_off == ids_on,
-        "compiled_matches_on": ids_c == ids_on,
-    }
-    for k in ("eager_telem_on", "eager_telem_off", "compiled"):
-        r = res[k]
-        print(f"  {k:>16}: prefill {r['prefill_ms']:7.1f} ms | "
-              f"decode b1 {r['decode_tps_b1']:6.1f} tok/s | "
-              f"b32 {r['decode_tps_b32']:7.1f} tok/s", flush=True)
-    idn = res["identity"]
-    print(f"  identity vs eager_telem_on: telem_off={idn['telem_off_matches_on']}"
-          f"  compiled={idn['compiled_matches_on']}", flush=True)
+    res["compiled"] = _bench_config("compiled", warmups=3)
+    if configs == "all":
+        res["identity"] = {
+            "compiled_matches_eager": (
+                res["compiled"][f"b{bs_list[0]}"]["ids"]
+                == res["eager_telem_on"][f"b{bs_list[0]}"]["ids"]
+            ),
+        }
+        print(f"  identity: {res['identity']}", flush=True)
+    for cfg in res.values():  # strip token ids from the return payload
+        if isinstance(cfg, dict):
+            for v in cfg.values():
+                if isinstance(v, dict):
+                    v.pop("ids", None)
     return res
 
 
 @app.local_entrypoint()
-def run_bench_generate(step: str = "latest", new_tokens: int = 64):
-    """Authoritative generate() bench + identity gate on A100 (blocking)."""
-    print(f"Benchmarking real generate() for step={step} on A100...")
-    res = bench_generate.remote(step=step, new_tokens=new_tokens)
+def run_bench_generate(
+    step: str = "latest",
+    new_tokens: int = 64,
+    configs: str = "all",
+    batches: str = "1,32",
+):
+    """Authoritative generate() bench on A100 (blocking).
+
+    --configs compiled --batches 1  -> fastest loop for iterating on the
+    compiled path (skips the thrice-measured eager baselines + extra traces).
+    """
+    print(f"Benchmarking generate() step={step} configs={configs} "
+          f"batches={batches} on A100...")
+    res = bench_generate.remote(
+        step=step, new_tokens=new_tokens, configs=configs, batches=batches)
     print("\n=== REAL generate() PATH (20 Sinkhorn iters) ===")
-    for k in ("eager_telem_on", "eager_telem_off", "compiled"):
-        r = res[k]
-        print(f"  {k}: prefill {r['prefill_ms']:.1f}ms | "
-              f"decode b1 {r['decode_tps_b1']:.1f} tok/s | "
-              f"b32 {r['decode_tps_b32']:.1f} tok/s")
-    print(f"  compiled output-identical to eager: "
-          f"{res['identity']['compiled_matches_on']}")
+    for k, cfg in res.items():
+        if k == "identity":
+            print(f"  identity: {cfg}")
+            continue
+        for b, r in cfg.items():
+            print(f"  {k} {b}: prefill {r['prefill_ms']:.1f}ms | "
+                  f"decode {r['decode_tps']:.1f} tok/s")
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=7200,
+)
+def ab_prepack(
+    step: str = "latest",
+    reps: int = 5,
+    decode_steps: int = 32,
+    ctx_sweep: str = "64,512,2048,4096",
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """Paired prepack A/B on ONE GPU (reviewer's design), compiled path.
+
+    (1) Alternating packed/unpacked decode timings (A/B/A/B), median tok/s —
+        removes cross-instance variance that confounded the first comparison.
+        Flipping packs to None flips a dynamo guard; both compiled variants
+        stay cached after their first trace, so alternation is cheap.
+    (2) Profiler pass per variant: does any kernel name contain stack/_to_copy
+        (the restack traffic), and GPU-busy ms/token.
+    (3) Context sweep (packed): wall + GPU-busy ms/token at each ctx length —
+        if GPU-busy grows ~linearly with ctx, the projected-K/V cache must
+        precede CUDA graphs; flat GPU-busy with flat ~45ms wall => graphs next.
+    """
+    import re
+    import statistics
+    import time
+
+    _use_inductor_cache()
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from torch.profiler import ProfilerActivity, profile
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+    model.optimize_for_inference()  # telemetry off + prepack + fullgraph compile
+
+    def _set_packed(on: bool) -> None:
+        for blk in model.model.blocks:
+            if on:
+                if blk.moe._packed_w_gate is None:
+                    blk.moe.prepack_expert_weights()
+            else:
+                blk.moe._invalidate_packed_weights()
+
+    gen = torch.Generator(device="cpu").manual_seed(0)
+
+    def _prompt(ctx: int, bs: int = 1) -> torch.Tensor:
+        ids = torch.randint(
+            0, cfg.real_vocab_size, (bs, ctx), generator=gen)
+        return ids.to(device)
+
+    def _timed_decode(inp: torch.Tensor) -> float:
+        """Steady-state decode tok/s (prefill excluded via 1-token run)."""
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model.generate(inp, max_new_tokens=1, temperature=0.0)
+            torch.cuda.synchronize()
+            t_pref = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            model.generate(inp, max_new_tokens=decode_steps, temperature=0.0)
+            torch.cuda.synchronize()
+            t_full = time.perf_counter() - t0
+        return (decode_steps - 1) / max(t_full - t_pref, 1e-6)
+
+    def _profile_variant(inp: torch.Tensor) -> dict:
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            model.generate(inp, max_new_tokens=2, temperature=0.0)  # settle
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            ) as prof:
+                model.generate(inp, max_new_tokens=8, temperature=0.0)
+        ka = prof.key_averages()
+        dev_us = sum(
+            getattr(e, "self_device_time_total",
+                    getattr(e, "self_cuda_time_total", 0.0))
+            for e in ka)
+        launches = sum(e.count for e in ka
+                       if e.key in ("cudaLaunchKernel", "cuLaunchKernel"))
+        restack = sorted({
+            e.key for e in ka
+            if ("stack" in e.key.lower() or "_to_copy" in e.key.lower())
+            and getattr(e, "self_device_time_total",
+                        getattr(e, "self_cuda_time_total", 0.0)) > 0
+        })
+        return {
+            "gpu_busy_ms_per_tok": dev_us / 8000.0,
+            "kernel_launches_per_tok": launches // 8,
+            "restack_kernels": restack,
+        }
+
+    # ── (1) paired alternating A/B at ctx 64 ──
+    inp64 = _prompt(64)
+    # settle both compiled variants first so traces don't pollute timings
+    _set_packed(True)
+    _timed_decode(inp64)
+    _set_packed(False)
+    _timed_decode(inp64)
+    packed_tps, unpacked_tps = [], []
+    for _ in range(reps):
+        _set_packed(True)
+        packed_tps.append(_timed_decode(inp64))
+        _set_packed(False)
+        unpacked_tps.append(_timed_decode(inp64))
+    ab = {
+        "packed_median_tps": statistics.median(packed_tps),
+        "unpacked_median_tps": statistics.median(unpacked_tps),
+        "packed_all": packed_tps,
+        "unpacked_all": unpacked_tps,
+    }
+    print(f"A/B ctx=64 b1: packed median {ab['packed_median_tps']:.1f} tok/s "
+          f"{[f'{t:.1f}' for t in packed_tps]} | unpacked median "
+          f"{ab['unpacked_median_tps']:.1f} {[f'{t:.1f}' for t in unpacked_tps]}",
+          flush=True)
+
+    # ── (2) profiler per variant ──
+    profs = {}
+    for label, on in (("packed", True), ("unpacked", False)):
+        _set_packed(on)
+        profs[label] = _profile_variant(inp64)
+        p = profs[label]
+        print(f"profile[{label}]: gpu_busy {p['gpu_busy_ms_per_tok']:.1f} "
+              f"ms/tok | {p['kernel_launches_per_tok']} launches/tok | "
+              f"restack kernels: {p['restack_kernels'] or 'NONE'}", flush=True)
+
+    # ── (3) context sweep, packed ──
+    _set_packed(True)
+    sweep = {}
+    for ctx in (int(c) for c in ctx_sweep.split(",")):
+        inp = _prompt(ctx)
+        tps = _timed_decode(inp)          # includes one settle implicitly? no:
+        tps = _timed_decode(inp)          # repeat once; keep 2nd (warm) figure
+        prof = _profile_variant(inp)
+        sweep[ctx] = {
+            "wall_ms_per_tok": 1000.0 / tps,
+            "gpu_busy_ms_per_tok": prof["gpu_busy_ms_per_tok"],
+        }
+        print(f"ctx={ctx:>4}: wall {sweep[ctx]['wall_ms_per_tok']:6.1f} ms/tok"
+              f" | gpu-busy {sweep[ctx]['gpu_busy_ms_per_tok']:6.1f} ms/tok",
+              flush=True)
+    return {"ab": ab, "profiles": profs, "ctx_sweep": sweep}
+
+
+@app.local_entrypoint()
+def run_ab_prepack(step: str = "latest", reps: int = 5):
+    """Paired prepack A/B + restack-kernel check + ctx sweep (blocking)."""
+    print(f"Paired prepack A/B for step={step} on one A100...")
+    res = ab_prepack.remote(step=step, reps=reps)
+    ab, profs, sweep = res["ab"], res["profiles"], res["ctx_sweep"]
+    print("\n=== PREPACK PAIRED A/B (same GPU, medians) ===")
+    print(f"  packed:   {ab['packed_median_tps']:.1f} tok/s  {ab['packed_all']}")
+    print(f"  unpacked: {ab['unpacked_median_tps']:.1f} tok/s  {ab['unpacked_all']}")
+    for k, p in profs.items():
+        print(f"  {k}: gpu_busy {p['gpu_busy_ms_per_tok']:.1f} ms/tok, "
+              f"{p['kernel_launches_per_tok']} launches/tok, "
+              f"restack={p['restack_kernels'] or 'NONE'}")
+    print("  ctx sweep (packed):")
+    for ctx, r in sweep.items():
+        print(f"    ctx={ctx}: wall {r['wall_ms_per_tok']:.1f} | "
+              f"gpu {r['gpu_busy_ms_per_tok']:.1f} ms/tok")
 
 
 @app.function(
