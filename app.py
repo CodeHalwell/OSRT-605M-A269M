@@ -2106,6 +2106,115 @@ def ab_static(
     }
 
 
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={"/vol/hf_cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=7200,
+)
+def gate_cudagraph(
+    step: str = "latest",
+    new_tokens: int = 48,
+    ctx_list: str = "64,512,2048,4000",
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
+    """Sequence-level quality gate for the CUDA-graph decode config
+    (reviewer's spec): greedy static+graphs vs latent across context lengths,
+    plus the MIN WINNING MARGIN (top1 - top2 logit gap, teacher-forced over
+    the reference generation) — quantifies how near the near-ties are, since
+    teacher-forced ppl never exercises the decode path.
+
+    ctx values are real-text prefixes (concatenated sample prompts, repeated),
+    truncated to length; ctx+new_tokens must stay <= max_position_embeddings.
+    """
+    import re
+
+    _use_inductor_cache()
+
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+
+    files = HfApi().list_repo_files(hf_repo, repo_type="model")
+    ckpts = [f for f in files
+             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+            if step == "latest"
+            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    print(f"pulling {name}...", flush=True)
+    path = hf_hub_download(hf_repo, name, repo_type="model")
+    tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device).eval()
+    sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
+    model.load_state_dict(sd, strict=False)
+    model.optimize_for_inference(reduce_overhead=True)
+
+    long_text = " ".join(_SAMPLE_PROMPTS) * 40
+    long_ids = tok.encode(long_text, add_special_tokens=False)
+
+    results = {}
+    for ctx in (int(c) for c in ctx_list.split(",")):
+        ids = torch.tensor(
+            [[tok.bos_token_id] + long_ids[: ctx - 1]], device=device)
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            ref = model.generate(
+                ids, max_new_tokens=new_tokens, temperature=0.0,
+                cache_impl="latent",
+            )[0, ids.shape[1]:].tolist()
+            cg = model.generate(
+                ids, max_new_tokens=new_tokens, temperature=0.0,
+                cache_impl="static",
+            )[0, ids.shape[1]:].tolist()
+            # Min winning margin over the reference generation, teacher-forced
+            # (positions ctx-1 .. ctx+new-2 predict the generated tokens).
+            full = torch.tensor([ids[0].tolist() + ref], device=device)
+            logits = model._fwd(full).logits[
+                0, ids.shape[1] - 1: -1, :cfg.real_vocab_size
+            ].float()
+            top2 = logits.topk(2, dim=-1).values
+            margins = (top2[:, 0] - top2[:, 1])
+        first_div = next(
+            (i for i, (a, b) in enumerate(zip(ref, cg)) if a != b), None)
+        results[ctx] = {
+            "first_divergence": first_div,
+            "match_frac": (
+                (first_div if first_div is not None else new_tokens)
+                / new_tokens
+            ),
+            "min_margin": margins.min().item(),
+            "mean_margin": margins.mean().item(),
+        }
+        tag = "IDENTICAL" if first_div is None else f"div@{first_div}"
+        print(f"  ctx={ctx:>4}: [{tag}] match={results[ctx]['match_frac']:.2f} "
+              f"min_margin={results[ctx]['min_margin']:.4f} "
+              f"mean_margin={results[ctx]['mean_margin']:.3f}", flush=True)
+    return results
+
+
+@app.local_entrypoint()
+def run_gate_cudagraph(step: str = "latest", new_tokens: int = 48):
+    """Sequence-level gate: static+cudagraphs vs latent across ctx (blocking)."""
+    print(f"CUDA-graph sequence gate for step={step} on A100...")
+    res = gate_cudagraph.remote(step=step, new_tokens=new_tokens)
+    print("\n=== CUDA-GRAPH SEQUENCE-LEVEL QUALITY GATE ===")
+    for ctx, r in res.items():
+        tag = ("IDENTICAL" if r["first_divergence"] is None
+               else f"diverges @ {r['first_divergence']}")
+        print(f"  ctx={ctx}: {tag} | match {r['match_frac']*100:.0f}% | "
+              f"min margin {r['min_margin']:.4f} | "
+              f"mean margin {r['mean_margin']:.3f}")
+
+
 @app.local_entrypoint()
 def run_ab_static(
     step: str = "latest", reps: int = 5, debug_capture: bool = False,
