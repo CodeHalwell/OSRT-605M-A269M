@@ -1063,10 +1063,15 @@ class MoELayer(nn.Module):
         #            data-dependent .nonzero() is the only torch.compile break.
         #   grouped: sort pairs by expert + one grouped GEMM, dropless.
         if self.grouped_gemm:
-            if not self.training and N * self.top_k <= 128:
+            if not self.training and N * self.top_k <= 32:
                 # Inference small-N (decode) path: capture-safe gather+bmm —
                 # torch._grouped_mm is illegal under CUDA-graph capture, and
                 # at N*K this small bmm also skips the argsort/scatter setup.
+                # Threshold 32 (= b16 decode): the batch-scaling probe showed
+                # bmm is throughput POISON past that (tiny GEMVs; b32 sampled
+                # decode ran 618 tok/s on bmm vs 3,747 at b128 on grouped) —
+                # so batched rollouts use the grouped GEMM, while b<=16
+                # interactive decode stays CUDA-graph capturable.
                 moe_out, total_dropped = self._dispatch_bmm(
                     x_flat, top_idx, top_probs,
                 )
