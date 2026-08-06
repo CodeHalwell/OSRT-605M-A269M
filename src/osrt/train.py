@@ -350,6 +350,20 @@ def run_rollout_eval(
     was_training = model.training
     model.train(False)
 
+    # Telemetry MUST be off for the eval forward. Its ~21 .item() calls per
+    # MoE layer graph-break the compiled model, and worse, dynamo SPECIALISES
+    # ON THE SCALAR VALUE ("___as_tensor(...).item() == -2.074575662612915"),
+    # so every distinct entropy value is a fresh recompile — the v4 run blew
+    # config.recompile_limit (8) on the resume frame at the first eval, after
+    # which dynamo abandons that frame to eager for the rest of the run.
+    # The trainer leaves telemetry ON on logging steps, and eval_interval
+    # lines up with those, so this fires on every single eval unless disabled.
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _base = inner.model if hasattr(inner, "model") else inner
+    _prev_telemetry = getattr(_base, "telemetry_enabled", None)
+    if hasattr(inner, "set_moe_telemetry"):
+        inner.set_moe_telemetry(False)
+
     cache_key = ("rollout", jsonl_path, tokenizer_name, seq_len, batch_size,
                  eval_steps)
     cached = _EVAL_BATCH_CACHE.get(cache_key)
@@ -396,6 +410,10 @@ def run_rollout_eval(
 
     if was_training:
         model.train(True)
+    # Restore whatever the trainer had set, so the logging step that follows
+    # still gets its MoE diagnostics.
+    if _prev_telemetry is not None and hasattr(inner, "set_moe_telemetry"):
+        inner.set_moe_telemetry(_prev_telemetry)
     # Release the eval activations so training's allocator doesn't have to
     # fight fragmentation for the next 100 steps.
     torch.cuda.empty_cache()
