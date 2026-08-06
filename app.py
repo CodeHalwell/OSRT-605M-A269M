@@ -1138,6 +1138,8 @@ def sft_eval_sweep(
     eval. `steps` is a comma-separated list; empty = auto-discover every
     <prefix>_step_*.pt on the volume, plus _final.
     """
+    _use_inductor_cache()
+
     import os
     import re
 
@@ -1173,6 +1175,22 @@ def sft_eval_sweep(
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device)
 
+    # Compile ONCE, before the loop, and swap state dicts inside it. Every
+    # checkpoint has identical shapes and takes an identical code path, so the
+    # traced graph stays valid: load_state_dict copies IN PLACE into the same
+    # param storages, and params are not dynamo guards. Prepacked expert
+    # weights would go stale, but _load_from_state_dict already invalidates
+    # them (see MoELayer._invalidate_packed_weights), so they rebuild lazily.
+    #
+    # Worth compiling here rather than running eager: this sweep does 11
+    # checkpoints x n problems x 2 modes of free generation, and eager also
+    # loses the fused RMSNorm (nn.RMSNorm holds fp32 weights, autocast feeds
+    # bf16, so ATen refuses its fused kernel — ~70 norm calls per forward pay
+    # extra kernels). Inductor generates its own fused norm and ignores that
+    # dispatch entirely, so compiling fixes it for free and correctly, with no
+    # dtype fiddling and no numerical change.
+    model.optimize_for_inference(compile_model=True)
+
     rows = []
     for name in names:
         ck = torch.load(f"{d}/{name}", map_location=device, weights_only=True)
@@ -1182,9 +1200,7 @@ def sft_eval_sweep(
             f"{name}: missing={missing[:3]} unexpected={unexpected[:3]}"
         )
         del ck, sd
-        # telemetry off + prepack; NO torch.compile — recompiling per
-        # checkpoint would cost more than the eval itself.
-        model.optimize_for_inference(compile_model=False)
+        model.eval()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             m = run_reasoning_eval(
                 model, tok, device, n_problems=n,
