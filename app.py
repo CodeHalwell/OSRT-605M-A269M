@@ -783,8 +783,9 @@ def _run_sft_v2(cfg_cls):
     )
     if not os.path.exists(cfg.rollout_dataset_path):
         raise FileNotFoundError(
-            f"SFT-v2 corpus not found at {cfg.rollout_dataset_path}. Upload it: "
-            "`modal volume put osrt-rollouts rollouts/sft_v2.jsonl sft_v2.jsonl`"
+            f"SFT corpus not found at {cfg.rollout_dataset_path}. Upload it "
+            "(`modal volume put osrt-rollouts rollouts/<file>.jsonl <file>.jsonl`) "
+            "or, for sft_v3, run `modal run app.py --stage sft_v3_prep`."
         )
     print(
         f"{cfg.__class__.__name__}: {cfg.total_steps} steps @ seq "
@@ -852,6 +853,105 @@ def run_sft_v2_sanity():
     """Spawn the 30-step v6 SFT-v2 sanity probe."""
     call = sft_v2_sanity.spawn()
     print(f"Spawned v6 SFT v2 sanity — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+# =============================================================================
+# SFT v3 — distillation on the midtrain3 (Chinchilla) base. See SFTv3Config.
+# =============================================================================
+@app.function(
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=3600,
+)
+def sft_v3_prep():
+    """Fresh-workspace bootstrap for sft_v3 (CPU-only, idempotent): pull the
+    midtrain3_final base ckpt and the sft_v3 corpus from HF onto the volumes.
+    Server-side download — no 5GB upload from a laptop."""
+    import os
+    import shutil
+
+    from huggingface_hub import hf_hub_download
+
+    pulls = [
+        ("osrt_v5_midtrain3_final.pt",
+         "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt", vol),
+        ("data/sft_v3.jsonl", "/vol/rollouts/sft_v3.jsonl", rollouts_vol),
+    ]
+    for hf_name, dest, volume in pulls:
+        if os.path.exists(dest):
+            print(f"already present: {dest} ({os.path.getsize(dest)/2**20:.0f} MB)")
+            continue
+        print(f"pulling {hf_name} from HallD/osrt-v6-ckpt...", flush=True)
+        src = hf_hub_download("HallD/osrt-v6-ckpt", hf_name, repo_type="model")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        volume.commit()
+        print(f"  -> {dest} ({os.path.getsize(dest)/2**20:.0f} MB)")
+    print("sft_v3 prep complete.")
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v3():
+    """v6 SFT v3: distillation on midtrain3_final, seq 4096, 800 steps on the
+    42K verified+Nemotron+smoltalk2 corpus. See SFTv3Config."""
+    from osrt.train_config import SFTv3Config
+    _run_sft_v2(SFTv3Config)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v3_sanity():
+    """30-step SFT-v3 probe: corpus parses, midtrain3_final loads clean,
+    VRAM fits at seq 4096 — run on every fresh workspace before the paid run."""
+    from osrt.train_config import SFTv3SanityConfig
+    _run_sft_v2(SFTv3SanityConfig)
+
+
+@app.local_entrypoint()
+def run_sft_v3():
+    """Spawn v6 SFT v3 (fire-and-forget)."""
+    call = sft_v3.spawn()
+    print(f"Spawned v6 SFT v3 — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_sft_v3_sanity():
+    """Spawn the 30-step v6 SFT-v3 sanity probe."""
+    call = sft_v3_sanity.spawn()
+    print(f"Spawned v6 SFT v3 sanity — call_id={call.object_id}")
     print("Monitor: modal app logs <app-id>")
 
 
@@ -5956,6 +6056,9 @@ def main(stage: str = "pretrain"):
         "sft_v1_sanity": (sft_v1_sanity, SPAWN),
         "sft_v2": (sft_v2, SPAWN),
         "sft_v2_sanity": (sft_v2_sanity, SPAWN),
+        "sft_v3_prep": (sft_v3_prep, REMOTE),
+        "sft_v3": (sft_v3, SPAWN),
+        "sft_v3_sanity": (sft_v3_sanity, SPAWN),
     }
     entry = registry.get(stage)
     if entry is None:

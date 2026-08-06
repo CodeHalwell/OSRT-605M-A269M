@@ -1696,6 +1696,54 @@ class SFTv2SanityConfig(SFTv2Config):
     wandb_run_name: str = "osrt-v6-sft-v2-sanity"
 
 
+class SFTv3Config(SFTv2Config):
+    """v6 SFT v3 — reasoning distillation on the midtrain3 (Chinchilla) base.
+
+    Corpus: rollouts/sft_v3.jsonl (scripts/build_sft_v3_data.py): 42,215 rows
+    = verified v2 anchor (mopd gold-checked + openr1/stratos/chat subsamples)
+    + Nemotron-PT math/science thinking-ON + math/chat OFF + smoltalk2
+    instruct/chat. 54/30/15 ON/OFF/CHAT; 8-gram decontamination vs GSM8K-test
+    + MATH-500; cross-source problem dedup; all rows ≤4096 assembled tokens.
+    Report: rollouts/sft_v3_report.md. Also mirrored on HF
+    HallD/osrt-v6-ckpt @ data/sft_v3.jsonl (pulled by the sft_v3_prep stage).
+
+    Sizing: RolloutDataset is one example per seq_len row (NO packing), so
+    42,215 rows / eff-batch 64 ≈ 660 steps/epoch. 800 steps ≈ 1.2 epochs ≈
+    7.3h ≈ $29 at v2's measured ~33s/step (identical shape: H100, batch 4,
+    seq 4096, grad-ckpt) — fits a $40 workspace with margin; v1 and v2 both
+    plateaued by ~1000 steps. Same gentle LR as v2 (peak 1e-5); the base is
+    stronger but the mechanism unchanged.
+    """
+
+    total_steps: int = 800
+    warmup_steps: int = 80
+    rollout_dataset_path: str = "/vol/rollouts/sft_v3.jsonl"
+
+    # Base = midtrain3_final (step 12,600, ~1x Chinchilla; math ppl 2.97 /
+    # fineweb 26.30). Pulled from HF by `--stage sft_v3_prep` on fresh
+    # workspaces — the v6 line's ONLY intact post-midtrain3 base artifact.
+    pretrained_checkpoint: str = (
+        "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt"
+    )
+    ckpt_interval: int = 200
+    stage_prefix: str = "sft_v3"
+    wandb_run_name: str = "osrt-v6-sft-v3"
+
+
+class SFTv3SanityConfig(SFTv3Config):
+    """30-step SFT-v3 probe (run on every FRESH workspace before the paid
+    run): corpus present + parses, v6 system/think/answer seq builds,
+    midtrain3_final loads clean, VRAM fits at seq 4096."""
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    ckpt_interval: int = 9_999_999
+    save_final_checkpoint: bool = False
+    compile_enabled: bool = False
+    stage_prefix: str = "sft_v3-sanity"
+    wandb_run_name: str = "osrt-v6-sft-v3-sanity"
+
+
 class SFTLongConfig(SFTConfig):
     """Long-context SFT — resumes from the seq-2048 SFT checkpoint and
     fine-tunes at seq_len 4096 with a Nemotron-heavy data mix.
