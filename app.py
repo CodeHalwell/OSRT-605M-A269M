@@ -992,6 +992,104 @@ def run_sft_v3_sanity():
     print("Monitor: modal app logs <app-id>")
 
 
+# =============================================================================
+# SFT v4 — length-matched reasoning + broadened mix. See SFTv4Config.
+# =============================================================================
+@app.function(
+    image=image,
+    volumes={"/vol/checkpoints": vol, "/vol/rollouts": rollouts_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=3600,
+)
+def sft_v4_prep():
+    """Fresh-workspace bootstrap for sft_v4 (CPU-only, idempotent): pull the
+    midtrain3_final base plus the v4 train/val corpus from HF."""
+    import os
+    import shutil
+
+    from huggingface_hub import hf_hub_download
+
+    pulls = [
+        ("osrt_v5_midtrain3_final.pt",
+         "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt", vol),
+        ("data/sft_v4.jsonl", "/vol/rollouts/sft_v4.jsonl", rollouts_vol),
+        ("data/sft_v4_val.jsonl", "/vol/rollouts/sft_v4_val.jsonl",
+         rollouts_vol),
+    ]
+    for hf_name, dest, volume in pulls:
+        if os.path.exists(dest):
+            print(f"already present: {dest} "
+                  f"({os.path.getsize(dest) / 2**20:.0f} MB)")
+            continue
+        print(f"pulling {hf_name} from HallD/osrt-v6-ckpt...", flush=True)
+        src = hf_hub_download("HallD/osrt-v6-ckpt", hf_name, repo_type="model")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        volume.commit()
+        print(f"  -> {dest} ({os.path.getsize(dest) / 2**20:.0f} MB)")
+    print("sft_v4 prep complete.")
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v4():
+    """v6 SFT v4: 1,200 steps (~1.7 epochs) on the length-matched corpus,
+    held-out SFT loss logged every 100 steps. See SFTv4Config."""
+    from osrt.train_config import SFTv4Config
+    _run_sft_v2(SFTv4Config)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v4_sanity():
+    """30-step SFT-v4 probe: corpus + val split parse, base loads clean,
+    held-out eval path works, VRAM fits at seq 4096."""
+    from osrt.train_config import SFTv4SanityConfig
+    _run_sft_v2(SFTv4SanityConfig)
+
+
+@app.local_entrypoint()
+def run_sft_v4():
+    """Spawn v6 SFT v4 (fire-and-forget; use `modal run --detach`)."""
+    call = sft_v4.spawn()
+    print(f"Spawned v6 SFT v4 — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
+@app.local_entrypoint()
+def run_sft_v4_sanity():
+    """Spawn the 30-step v6 SFT-v4 sanity probe."""
+    call = sft_v4_sanity.spawn()
+    print(f"Spawned v6 SFT v4 sanity — call_id={call.object_id}")
+    print("Monitor: modal app logs <app-id>")
+
+
 @app.function(
     gpu="H100",
     image=image,
@@ -6096,6 +6194,9 @@ def main(stage: str = "pretrain"):
         "sft_v3_prep": (sft_v3_prep, REMOTE),
         "sft_v3": (sft_v3, SPAWN),
         "sft_v3_sanity": (sft_v3_sanity, SPAWN),
+        "sft_v4_prep": (sft_v4_prep, REMOTE),
+        "sft_v4": (sft_v4, SPAWN),
+        "sft_v4_sanity": (sft_v4_sanity, SPAWN),
     }
     entry = registry.get(stage)
     if entry is None:

@@ -317,6 +317,81 @@ def run_eval(
     }
 
 
+def run_rollout_eval(
+    model: nn.Module,
+    jsonl_path: str,
+    tokenizer_name: str,
+    seq_len: int,
+    batch_size: int,
+    eval_steps: int,
+    device: torch.device,
+) -> dict:
+    """Held-out loss on an SFT rollout JSONL (assistant tokens only).
+
+    Why this exists: SFT-v3 was sized off a TRAINING-loss plateau (flat from
+    ~step 475), and midtrain3 had already shown that signal to be unreliable
+    on this model — its train loss plateaued while held-out ppl kept falling
+    (math 3.06 -> 2.97, fineweb 28.32 -> 26.30). run_eval() answers a
+    different question (general-LM retention on FineWeb-Edu); this answers
+    "is the model still learning the SFT task distribution, or overfitting?"
+
+    Batches are fetched once and cached, so every call scores the SAME
+    held-out examples and the curve is strictly comparable across steps.
+    Loss is masked to the assistant span by RolloutDataset (-100 prefix), so
+    this is genuinely task loss, not prompt-reconstruction loss.
+    """
+    from osrt.data import make_rollout_loader
+
+    was_training = model.training
+    model.train(False)
+
+    cache_key = ("rollout", jsonl_path, tokenizer_name, seq_len, batch_size,
+                 eval_steps)
+    cached = _EVAL_BATCH_CACHE.get(cache_key)
+    if cached is None:
+        loader = make_rollout_loader(
+            jsonl_path=jsonl_path,
+            seq_len=seq_len,
+            tokenizer_name=tokenizer_name,
+            batch_size=batch_size,
+            step_num=999999,  # fixed seed; never collides with training seeds
+            num_workers=0,    # same rationale as run_eval: no worker spawn
+        )
+        data_iter = iter(loader)
+        cached = []
+        for _ in range(eval_steps):
+            try:
+                cached.append(next(data_iter))
+            except StopIteration:
+                break
+        _EVAL_BATCH_CACHE[cache_key] = cached
+        import gc
+        del data_iter
+        del loader
+        gc.collect()
+
+    total_loss = 0.0
+    total_tokens = 0
+    for input_ids, labels in cached:
+        input_ids = input_ids.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            outputs = model(input_ids, labels=labels)
+        n_tokens = (labels != -100).sum().item()
+        total_loss += outputs.loss.item() * n_tokens
+        total_tokens += n_tokens
+
+    if was_training:
+        model.train(True)
+
+    mean_loss = total_loss / max(total_tokens, 1)
+    return {
+        "sft_eval/loss": mean_loss,
+        "sft_eval/perplexity": math.exp(min(mean_loss, 20.0)),
+        "sft_eval/tokens": total_tokens,
+    }
+
+
 def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
     """Pull v5 MoE telemetry from each block. Returns (wandb_dict, stdout_summary)."""
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -2025,6 +2100,41 @@ def run_pretrain_extend(
                 print(
                     f"  EVAL step {step} FAILED ({type(e).__name__}: {e}) — "
                     f"skipping eval, continuing to checkpoint.",
+                    flush=True,
+                )
+
+        # ── Periodic held-out SFT eval (rollout corpus) ──────────────
+        # The signal that decides when to STOP an SFT run: training loss
+        # plateaus early on this model while the eval metric keeps moving
+        # (midtrain3 precedent). Opt-in via `rollout_eval_path`; same
+        # best-effort contract as the FineWeb eval above.
+        sft_eval_path = getattr(extend_cfg, "rollout_eval_path", "")
+        sft_eval_interval = getattr(extend_cfg, "rollout_eval_interval", 0)
+        if (sft_eval_path and sft_eval_interval and step > 0
+                and step % sft_eval_interval == 0):
+            try:
+                m = run_rollout_eval(
+                    model,
+                    sft_eval_path,
+                    tokenizer_name,
+                    seq_len,
+                    batch_size,
+                    getattr(extend_cfg, "rollout_eval_steps", 16),
+                    device,
+                )
+                print(
+                    f"  SFT-EVAL step {step} | held-out loss "
+                    f"{m['sft_eval/loss']:.4f} | ppl "
+                    f"{m['sft_eval/perplexity']:.2f} | "
+                    f"{m['sft_eval/tokens']} tok",
+                    flush=True,
+                )
+                if use_wandb:
+                    wandb.log(m, step=step)
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"  SFT-EVAL step {step} FAILED "
+                    f"({type(e).__name__}: {e}) — continuing.",
                     flush=True,
                 )
                 model.train(True)  # run_eval set eval mode; restore train mode

@@ -1730,6 +1730,64 @@ class SFTv3Config(SFTv2Config):
     wandb_run_name: str = "osrt-v6-sft-v3"
 
 
+class SFTv4Config(SFTv3Config):
+    """v6 SFT v4 — length-matched reasoning, broadened mix, LONGER schedule.
+
+    Why v4 (see scripts/build_sft_v4_data.py for the full measurement): v3's
+    reasoning data was unusable at this scale — 4-8k-char R1 traces the model
+    cannot execute (it emits 250-440c) plus 456c of mopd meta-narration, with
+    essentially nothing in between. It learned to narrate. GSM8K 0/20, and ON
+    vs OFF produced the SAME wrong answers. v4 teaches brief correct
+    derivation from GSM8K-train's own human solutions (median 249c) plus
+    orca-math, caps ON thinking at 2,000c, rejects ON rows whose think is
+    shorter than their answer, cuts math/science from 64% to ~48%, and adds
+    general reasoning, rewriting/summarising, and tool calling.
+
+    Schedule: 1,200 steps ~ 1.7 epochs over ~43k rows at eff-batch 64 — 50%
+    more than v3's 1.2 epochs. Sized against MEASURED throughput (9,582 tok/s
+    at the end of the v3 run => 27.4s/step): 9.1h ~ $39, which is the most
+    that fits ONE $40 workspace with the cosine fully annealed. Going longer
+    inside one workspace risks the budget wall stopping the run mid-anneal and
+    leaving an un-annealed checkpoint (the midtrain2 LR-displacement lesson);
+    if held-out loss is still falling at 1,200 the right move is a separate
+    extend run with a fresh short cosine, not a partial anneal.
+
+    Stopping signal: `rollout_eval_path` + `rollout_eval_interval` log
+    held-out SFT loss every 100 steps. v3 was sized off a TRAINING-loss
+    plateau, which midtrain3 had already shown to be unreliable here (train
+    loss flat while held-out ppl kept improving). Never size the next SFT run
+    off train loss again.
+    """
+
+    total_steps: int = 1_200
+    warmup_steps: int = 100
+    rollout_dataset_path: str = "/vol/rollouts/sft_v4.jsonl"
+
+    # Held-out SFT eval — the signal that says when to stop.
+    rollout_eval_path: str = "/vol/rollouts/sft_v4_val.jsonl"
+    rollout_eval_interval: int = 100
+    rollout_eval_steps: int = 32     # 32 x batch 4 = 128 held-out examples
+
+    ckpt_interval: int = 200         # 6 checkpoints; pick the best by eval
+    stage_prefix: str = "sft_v4"
+    wandb_run_name: str = "osrt-v6-sft-v4"
+
+
+class SFTv4SanityConfig(SFTv4Config):
+    """30-step SFT-v4 probe: corpus + val split parse, midtrain3_final loads
+    clean, held-out eval path works, VRAM fits at seq 4096."""
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    rollout_eval_interval: int = 10   # exercise the eval path in the probe
+    rollout_eval_steps: int = 4
+    ckpt_interval: int = 9_999_999
+    save_final_checkpoint: bool = False
+    compile_enabled: bool = False
+    stage_prefix: str = "sft_v4-sanity"
+    wandb_run_name: str = "osrt-v6-sft-v4-sanity"
+
+
 class SFTv3SanityConfig(SFTv3Config):
     """30-step SFT-v3 probe (run on every FRESH workspace before the paid
     run): corpus present + parses, v6 system/think/answer seq builds,
