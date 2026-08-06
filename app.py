@@ -1106,6 +1106,117 @@ def sft_v4_sanity_b16():
     _run_sft_v2(SFTv4Batch16SanityConfig)
 
 
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=14400,
+)
+def sft_eval_sweep(
+    prefix: str = "osrt_v5_sft_v4",
+    steps: str = "",
+    n: int = 200,
+    max_new_tokens: int = 512,
+) -> list[dict]:
+    """Score EVERY checkpoint of a run by GSM8K generation accuracy.
+
+    Why this exists: SFT task loss is a poor proxy for what we actually want.
+    It is measured under teacher forcing, so it never sees error accumulation,
+    and on this corpus the GSM8K rows are ~70 tokens of derivation against a
+    1-3 token answer — so the average barely touches whether the final number
+    is right. v3 posted a healthy-looking loss curve and scored 0/20.
+    Held-out LOSS has the same blind spot. Accuracy under free generation does
+    not, so pick the checkpoint on THIS, not on either loss.
+
+    Loads each checkpoint into one already-built model (state-dict swap, not a
+    fresh container per checkpoint) and runs the existing reasoning-on/off
+    eval. `steps` is a comma-separated list; empty = auto-discover every
+    <prefix>_step_*.pt on the volume, plus _final.
+    """
+    import os
+    import re
+
+    import torch
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+    from osrt.sft_eval import run_reasoning_eval
+
+    d = "/vol/checkpoints/v5"
+    if steps:
+        names = [f"{prefix}_step_{s.strip()}.pt" for s in steps.split(",")
+                 if s.strip()]
+    else:
+        found = [f for f in os.listdir(d)
+                 if re.fullmatch(rf"{re.escape(prefix)}_step_\d+\.pt", f)]
+        names = sorted(found, key=lambda f: int(re.search(r"_step_(\d+)", f).group(1)))
+    if os.path.exists(f"{d}/{prefix}_final.pt"):
+        names.append(f"{prefix}_final.pt")
+    names = [f for f in names if os.path.exists(f"{d}/{f}")]
+    if not names:
+        raise FileNotFoundError(f"no checkpoints matching {prefix} in {d}")
+    print(f"sweeping {len(names)} checkpoints x {n} problems:\n  "
+          + "\n  ".join(names), flush=True)
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device)
+
+    rows = []
+    for name in names:
+        ck = torch.load(f"{d}/{name}", map_location=device, weights_only=True)
+        sd = ck.get("model_state_dict", ck)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        assert not missing and not unexpected, (
+            f"{name}: missing={missing[:3]} unexpected={unexpected[:3]}"
+        )
+        del ck, sd
+        # telemetry off + prepack; NO torch.compile — recompiling per
+        # checkpoint would cost more than the eval itself.
+        model.optimize_for_inference(compile_model=False)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            m = run_reasoning_eval(
+                model, tok, device, n_problems=n,
+                max_new_tokens=max_new_tokens, batch_size=32,
+                repetition_penalty=1.2,   # the locked decode hygiene
+            )
+        step = int(re.search(r"_step_(\d+)", name).group(1)) if "_step_" in name else -1
+        m["ckpt"] = name
+        m["step"] = step
+        rows.append(m)
+        print(f"  {name:<42} acc_on {100*m['sft_eval/acc_on']:5.1f}%  "
+              f"acc_off {100*m['sft_eval/acc_off']:5.1f}%  "
+              f"delta {100*m['sft_eval/acc_delta_on_minus_off']:+5.1f}pp  "
+              f"fmt_on {100*m['sft_eval/format_ok_on']:5.1f}%  "
+              f"len_on {m['sft_eval/resp_len_on']:.0f}", flush=True)
+
+    best = max(rows, key=lambda r: r["sft_eval/acc_on"])
+    print(f"\n{'='*78}\nBEST BY acc_on: {best['ckpt']} at "
+          f"{100*best['sft_eval/acc_on']:.1f}% "
+          f"(off {100*best['sft_eval/acc_off']:.1f}%, "
+          f"delta {100*best['sft_eval/acc_delta_on_minus_off']:+.1f}pp)")
+    print("GATE: >=~15% acc_on -> GRPO has signal. <10% -> stop and rethink.")
+    return rows
+
+
+@app.local_entrypoint()
+def run_sft_eval_sweep(prefix: str = "osrt_v5_sft_v4", steps: str = "",
+                       n: int = 200):
+    """Score every checkpoint of a run by GSM8K accuracy (blocking)."""
+    sft_eval_sweep.remote(prefix=prefix, steps=steps, n=n)
+
+
 @app.local_entrypoint()
 def run_sft_v4():
     """Spawn v6 SFT v4 (fire-and-forget; use `modal run --detach`)."""
@@ -6230,6 +6341,7 @@ def main(stage: str = "pretrain"):
         "sft_v4": (sft_v4, SPAWN),
         "sft_v4_sanity": (sft_v4_sanity, SPAWN),
         "sft_v4_sanity_b16": (sft_v4_sanity_b16, SPAWN),
+        "sft_eval_sweep": (sft_eval_sweep, REMOTE),
     }
     entry = registry.get(stage)
     if entry is None:
