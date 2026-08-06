@@ -1769,7 +1769,13 @@ class SFTv4Config(SFTv3Config):
     # the same ~$39 buys 2,400 steps ~ 3.0 epochs instead of 1.5.
     # Safe for inference at longer contexts: 2048 < the 4096 the base was
     # pretrained and midtrained at, so no RoPE position is left untrained.
-    total_steps: int = 2_400
+    # 2,200 not 2,400: measured eager throughput on the sanity was 8,175 tok/s
+    # => 16.0s/step; v3 gained ~22% from torch.compile, so expect ~13.1s/step
+    # => 2,200 steps ~ 8.0h ~ $34, leaving margin under the $40 workspace wall
+    # even if compile underdelivers. 2,400 would land at $37-41 — i.e. it could
+    # be killed mid-anneal, which is the one outcome to avoid. Still ~2.7
+    # epochs vs v3's 1.2.
+    total_steps: int = 2_200
     warmup_steps: int = 150
     rollout_dataset_path: str = "/vol/rollouts/sft_v4.jsonl"
     # batch 8 x accum 8 = eff batch 64, unchanged from v2/v3 (so the
