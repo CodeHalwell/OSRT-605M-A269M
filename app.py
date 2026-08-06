@@ -896,6 +896,43 @@ def sft_v3_prep():
 
 
 @app.function(
+    image=image,
+    volumes={"/vol/checkpoints": vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=7200,
+)
+def push_ckpt(ckpt_name: str, hf_repo: str = "HallD/osrt-v6-ckpt"):
+    """Push a checkpoint from /vol/checkpoints/v5/ to HF (CPU-only).
+
+    Server-side upload — avoids downloading GBs to a laptop and back. Used to
+    publish SFT/GRPO artifacts so Colab notebooks and local evals can pull
+    them. Idempotent-ish: HF overwrites the same path_in_repo."""
+    import os
+
+    from huggingface_hub import HfApi
+
+    src = f"/vol/checkpoints/v5/{ckpt_name}"
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"{src} not on the volume")
+    size_mb = os.path.getsize(src) / 2**20
+    print(f"uploading {ckpt_name} ({size_mb:.0f} MB) -> {hf_repo}", flush=True)
+    api = HfApi()
+    api.create_repo(hf_repo, repo_type="model", private=True, exist_ok=True)
+    api.upload_file(
+        path_or_fileobj=src, path_in_repo=ckpt_name,
+        repo_id=hf_repo, repo_type="model",
+        commit_message=f"add {ckpt_name}",
+    )
+    print(f"done: {hf_repo}/{ckpt_name}", flush=True)
+
+
+@app.local_entrypoint()
+def run_push_ckpt(ckpt_name: str = "osrt_v5_sft_v3_final.pt"):
+    """Push a volume checkpoint to the HF ckpt repo (blocking, CPU-only)."""
+    push_ckpt.remote(ckpt_name)
+
+
+@app.function(
     gpu="H100",
     image=image,
     volumes={
