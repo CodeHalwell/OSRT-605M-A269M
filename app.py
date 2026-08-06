@@ -1085,6 +1085,27 @@ def sft_v4_sanity():
     _run_sft_v2(SFTv4SanityConfig)
 
 
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_v4_sanity_b16():
+    """Paired batch-16 probe vs the batch-8 sanity: VRAM headroom + tok/s."""
+    from osrt.train_config import SFTv4Batch16SanityConfig
+    _run_sft_v2(SFTv4Batch16SanityConfig)
+
+
 @app.local_entrypoint()
 def run_sft_v4():
     """Spawn v6 SFT v4 (fire-and-forget; use `modal run --detach`)."""
@@ -6208,6 +6229,7 @@ def main(stage: str = "pretrain"):
         "sft_v4_prep": (sft_v4_prep, REMOTE),
         "sft_v4": (sft_v4, SPAWN),
         "sft_v4_sanity": (sft_v4_sanity, SPAWN),
+        "sft_v4_sanity_b16": (sft_v4_sanity_b16, SPAWN),
     }
     entry = registry.get(stage)
     if entry is None:

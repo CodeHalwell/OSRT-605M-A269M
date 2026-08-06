@@ -295,15 +295,20 @@ def run_eval(
 
     total_loss = 0.0
     total_tokens = 0
-    for input_ids, labels in cached:
-        input_ids = input_ids.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            outputs = model(input_ids, labels=labels)
-        # In inference mode, outputs.loss is pure task CE (no aux pollution).
-        n_tokens = (labels != -100).sum().item()
-        total_loss += outputs.loss.item() * n_tokens
-        total_tokens += n_tokens
+    # no_grad is load-bearing: without it this forward retains activations for
+    # a backward that never comes, on top of the live training allocation. It
+    # survived here only because midtrain ran with enough headroom; the same
+    # omission OOMed the sft_v4 rollout eval outright. Values are unchanged.
+    with torch.no_grad():
+        for input_ids, labels in cached:
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                outputs = model(input_ids, labels=labels)
+            # In inference mode, outputs.loss is pure task CE (no aux pollution).
+            n_tokens = (labels != -100).sum().item()
+            total_loss += outputs.loss.item() * n_tokens
+            total_tokens += n_tokens
 
     if was_training:
         model.train(True)
@@ -372,17 +377,28 @@ def run_rollout_eval(
 
     total_loss = 0.0
     total_tokens = 0
-    for input_ids, labels in cached:
-        input_ids = input_ids.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            outputs = model(input_ids, labels=labels)
-        n_tokens = (labels != -100).sum().item()
-        total_loss += outputs.loss.item() * n_tokens
-        total_tokens += n_tokens
+    # no_grad is LOAD-BEARING, not a micro-optimisation: without it the eval
+    # forward builds a full autograd graph (activations retained for a backward
+    # that never comes) ON TOP of the live training allocation, and the run OOMs
+    # mid-eval. Observed on the sft_v4 sanity: training sat at 41GB, the first
+    # eval tried to allocate into a 79GB-full GPU and threw. The eval is
+    # wrapped in try/except upstream, so this failed SILENTLY apart from one log
+    # line — losing exactly the signal this function exists to provide.
+    with torch.no_grad():
+        for input_ids, labels in cached:
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                outputs = model(input_ids, labels=labels)
+            n_tokens = (labels != -100).sum().item()
+            total_loss += outputs.loss.item() * n_tokens
+            total_tokens += n_tokens
 
     if was_training:
         model.train(True)
+    # Release the eval activations so training's allocator doesn't have to
+    # fight fragmentation for the next 100 steps.
+    torch.cuda.empty_cache()
 
     mean_loss = total_loss / max(total_tokens, 1)
     return {

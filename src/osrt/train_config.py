@@ -1759,9 +1759,35 @@ class SFTv4Config(SFTv3Config):
     off train loss again.
     """
 
-    total_steps: int = 1_200
-    warmup_steps: int = 100
+    # seq_len 2048, NOT 4096. v4's corpus is 2.4x shorter than v3's (median
+    # 388 assembled tokens vs 925) because 6k-char R1 traces were replaced
+    # with 250-500c derivations — at 4096 that is 88% PADDING, i.e. we would
+    # burn ~half the budget computing pad positions. Measured on the built
+    # corpus: only 1.0% of rows exceed 2048, and those were DROPPED at build
+    # time rather than left to truncate mid-derivation (an unfinished chain is
+    # exactly what we must not teach). Halving seq_len halves step time, so
+    # the same ~$39 buys 2,400 steps ~ 3.0 epochs instead of 1.5.
+    # Safe for inference at longer contexts: 2048 < the 4096 the base was
+    # pretrained and midtrained at, so no RoPE position is left untrained.
+    total_steps: int = 2_400
+    warmup_steps: int = 150
     rollout_dataset_path: str = "/vol/rollouts/sft_v4.jsonl"
+    # batch 8 x accum 8 = eff batch 64, unchanged from v2/v3 (so the
+    # optimisation trajectory stays comparable) but with twice the micro-batch.
+    # VRAM should FALL vs v3's 44.8GB despite the bigger batch: MLP/norm
+    # activations scale with batch*seq (16,384 tokens either way, identical),
+    # while attention scales with batch*seq^2 — 8*2048^2 is HALF of 4*4096^2.
+    # Bigger micro-batches also use the tensor cores better, so step time may
+    # beat the 2x that halving seq_len alone predicts. The sanity run measures
+    # both before the paid run commits.
+    phases: dict = {  # noqa: RUF012
+        "extend": {
+            "seq_len": 2048,
+            "batch_size": 8,
+            "grad_accum_steps": 8,
+            "datasets": [{"name": "sft_v4_rollout", "weight": 1.0}],
+        },
+    }
 
     # Held-out SFT eval — the signal that says when to stop.
     rollout_eval_path: str = "/vol/rollouts/sft_v4_val.jsonl"
@@ -1786,6 +1812,30 @@ class SFTv4SanityConfig(SFTv4Config):
     compile_enabled: bool = False
     stage_prefix: str = "sft_v4-sanity"
     wandb_run_name: str = "osrt-v6-sft-v4-sanity"
+
+
+class SFTv4Batch16SanityConfig(SFTv4SanityConfig):
+    """Paired batch-16 probe against SFTv4SanityConfig's batch 8.
+
+    Question: does doubling the micro-batch again buy throughput, and does it
+    fit with enough margin for a 9-hour run? Estimate says activations roughly
+    double (both MLP and attention scale with batch here), so ~38GB -> ~66GB
+    against an 80GB card — and VRAM CREPT 38.3 -> 44.8GB across the v3 run
+    from compile buffers and allocator fragmentation, so a tight fit at step 0
+    is not a safe fit at step 2,000. Measure instead of guessing: same GPU,
+    same corpus, same 30 steps, only batch/accum differ. eff batch stays 64.
+    """
+
+    phases: dict = {  # noqa: RUF012
+        "extend": {
+            "seq_len": 2048,
+            "batch_size": 16,
+            "grad_accum_steps": 4,
+            "datasets": [{"name": "sft_v4_rollout", "weight": 1.0}],
+        },
+    }
+    stage_prefix: str = "sft_v4-sanity-b16"
+    wandb_run_name: str = "osrt-v6-sft-v4-sanity-b16"
 
 
 class SFTv3SanityConfig(SFTv3Config):
