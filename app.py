@@ -785,7 +785,18 @@ def _run_sft_v2(cfg_cls):
         raise FileNotFoundError(
             f"SFT corpus not found at {cfg.rollout_dataset_path}. Upload it "
             "(`modal volume put osrt-rollouts rollouts/<file>.jsonl <file>.jsonl`) "
-            "or, for sft_v3, run `modal run app.py --stage sft_v3_prep`."
+            "or run the matching `--stage sft_v*_prep`."
+        )
+    # Held-out eval is best-effort inside the training loop (it must never kill
+    # a run), so a missing val file would be silently skipped and we'd fly
+    # blind on the one signal that decides when to stop. Fail loudly HERE,
+    # before the GPU does any work.
+    _val = getattr(cfg, "rollout_eval_path", "")
+    if _val and not os.path.exists(_val):
+        raise FileNotFoundError(
+            f"rollout_eval_path set to {_val} but the file is missing — the "
+            "held-out SFT eval would be silently skipped. Run the stage's "
+            "*_prep step (it pulls the val split too)."
         )
     print(
         f"{cfg.__class__.__name__}: {cfg.total_steps} steps @ seq "

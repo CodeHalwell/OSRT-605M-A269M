@@ -119,6 +119,19 @@ TARGETS = {
     # ── OFF: tool calling (plain-text delimiters) ────────────────────
     "smol_xlam_tool": 1_500,
     "smol_hermes_tool": 1_000,
+    "smol_agentic_tool_on": 1_000,   # reasoning THEN tool call
+    # ── SPECIALITIES (the v4b broadening) ────────────────────────────
+    # Mostly OFF/answer-only: these teach a SKILL, and long teacher CoT
+    # would just re-run the v3 mistake. A 601M model asked for code should
+    # write the code, not narrate about writing it.
+    "evol_code_off": 3_000,          # short code outputs (~620c)
+    "nemotron_code_off": 2_000,      # competitive-programming, CoT stripped
+    "nemotron_safety_off": 1_500,    # refusal / harm-handling behaviour
+    "smol_science_short_off": 2_000, # Mixture-of-Thoughts science (short)
+    "smol_tables_off": 1_500,        # structured-data manipulation
+    "smol_multilingual_off": 1_500,  # 8 languages (65K byte-level BPE)
+    "smol_openthoughts_off": 1_500,  # mixed reasoning, answer-only
+    "smol_s1k_on": 400,              # s1 curated reasoning (only ~1k exist)
     # ── CHAT ─────────────────────────────────────────────────────────
     "smol_everyday_chat": 2_000,
     "smol_systemchats_chat": 2_000,
@@ -145,6 +158,39 @@ def _phash(text: str) -> str:
 def _ngrams(text: str, n: int = NGRAM) -> set[str]:
     w = re.findall(r"[a-z0-9]+", (text or "").lower())
     return {" ".join(w[i:i + n]) for i in range(len(w) - n + 1)}
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
+
+
+def _normalise_tool_calls(answer: str) -> str | None:
+    """Rewrite every <tool_call> payload as VALID JSON, or None if any is
+    unparseable.
+
+    hermes_function_calling emits Python dict repr with single quotes
+    ({'arguments': {...}}) while xlam emits real JSON. Training on both
+    teaches the model that either is acceptable, and a tool call that
+    doesn't parse is worthless to a caller — so canonicalise to JSON and
+    DROP rows we cannot parse (a free quality gate on the tool slices).
+    """
+    calls = _TOOL_CALL_RE.findall(answer)
+    if not calls:
+        return None
+    out = answer
+    for raw in calls:
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                import ast
+                obj = ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                return None
+        if not isinstance(obj, dict):
+            return None
+        out = out.replace(
+            raw, json.dumps(obj, ensure_ascii=False, sort_keys=True))
+    return out
 
 
 def _clean_gsm8k_solution(answer: str) -> tuple[str, str] | None:
@@ -388,6 +434,14 @@ def main() -> int:  # noqa: PLR0915
                 if not spec_text:
                     stats["parsefail"] += 1
                     continue
+            if tools:
+                # Canonicalise the tool payload to valid JSON; drop the row if
+                # it will not parse (hermes ships Python dict repr).
+                fixed = _normalise_tool_calls(ans)
+                if fixed is None:
+                    stats["parsefail"] += 1
+                    continue
+                ans = fixed
             if not admit(q):
                 continue
             system = own_sys if (keep_system and own_sys) else persona(
@@ -427,11 +481,49 @@ def main() -> int:  # noqa: PLR0915
     smol_slice("hermes_function_calling_v1_no_think", "smol_hermes_tool",
                "off", tools=True)
 
+    # ON — agentic: reason, then emit the tool call
+    smol_slice("smolagents_toolcalling_traces_think", "smol_agentic_tool_on",
+               "on", want_think=True, tools=True)
+
+    # SPECIALITIES — answer-only (skill without impossible-length CoT)
+    smol_slice("Mixture_of_Thoughts_science_no_think",
+               "smol_science_short_off", "off")
+    smol_slice("table_gpt_no_think", "smol_tables_off", "off")
+    smol_slice("smoltalk_multilingual_8languages_lang_5_no_think",
+               "smol_multilingual_off", "off")
+    smol_slice("OpenThoughts3_1.2M_no_think_no_think",
+               "smol_openthoughts_off", "off")
+    # s1k is curated + tiny; take whatever clears the 2,000c think cap.
+    smol_slice("s1k_1.1_think", "smol_s1k_on", "on", want_think=True)
+
     # CHAT
     smol_slice("smoltalk_smollm3_everyday_conversations_no_think",
                "smol_everyday_chat", "chat")
     smol_slice("smoltalk_smollm3_systemchats_30k_no_think",
                "smol_systemchats_chat", "chat", keep_system=True)
+
+    # ── Evol-Instruct-Code: short code outputs (instruction/output) ────
+    # The v6 corpus had ZERO code before v4b. Outputs are ~620c — already the
+    # right size, no filtering needed.
+    print("Evol-Instruct-Code-80k...", flush=True)
+    key = "evol_code_off"
+    scanned = 0
+    cap = 60_000 // (50 if args.smoke else 1)
+    for row in load_dataset("nickrosh/Evol-Instruct-Code-80k-v1",
+                            split="train", streaming=True):
+        scanned += 1
+        if kept[key] >= targets[key] or scanned > cap:
+            break
+        q = (row.get("instruction") or "").strip()
+        a = (row.get("output") or "").strip()
+        if not q or not a:
+            stats["parsefail"] += 1
+            continue
+        if not admit(q):
+            continue
+        if add("off", "evol-code", persona("off"), q, "", a):
+            kept[key] += 1
+    print(f"  {key}: {kept[key]}", flush=True)
 
     # ── 4. Nemotron: SHORT science ON + answer-only math OFF ──────────
     def parse_nemotron(row) -> tuple[str, str, str] | None:
@@ -450,7 +542,9 @@ def main() -> int:  # noqa: PLR0915
         return q, "", out
 
     for split, key, mode in (("science", "nemotron_science_short_on", "on"),
-                             ("math", "nemotron_math_off", "off")):
+                             ("math", "nemotron_math_off", "off"),
+                             ("code", "nemotron_code_off", "off"),
+                             ("safety", "nemotron_safety_off", "off")):
         print(f"nemotron-pt [{split}] -> {mode}...", flush=True)
         ds = load_dataset("nvidia/Llama-Nemotron-Post-Training-Dataset",
                           "SFT", split=split, streaming=True)
@@ -526,10 +620,16 @@ def main() -> int:  # noqa: PLR0915
         return xs[min(len(xs) - 1, int(p * (len(xs) - 1)))] if xs else 0
 
     MATHY = ("gsm8k-train", "orca-math", "nemotron:math", "nemotron:science",
-             "v2:openr1", "v2:mopd-verified", "v2:stratos")
+             "v2:openr1", "v2:mopd-verified", "v2:stratos",
+             "smoltalk2:Mixture_of_Thoughts_science")
+    CODEY = ("evol-code", "nemotron:code", "smoltalk2:OpenThoughts3")
     mathy = sum(c for s, c in by_source.items() if s.startswith(MATHY))
+    code = sum(c for s, c in by_source.items() if s.startswith(CODEY))
     tool = sum(c for s, c in by_source.items()
-               if "xlam" in s or "hermes" in s)
+               if "xlam" in s or "hermes" in s or "smolagents" in s)
+    spec = sum(c for s, c in by_source.items()
+               if "table_gpt" in s or "multilingual" in s
+               or s.startswith("nemotron:safety"))
     lines = [
         "# SFT-v4 corpus report",
         "",
@@ -540,8 +640,11 @@ def main() -> int:  # noqa: PLR0915
         f"**{total} records** ({len(train_idx)} train + {n_val} held-out val), "
         f"{sum(lengths) / 1e6:.1f}M assembled tokens",
         "",
-        f"math/science: {mathy} ({100 * mathy / total:.0f}%) — v3 was 64%",
-        f"tool-calling: {tool} ({100 * tool / total:.0f}%) — new in v4",
+        f"math/science:  {mathy} ({100 * mathy / total:.0f}%) — v3 was 64%",
+        f"code:          {code} ({100 * code / total:.0f}%) — v3 had ZERO",
+        f"tool-calling:  {tool} ({100 * tool / total:.0f}%) — new in v4",
+        f"other spec.:   {spec} ({100 * spec / total:.0f}%) "
+        f"(tables / multilingual / safety)",
         "",
         "## By mode",
     ]
