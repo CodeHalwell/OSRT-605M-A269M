@@ -54,7 +54,8 @@ app.py                # Modal deployment entry point — all training stages liv
 scripts/              # CPU smoke tests, probes, data builders, tokenizer training
 tests/                # pytest suite (run on CPU)
 configs/              # exported HF config.json
-tokenizer/            # 65K byte-level BPE tokenizer artefacts (v6 contract)
+v6_tokenizer_export/  # 65K byte-level BPE tokenizer (v6 contract) — USE THIS
+tokenizer/            # STALE 32K artefact (pre-v6) — do not load for v6 ckpts
 docs/                 # numbered architecture chapters (00-overview → 10-...)
 ARCHITECTURE.md       # terse technical spec (config-value source of truth)
 README.md             # design philosophy + the "why" / integrated training plan
