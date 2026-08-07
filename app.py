@@ -1657,7 +1657,16 @@ def build_grpo_prompts(
     `answer` is the bare gold number, which compute_reward handles via its
     extract_gsm8k_answer fallback.
     """
-    _use_inductor_cache()
+    # screen_group=0 => NO screening: just collect unseen prompts with gold.
+    # Screening measured ~13 scans/min even batched, so filling a few thousand
+    # prompts would cost hours and ~$10 of a $35 budget to raise
+    # gradient-bearing prompts per step from ~10 to 32. Dead prompts are
+    # WASTEFUL, not harmful — they contribute exactly zero under group
+    # normalisation — and generation is only ~19% of a step, so 70% dead costs
+    # ~13% of step time. That $10 buys more STEPS than it buys better steps,
+    # and step count is the binding constraint below ~300.
+    if screen_group > 0:
+        _use_inductor_cache()
 
     import json
     import os
@@ -1682,14 +1691,16 @@ def build_grpo_prompts(
         pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
-    model = OSRTForCausalLM(cfg).to(device)
-    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
-                    weights_only=True)
-    sd = ck.get("model_state_dict", ck)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    assert not missing and not unexpected, f"{missing[:3]} {unexpected[:3]}"
-    del ck, sd
-    model.optimize_for_inference(compile_model=True)
+    model = None
+    if screen_group > 0:
+        model = OSRTForCausalLM(cfg).to(device)
+        ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
+                        weights_only=True)
+        sd = ck.get("model_state_dict", ck)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        assert not missing and not unexpected, f"{missing[:3]} {unexpected[:3]}"
+        del ck, sd
+        model.optimize_for_inference(compile_model=True)
 
     import random
     _, on_sys = sample_system_prompt(random.Random(0), "on")
@@ -1718,32 +1729,57 @@ def build_grpo_prompts(
     stats = {"scanned": 0, "no_gold": 0, "dead": 0, "saturated": 0}
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
+    # Screen a CHUNK of prompts per generate() call. Doing one prompt at a time
+    # means batch=screen_group (8), which our own batch-scaling probe measured
+    # as throughput poison: b32 managed 618 tok/s where b256 hit 7,504. Batching
+    # `chunk` prompts x screen_group rollouts puts us in the efficient region —
+    # worth ~30x, i.e. hours instead of a day.
+    chunk = max(1, 256 // screen_group) if screen_group > 0 else 1
+    pending: list[tuple[str, str]] = []          # (question, gold)
+
+    def flush(pending_batch: list[tuple[str, str]]) -> None:
+        if not pending_batch:
+            return
+        prompts = [f"<|system|>{on_sys}<|user|>{q}<|assistant|>"
+                   for q, _ in pending_batch for _ in range(screen_group)]
+        texts = gen(prompts)
+        for pi, (q, gold) in enumerate(pending_batch):
+            got = 0
+            for text in texts[pi * screen_group:(pi + 1) * screen_group]:
+                guess, _ = extract_numeric_answer_strict(text)
+                if guess is not None and numeric_match(guess, gold):
+                    got += 1
+            if got == 0:
+                stats["dead"] += 1
+            elif got == screen_group:
+                stats["saturated"] += 1
+            else:
+                kept.append({"question": q, "answer": gold,
+                             "screen_successes": got})
+
     for row in ds:
         if len(kept) >= target or stats["scanned"] >= max_scan:
             break
-        stats["scanned"] += 1
         q = (row.get("question") or "").strip()
         gold = extract_numeric_answer(row.get("answer") or "")
         if not q or gold is None:
             stats["no_gold"] += 1
             continue
-        gold = str(gold).strip()
-        prompt = f"<|system|>{on_sys}<|user|>{q}<|assistant|>"
-        got = 0
-        for text in gen([prompt] * screen_group):
-            guess, _ = extract_numeric_answer_strict(text)
-            if guess is not None and numeric_match(guess, gold):
-                got += 1
-        if got == 0:
-            stats["dead"] += 1
-        elif got == screen_group:
-            stats["saturated"] += 1
-        else:
-            kept.append({"question": q, "answer": gold, "screen_successes": got})
-        if stats["scanned"] % 250 == 0:
+        stats["scanned"] += 1
+        if screen_group == 0:
+            kept.append({"question": q, "answer": str(gold).strip(),
+                         "screen_successes": -1})
+            if len(kept) % 500 == 0:
+                print(f"  collected {len(kept)} unscreened prompts", flush=True)
+            continue
+        pending.append((q, str(gold).strip()))
+        if len(pending) >= chunk:
+            flush(pending)
+            pending = []
             print(f"  scanned {stats['scanned']}: kept {len(kept)} "
                   f"(dead {stats['dead']}, saturated {stats['saturated']})",
                   flush=True)
+    flush(pending)
 
     with open(out_path, "w") as f:
         for r in kept:
@@ -1762,9 +1798,12 @@ def build_grpo_prompts(
 
 
 @app.local_entrypoint()
-def run_build_grpo_prompts(ckpt_name: str, target: int = 4000):
-    """Screen unseen orca-math prompts into a GRPO prompt set."""
-    build_grpo_prompts.remote(ckpt_name=ckpt_name, target=target)
+def run_build_grpo_prompts(ckpt_name: str, target: int = 4000,
+                           screen_group: int = 8):
+    """Build a GRPO prompt set from unseen orca-math.
+    screen_group=0 skips difficulty screening (fast, CPU-only)."""
+    build_grpo_prompts.remote(ckpt_name=ckpt_name, target=target,
+                              screen_group=screen_group)
 
 
 @app.local_entrypoint()
@@ -5545,19 +5584,43 @@ def grpo(config_name: str = "GRPOConfig",
 
     cfg = getattr(_tc, config_name)()
     print(f"GRPO config: {config_name}")
+    _sys_text = ""
+    if getattr(cfg, "system_persona", ""):
+        from osrt.system_prompts import get_by_name
+        _sys_text = get_by_name(cfg.system_persona)
+        print(f"System persona: {cfg.system_persona} "
+              f"({len(_sys_text)} chars)")
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
 
     print("=" * 60)
     print("OSRT — GRPO Training")
     print("=" * 60)
 
-    model_config = OSRTConfig(
-        vocab_size=len(tok),
-        real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id,
-        eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id,
-    )
+    # v6 MUST build via presets.build_config, not raw OSRTConfig. OSRTConfig's
+    # defaults give rank-16 HRA adapters; the v6 preset is rank 256. Building
+    # raw makes 36 adapter tensors of 24,576 params (884,736 total) where the
+    # checkpoint holds 393,216 each (14,155,776) — the state_dict load then
+    # fails outright, which is the SAFE outcome, but with strict=False anywhere
+    # in the path it would instead leave every adapter RANDOMLY INITIALISED
+    # while everything else loaded fine.
+    if getattr(cfg, "hra_native", False):
+        from osrt.presets import build_config as _build_v6
+        model_config = _build_v6(
+            vocab_size=len(tok),
+            real_vocab_size=len(tok),
+            bos_token_id=tok.bos_token_id,
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.pad_token_id,
+            fused_cross_entropy_chunks=8,
+        )
+    else:
+        model_config = OSRTConfig(
+            vocab_size=len(tok),
+            real_vocab_size=len(tok),
+            bos_token_id=tok.bos_token_id,
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.pad_token_id,
+        )
 
     model = OSRTForCausalLM(model_config).to(device)
 
@@ -5760,7 +5823,14 @@ def grpo(config_name: str = "GRPOConfig",
             question = example["question"]
             ground_truth = example["answer"]
 
-            prompt_text = f"{cfg.user_tag}{question}{cfg.assistant_tag}"
+            # Prepend the system persona when configured. Omitting it puts the
+            # model off-distribution vs SFT and suppresses the <|think|> block
+            # entirely (see GRPOv6Config.system_persona).
+            if getattr(cfg, "system_persona", ""):
+                prompt_text = (f"{cfg.system_tag}{_sys_text}"
+                               f"{cfg.user_tag}{question}{cfg.assistant_tag}")
+            else:
+                prompt_text = f"{cfg.user_tag}{question}{cfg.assistant_tag}"
             prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
             prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             prompt_len = len(prompt_ids)
@@ -6907,14 +6977,15 @@ def _run_grpo_multi(sanity: bool = False) -> None:
 # =============================================================================
 # GRPO v6 — from the SFT-v4 soup. See GRPOv6Config for the measured settings.
 # =============================================================================
-@app.function(image=image, timeout=60)
+@app.function(image=image, timeout=86400)   # must OUTLIVE the blocking
+                                           # grpo.remote() call it wraps
 def grpo_v6():
     """Spawn-able v6 GRPO. Delegates to the shared loop with the v6 config and
     the 65K tokenizer (the default mount is the v4 32K one)."""
     grpo.remote(config_name="GRPOv6Config", tokenizer_path="/vol/tokenizer_v6")
 
 
-@app.function(image=image, timeout=60)
+@app.function(image=image, timeout=86400)   # ditto
 def grpo_v6_sanity():
     """30-step v6 GRPO probe — measures TRAINING-phase VRAM (policy + grads +
     optimiser state + reference copy for KL) and seconds/step at the real wave

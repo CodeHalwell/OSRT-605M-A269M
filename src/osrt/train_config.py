@@ -2733,6 +2733,20 @@ class GRPOv6Config(GRPOConfig):
     # ── anti-hacking (inherited defaults, restated for visibility) ───
     strict_answer_extraction: bool = True   # verified LOSSLESS: strict==loose
                                             # at 18.0%, 0.0% ambiguous
+    # ── SYSTEM PROMPT — load-bearing, not cosmetic ───────────────────
+    # The v5 loop builds "<|user|>{q}<|assistant|>" with NO system block. The
+    # SFT model was trained with one, and the system prompt is what carries the
+    # think/answer instruction. Without it the model emits NO <|think|> block
+    # and dumps its working straight into <|answer|>, so the answer block holds
+    # several numbers, the strict extractor rules it `ambiguous`, and every such
+    # rollout takes the -0.5 penalty. Observed at step 0: mean reward -0.984
+    # with all three sampled rollouts starting "<|answer|>To find the total...".
+    # Our 0.0%-ambiguity measurement used this persona; strip it and the whole
+    # reward signal inverts.
+    system_tag: str = "<|system|>"
+    system_persona: str = "minimal_format"   # the ON persona the SFT corpus and
+                                             # every eval/probe used
+
     # ── in-flight visibility ─────────────────────────────────────────
     # Print real rollouts periodically: scalars cannot show that the text has
     # gone degenerate, and reward hacking looks like a healthy curve over
