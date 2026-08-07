@@ -1613,6 +1613,160 @@ def grpo_signal_probe(
     return results
 
 
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=14400,
+)
+def build_grpo_prompts(
+    ckpt_name: str,
+    target: int = 4000,
+    screen_group: int = 8,
+    temperature: float = 0.4,
+    max_new_tokens: int = 512,
+    skip: int = 60_000,
+    max_scan: int = 40_000,
+    out_path: str = "/vol/rollouts/grpo_prompts.jsonl",
+) -> dict:
+    """Build a DIFFICULTY-SCREENED, UNSEEN prompt set for GRPO.
+
+    Two problems this solves, both of which would otherwise be invisible:
+
+    1. 62-73% of unfiltered prompts are DEAD (0 of 16 rollouts correct) at every
+       temperature we measured, and a dead prompt contributes exactly zero
+       gradient under group-normalised advantage. Screening keeps only prompts
+       the policy solves SOMETIMES — where the reward actually varies — making
+       each wave ~2.6x more useful.
+    2. SFT-v4 trained on 6,500 of GSM8K-train's 7,473 problems. Handing that
+       split to GRPO would be RL on memorised solutions: healthy reward, no
+       generalisation, and a failure that looks like the model plateauing. So
+       prompts come from orca-math AFTER `skip` streamed rows, which the v4
+       builder never reached.
+
+    Screens with `screen_group` rollouts (8 is enough to separate
+    always/never/sometimes and costs half of 16) at the MEASURED best
+    temperature, scored with the STRICT extractor GRPO rewards. Keeps prompts
+    with 1..screen_group-1 successes. Writes {"question", "answer"} JSONL —
+    `answer` is the bare gold number, which compute_reward handles via its
+    extract_gsm8k_answer fallback.
+    """
+    _use_inductor_cache()
+
+    import json
+    import os
+
+    import torch
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+    from osrt.rewards import (
+        extract_numeric_answer,
+        extract_numeric_answer_strict,
+        numeric_match,
+    )
+    from osrt.system_prompts import sample_system_prompt
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device)
+    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
+                    weights_only=True)
+    sd = ck.get("model_state_dict", ck)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    assert not missing and not unexpected, f"{missing[:3]} {unexpected[:3]}"
+    del ck, sd
+    model.optimize_for_inference(compile_model=True)
+
+    import random
+    _, on_sys = sample_system_prompt(random.Random(0), "on")
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    END_ANS = tok.encode("<|/answer|>", add_special_tokens=False)[0]
+
+    def gen(prompts: list[str]) -> list[str]:
+        enc = [tok.encode(p, add_special_tokens=False) for p in prompts]
+        width = max(len(e) for e in enc)
+        ids = torch.tensor([[pad_id] * (width - len(e)) + e for e in enc],
+                           dtype=torch.long, device=device)
+        attn = torch.tensor([[0] * (width - len(e)) + [1] * len(e) for e in enc],
+                            dtype=torch.long, device=device)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.generate(
+                ids, attention_mask=attn, max_new_tokens=max_new_tokens,
+                temperature=temperature, top_p=1.0, top_k=0,
+                eos_token_id=tok.eos_token_id, stop_token_ids=[END_ANS],
+            )
+        return [tok.decode(out[i, width:], skip_special_tokens=False)
+                for i in range(out.shape[0])]
+
+    ds = load_dataset("microsoft/orca-math-word-problems-200k", split="train",
+                      streaming=True).skip(skip)
+    kept: list[dict] = []
+    stats = {"scanned": 0, "no_gold": 0, "dead": 0, "saturated": 0}
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    for row in ds:
+        if len(kept) >= target or stats["scanned"] >= max_scan:
+            break
+        stats["scanned"] += 1
+        q = (row.get("question") or "").strip()
+        gold = extract_numeric_answer(row.get("answer") or "")
+        if not q or gold is None:
+            stats["no_gold"] += 1
+            continue
+        gold = str(gold).strip()
+        prompt = f"<|system|>{on_sys}<|user|>{q}<|assistant|>"
+        got = 0
+        for text in gen([prompt] * screen_group):
+            guess, _ = extract_numeric_answer_strict(text)
+            if guess is not None and numeric_match(guess, gold):
+                got += 1
+        if got == 0:
+            stats["dead"] += 1
+        elif got == screen_group:
+            stats["saturated"] += 1
+        else:
+            kept.append({"question": q, "answer": gold, "screen_successes": got})
+        if stats["scanned"] % 250 == 0:
+            print(f"  scanned {stats['scanned']}: kept {len(kept)} "
+                  f"(dead {stats['dead']}, saturated {stats['saturated']})",
+                  flush=True)
+
+    with open(out_path, "w") as f:
+        for r in kept:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    rollouts_vol.commit()
+
+    import collections
+    hist = collections.Counter(r["screen_successes"] for r in kept)
+    print(f"\n{'=' * 72}\nwrote {len(kept)} screened prompts -> {out_path}")
+    print(f"  scanned {stats['scanned']} | dead {stats['dead']} "
+          f"({100 * stats['dead'] / max(1, stats['scanned']):.0f}%) | "
+          f"saturated {stats['saturated']} | no-gold {stats['no_gold']}")
+    print(f"  keep rate {100 * len(kept) / max(1, stats['scanned']):.0f}%")
+    print(f"  successes/{screen_group} histogram: {dict(sorted(hist.items()))}")
+    return {"kept": len(kept), **stats}
+
+
+@app.local_entrypoint()
+def run_build_grpo_prompts(ckpt_name: str, target: int = 4000):
+    """Screen unseen orca-math prompts into a GRPO prompt set."""
+    build_grpo_prompts.remote(ckpt_name=ckpt_name, target=target)
+
+
 @app.local_entrypoint()
 def run_grpo_signal_probe(ckpt_name: str, n_prompts: int = 100,
                           group_size: int = 16, temps: str = "0.7,0.9,1.0"):
@@ -5344,8 +5498,10 @@ def evaluate(
     image=image,
     volumes={
         "/vol/checkpoints": vol,
-        "/vol/tokenizer": tokenizer_vol,
+        "/vol/tokenizer": tokenizer_vol,        # v4 32K — v5 lineage
+        "/vol/tokenizer_v6": v6_tokenizer_vol,  # v6 65K contract
         "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,          # screened GRPO prompt file
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -5353,8 +5509,14 @@ def evaluate(
     ],
     timeout=86400,
 )
-def grpo():
-    """Run GRPO with verifiable math rewards."""
+def grpo(config_name: str = "GRPOConfig",
+         tokenizer_path: str = "/vol/tokenizer"):
+    """Run GRPO with verifiable math rewards.
+
+    Parameterised by config so the v6 lineage can reuse this loop instead of
+    duplicating 400 lines. v6 MUST pass tokenizer_path="/vol/tokenizer_v6" —
+    the default mount is the v4 32K tokenizer and v6 is a 65K contract, so the
+    embedding would mismatch on load."""
     import copy
     import math
     import os
@@ -5375,14 +5537,15 @@ def grpo():
     from osrt.model import OSRTForCausalLM
     from osrt.rewards import compute_group_advantages, compute_reward
     from osrt.train import apply_router_balance_updates, load_model_state_or_raise
-    from osrt.train_config import GRPOConfig
+    from osrt import train_config as _tc
 
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    cfg = GRPOConfig()
-    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    cfg = getattr(_tc, config_name)()
+    print(f"GRPO config: {config_name}")
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
 
     print("=" * 60)
     print("OSRT — GRPO Training")
@@ -5398,9 +5561,20 @@ def grpo():
 
     model = OSRTForCausalLM(model_config).to(device)
 
-    # Inject HRA before loading SFT checkpoint
+    # Inject HRA before loading SFT checkpoint.
+    # v6 CAVEAT: v6 builds HRA from config, so the checkpoint ALREADY carries
+    # adapters_a/adapters_b. Injecting would bolt a SECOND adapter set onto the
+    # trained ones (the "never inject_hra on v6" rule). With hra_native=True we
+    # skip injection and instead collect the existing adapter tensors by name so
+    # they still get the differential hra_lr.
     hra_params = []
-    if cfg.hra_enabled:
+    if getattr(cfg, "hra_native", False):
+        hra_params = [p for n, p in model.named_parameters()
+                      if "adapters_a" in n or "adapters_b" in n]
+        print(f"HRA is native — skipping inject_hra; found "
+              f"{len(hra_params)} adapter tensors "
+              f"({sum(p.numel() for p in hra_params):,} params) for hra_lr.")
+    elif cfg.hra_enabled:
         print(f"Injecting HRA (rank={cfg.hra_rank})...")
         hra_params = inject_hra(model, rank=cfg.hra_rank)
 
@@ -5474,6 +5648,11 @@ def grpo():
     load_kwargs = {"split": cfg.prompt_split, "streaming": True}
     if cfg.prompt_config:
         load_kwargs["name"] = cfg.prompt_config
+    # v6: prompt_dataset="json" + prompt_data_files points at a local screened
+    # prompt file (difficulty-filtered, unseen problems) instead of a Hub repo.
+    if getattr(cfg, "prompt_data_files", ""):
+        load_kwargs["data_files"] = cfg.prompt_data_files
+        load_kwargs.pop("name", None)
     prompt_ds = load_dataset(cfg.prompt_dataset, **load_kwargs)
     prompt_ds = prompt_ds.shuffle(buffer_size=2_000, seed=42)
     prompt_iter = iter(prompt_ds)
@@ -6677,6 +6856,39 @@ def _run_grpo_multi(sanity: bool = False) -> None:
 # =============================================================================
 
 
+# =============================================================================
+# GRPO v6 — from the SFT-v4 soup. See GRPOv6Config for the measured settings.
+# =============================================================================
+@app.function(image=image, timeout=60)
+def grpo_v6():
+    """Spawn-able v6 GRPO. Delegates to the shared loop with the v6 config and
+    the 65K tokenizer (the default mount is the v4 32K one)."""
+    grpo.remote(config_name="GRPOv6Config", tokenizer_path="/vol/tokenizer_v6")
+
+
+@app.function(image=image, timeout=60)
+def grpo_v6_sanity():
+    """30-step v6 GRPO probe — measures TRAINING-phase VRAM (policy + grads +
+    optimiser state + reference copy for KL) and seconds/step at the real wave
+    size. The rollout probes could not measure this."""
+    grpo.remote(config_name="GRPOv6SanityConfig",
+                tokenizer_path="/vol/tokenizer_v6")
+
+
+@app.local_entrypoint()
+def run_grpo_v6():
+    """Spawn v6 GRPO (use `modal run --detach`)."""
+    call = grpo_v6.spawn()
+    print(f"Spawned v6 GRPO — call_id={call.object_id}")
+
+
+@app.local_entrypoint()
+def run_grpo_v6_sanity():
+    """Spawn the 30-step v6 GRPO sanity probe."""
+    call = grpo_v6_sanity.spawn()
+    print(f"Spawned v6 GRPO sanity — call_id={call.object_id}")
+
+
 @app.local_entrypoint()
 def main(stage: str = "pretrain"):
     """Run v5 training stages.
@@ -6769,6 +6981,9 @@ def main(stage: str = "pretrain"):
         "sft_v4_sanity_b16": (sft_v4_sanity_b16, SPAWN),
         "sft_eval_sweep": (sft_eval_sweep, REMOTE),
         "make_soup": (make_soup, REMOTE),
+        "build_grpo_prompts": (build_grpo_prompts, REMOTE),
+        "grpo_v6": (grpo_v6, SPAWN),
+        "grpo_v6_sanity": (grpo_v6_sanity, SPAWN),
     }
     entry = registry.get(stage)
     if entry is None:

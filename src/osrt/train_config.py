@@ -2642,3 +2642,110 @@ class MultiEnvGRPOConfig(GRPOConfig):
         ("What is the square root of 64?", "8"),
         ("Count: how many letters are in 'banana'?", "6"),
     )
+
+
+class GRPOv6Config(GRPOConfig):
+    """v6 GRPO from the SFT-v4 checkpoint soup. Every knob below that differs
+    from GRPOConfig was set by MEASUREMENT, not by inheriting a default —
+    see the probes in app.py (grpo_signal_probe, strict_extraction_probe).
+
+    FULL-PARAMETER, not HRA-only. The HRA adapter is a rank-256 parallel bypass
+    around ATTENTION only (model.py:1442), so freezing the base would leave
+    GRPO unable to touch the MoE experts, the router, mHC or the embeddings —
+    where this architecture's capacity lives — and the adapters are already
+    fitted through midtrain and SFT. Safety comes instead from peak_lr 1.5e-6
+    (inherited; set after a prior collapse), kl_coeff 0.15, checkpoints every
+    50 steps and the OOD probe.
+
+    hra_native=True: v6 builds HRA from config so the checkpoint already
+    carries adapters_a/adapters_b. inject_hra would add a SECOND set on top of
+    the trained ones. The stage skips injection and collects the existing
+    adapter tensors by name so they keep the differential hra_lr.
+
+    MEASURED SETTINGS
+    -----------------
+    temperature 0.4 (NOT the inherited 1.0). Swept 0.2/0.4/0.7/0.9/1.0 on 100
+    unseen prompts x 16 rollouts, scored strictly. What matters is within-group
+    reward variance, since group-normalised advantage scales with it — a prompt
+    at 0/16 or 16/16 gives exactly zero gradient, which is the recorded
+    "uniform rewards -> zero advantage -> frozen updates" collapse:
+        T     per-rollout  pass@16  gradient-bearing  variance
+        0.2   7.9%         32%      32%               4.05
+        0.4   6.5%         41%      41%               4.70  <- best
+        0.7   5.9%         38%      38%               4.50
+        0.9   3.1%         27%      27%               2.59
+        1.0   3.2%         34%      34%               2.70  <- old default
+    T=0.4 gives **+74% usable gradient** over the inherited 1.0.
+
+    group_size 16 (NOT 8). It was halved to save rollout cost; the decode work
+    made rollouts ~50x cheaper, and group size sets the fraction of prompts
+    yielding ANY gradient at all.
+
+    num_prompts_per_step 32 with grad_accum 32 => 512 rollouts/step, ~31s/step,
+    so ~900 steps fit the budget. Sized for STEP COUNT: 8B models need >=300
+    GRPO steps before answers improve, and a 601M needs at least that. Bigger
+    waves (128 prompts) would have given only ~240 steps — generation is just
+    ~19% of a step, so extra rollout throughput cannot be spent on learning.
+
+    Prompts are DIFFICULTY-SCREENED and UNSEEN. 62-73% of unfiltered prompts
+    are dead (0/16) at every temperature, so screening is essential, not
+    optional; and SFT-v4 trained on 6,500 of GSM8K-train's 7,473 problems, so
+    reusing that split would be RL on memorised solutions — high reward, no
+    generalisation, invisible failure. Prompt file is built by
+    build_grpo_prompts from orca-math past the rows v4 consumed.
+    """
+
+    # ── lineage ──────────────────────────────────────────────────────
+    pretrained_checkpoint: str = (
+        "/vol/checkpoints/v5/osrt_v5_sft_v4_soup_1200_1400_1600_1800.pt"
+    )
+    hra_native: bool = True          # v6: never inject_hra
+    hra_enabled: bool = True         # adapters exist and stay trainable
+
+    # ── measured rollout settings ────────────────────────────────────
+    temperature: float = 0.4
+    group_size: int = 16
+    grad_accum_steps: int = 32       # prompts per optimiser step
+    max_gen_len: int = 512           # responses measure ~357-430 tok
+
+    # ── schedule sized for step count ────────────────────────────────
+    total_steps: int = 900
+    warmup_steps: int = 30
+    lr_anchor_step: int = 0          # fresh cosine, not a resume
+    ckpt_interval: int = 50          # 18 ckpts -> sweep accuracy, don't trust
+                                     # the last one (the SFT-v4 lesson)
+
+    # ── screened prompt set ──────────────────────────────────────────
+    prompt_dataset: str = "json"
+    prompt_config: str = ""
+    prompt_split: str = "train"
+    prompt_data_files: str = "/vol/rollouts/grpo_prompts.jsonl"
+
+    # ── KL anchor: revert the extension-run bump ─────────────────────
+    # GRPOConfig carries kl_coeff=0.20, which is the value a 700->800 EXTENSION
+    # run raised it to. That bump is documented as harmful: KL pinned at
+    # 0.16-0.20 (vs ~0.05 before), mean gsm8k acc 14.5% -> 5.6%, peaks
+    # 43.8% -> 25.0%, and the resulting checkpoint was archived as
+    # osrt_v5_grpo_step_800_overconstrained.pt. This is a FRESH run from a
+    # fresh SFT base, so use the value that actually worked.
+    kl_coeff: float = 0.15
+
+    # ── anti-hacking (inherited defaults, restated for visibility) ───
+    strict_answer_extraction: bool = True   # verified LOSSLESS: strict==loose
+                                            # at 18.0%, 0.0% ambiguous
+    stage_prefix: str = "grpo_v6"
+    wandb_run_name: str = "osrt-v6-grpo"
+
+
+class GRPOv6SanityConfig(GRPOv6Config):
+    """30-step GRPO probe. Measures the thing the rollout probes could NOT:
+    training-phase VRAM (policy + grads + Muon/AdamW state + reference copy for
+    the KL term) at the real wave size, plus seconds/step. Run before the paid
+    run."""
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    grad_accum_steps: int = 8        # smaller wave so 30 steps is quick
+    ckpt_interval: int = 9_999_999
+    stage_prefix: str = "grpo_v6-sanity"
+    wandb_run_name: str = "osrt-v6-grpo-sanity"
