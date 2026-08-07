@@ -2733,6 +2733,17 @@ class GRPOv6Config(GRPOConfig):
     # ── anti-hacking (inherited defaults, restated for visibility) ───
     strict_answer_extraction: bool = True   # verified LOSSLESS: strict==loose
                                             # at 18.0%, 0.0% ambiguous
+    # ── in-flight visibility ─────────────────────────────────────────
+    # Print real rollouts periodically: scalars cannot show that the text has
+    # gone degenerate, and reward hacking looks like a healthy curve over
+    # rubbish output.
+    sample_print_interval: int = 10
+    # Held-out GSM8K accuracy is the ONLY trustworthy judge. Train reward can
+    # climb while real accuracy does not — SFT-v4 showed loss and accuracy
+    # dissociating three separate times.
+    heldout_eval_interval: int = 50
+    heldout_eval_n: int = 50
+
     stage_prefix: str = "grpo_v6"
     wandb_run_name: str = "osrt-v6-grpo"
 

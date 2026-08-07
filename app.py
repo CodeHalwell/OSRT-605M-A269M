@@ -5744,6 +5744,7 @@ def grpo(config_name: str = "GRPOConfig",
         step_loss = 0.0
         step_kl = 0.0
         step_rewards = []
+        _samples: list = []
         step_correct = 0
         step_total = 0
 
@@ -5831,6 +5832,13 @@ def grpo(config_name: str = "GRPOConfig",
                 if breakdown["correct"]:
                     step_correct += 1
                 step_total += 1
+                # Keep a couple of rollouts from the FIRST prompt of the step so
+                # we can print real generations, not just scalars. Reward curves
+                # can look healthy while the text is degenerate (that is what
+                # reward hacking looks like), so a human needs to see output.
+                if _accum == 0 and len(_samples) < 3:
+                    _samples.append((question, ground_truth, comp_text,
+                                     reward, bool(breakdown["correct"])))
             step_rewards.extend(rewards)
 
             advantages = compute_group_advantages(rewards)
@@ -5907,6 +5915,46 @@ def grpo(config_name: str = "GRPOConfig",
                     "grpo/approx_kl": mean_kl,
                     "grpo/lr": lr,
                 }, step=step)
+
+        # ── Print real rollouts for a human vibe check ───────────────
+        # Scalars cannot tell you the text has gone degenerate; reward hacking
+        # shows up as a healthy curve over rubbish output.
+        if _samples and step % getattr(cfg, "sample_print_interval", 10) == 0:
+            print(f"  ---- sample rollouts @ step {step} "
+                  f"(T={cfg.temperature}) ----", flush=True)
+            for si, (q, gt, comp, rw, ok) in enumerate(_samples):
+                q1 = " ".join(q.split())[:150]
+                c1 = " ".join(comp.split())[:400]
+                print(f"  [{si}] {'CORRECT' if ok else 'wrong  '} "
+                      f"reward {rw:+.2f} | gold {gt}")
+                print(f"       Q: {q1}")
+                print(f"       A: {c1}", flush=True)
+
+        # ── Held-out eval: the reward-hacking guard ──────────────────
+        # Train reward can climb while genuine accuracy does not. Judge the run
+        # on THIS, not on the reward EMA (the SFT-v4 lesson, three times over).
+        _hi = getattr(cfg, "heldout_eval_interval", 0)
+        if _hi and step > 0 and step % _hi == 0:
+            try:
+                from osrt.sft_eval import run_reasoning_eval
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    m = run_reasoning_eval(
+                        model, tok, device,
+                        n_problems=getattr(cfg, "heldout_eval_n", 50),
+                        max_new_tokens=cfg.max_gen_len, batch_size=32,
+                        repetition_penalty=1.2,
+                    )
+                print(f"  HELD-OUT GSM8K @ step {step}: "
+                      f"acc_on {100 * m['sft_eval/acc_on']:.1f}%  "
+                      f"acc_off {100 * m['sft_eval/acc_off']:.1f}%  "
+                      f"delta {100 * m['sft_eval/acc_delta_on_minus_off']:+.1f}pp  "
+                      f"fmt {100 * m['sft_eval/format_ok_on']:.0f}%", flush=True)
+                if use_wandb:
+                    wandb.log(m, step=step)
+                model.train(True)
+            except Exception as e:  # noqa: BLE001 — eval must never kill a run
+                print(f"  HELD-OUT eval FAILED ({type(e).__name__}: {e})",
+                      flush=True)
 
         # Checkpoints
         if step > 0 and step % cfg.ckpt_interval == 0:
