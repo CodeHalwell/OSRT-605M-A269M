@@ -1122,6 +1122,7 @@ def sft_eval_sweep(
     steps: str = "",
     n: int = 200,
     max_new_tokens: int = 512,
+    names_csv: str = "",
 ) -> list[dict]:
     """Score EVERY checkpoint of a run by GSM8K generation accuracy.
 
@@ -1151,14 +1152,19 @@ def sft_eval_sweep(
     from osrt.sft_eval import run_reasoning_eval
 
     d = "/vol/checkpoints/v5"
-    if steps:
+    if names_csv:
+        # Explicit filenames — for artefacts that don't follow the
+        # <prefix>_step_N.pt convention (e.g. soups). Scored with the SAME
+        # settings as the sweep so numbers stay comparable.
+        names = [s.strip() for s in names_csv.split(",") if s.strip()]
+    elif steps:
         names = [f"{prefix}_step_{s.strip()}.pt" for s in steps.split(",")
                  if s.strip()]
     else:
         found = [f for f in os.listdir(d)
                  if re.fullmatch(rf"{re.escape(prefix)}_step_\d+\.pt", f)]
         names = sorted(found, key=lambda f: int(re.search(r"_step_(\d+)", f).group(1)))
-    if os.path.exists(f"{d}/{prefix}_final.pt"):
+    if not names_csv and os.path.exists(f"{d}/{prefix}_final.pt"):
         names.append(f"{prefix}_final.pt")
     names = [f for f in names if os.path.exists(f"{d}/{f}")]
     if not names:
@@ -1226,11 +1232,91 @@ def sft_eval_sweep(
     return rows
 
 
+@app.function(
+    image=image,
+    volumes={"/vol/checkpoints": vol},
+    timeout=3600,
+)
+def make_soup(
+    prefix: str = "osrt_v5_sft_v4",
+    steps: str = "1200,1400,1600,1800",
+    out_name: str = "",
+) -> str:
+    """Uniform weight average ("model soup") of several checkpoints.
+
+    Valid here because all candidates lie on ONE training trajectory, so they
+    share a loss basin and need no permutation alignment. Averaging along a
+    trajectory tends to land in a flatter minimum — the right medicine for a
+    run that began overfitting after step 1,600.
+
+    Two known inexactnesses, deliberately accepted and then MEASURED rather
+    than argued about:
+      - HRA adapters are low-rank products, and avg(A)@avg(B) != avg(A@B)
+        (the LoRA-averaging problem). Small along one trajectory, not zero.
+      - MoE router weights: blended routers could in principle dispatch to
+        experts whose blended weights do not compose coherently. The router
+        was converged here (assignment entropy ~2.0, balance loss ~1.00), so
+        the candidates' routers should be close.
+    Non-float tensors (counters, integer buffers) are taken from the FIRST
+    checkpoint rather than averaged — averaging them is meaningless.
+    """
+    import os
+
+    import torch
+
+    d = "/vol/checkpoints/v5"
+    names = [f"{prefix}_step_{s.strip()}.pt" for s in steps.split(",") if s.strip()]
+    missing = [n for n in names if not os.path.exists(f"{d}/{n}")]
+    if missing:
+        raise FileNotFoundError(f"missing: {missing}")
+    out_name = out_name or f"{prefix}_soup_{'_'.join(s.strip() for s in steps.split(','))}.pt"
+
+    acc: dict = {}
+    n_ck = len(names)
+    for i, name in enumerate(names):
+        ck = torch.load(f"{d}/{name}", map_location="cpu", weights_only=True)
+        sd = ck.get("model_state_dict", ck)
+        for k, v in sd.items():
+            if not torch.is_floating_point(v):
+                if i == 0:
+                    acc[k] = v.clone()
+                continue
+            if i == 0:
+                acc[k] = v.detach().to(torch.float32).clone()
+            else:
+                acc[k] += v.detach().to(torch.float32)
+        del ck, sd
+        print(f"  accumulated {name} ({i + 1}/{n_ck})", flush=True)
+
+    # Keep fp32. The source checkpoints store fp32 weights, and casting the
+    # average to bf16 would perturb every parameter by ~0.4% relative — enough
+    # to bias a comparison whose signal is 1-2pp of accuracy.
+    for k, v in acc.items():
+        if torch.is_floating_point(v):
+            acc[k] = v / n_ck
+
+    dest = f"{d}/{out_name}"
+    torch.save({"model_state_dict": acc}, dest)
+    vol.commit()
+    print(f"soup of {n_ck} checkpoints -> {dest} "
+          f"({os.path.getsize(dest) / 2**20:.0f} MB)", flush=True)
+    return out_name
+
+
+@app.local_entrypoint()
+def run_make_soup(prefix: str = "osrt_v5_sft_v4",
+                  steps: str = "1200,1400,1600,1800"):
+    """Average checkpoints into a soup, then score it against the baseline."""
+    name = make_soup.remote(prefix=prefix, steps=steps)
+    print(f"created {name}")
+
+
 @app.local_entrypoint()
 def run_sft_eval_sweep(prefix: str = "osrt_v5_sft_v4", steps: str = "",
-                       n: int = 200):
-    """Score every checkpoint of a run by GSM8K accuracy (blocking)."""
-    sft_eval_sweep.remote(prefix=prefix, steps=steps, n=n)
+                       n: int = 200, names_csv: str = ""):
+    """Score checkpoints by GSM8K accuracy. names_csv overrides discovery."""
+    sft_eval_sweep.remote(prefix=prefix, steps=steps, n=n,
+                          names_csv=names_csv)
 
 
 @app.local_entrypoint()
@@ -6358,6 +6444,7 @@ def main(stage: str = "pretrain"):
         "sft_v4_sanity": (sft_v4_sanity, SPAWN),
         "sft_v4_sanity_b16": (sft_v4_sanity_b16, SPAWN),
         "sft_eval_sweep": (sft_eval_sweep, REMOTE),
+        "make_soup": (make_soup, REMOTE),
     }
     entry = registry.get(stage)
     if entry is None:
