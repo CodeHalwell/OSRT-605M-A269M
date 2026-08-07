@@ -1234,6 +1234,47 @@ def sft_eval_sweep(
 
 @app.function(
     image=image,
+    volumes={"/vol/checkpoints": vol, "/vol/rollouts": rollouts_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=7200,
+)
+def pull_artifacts(names_csv: str, hf_repo: str = "HallD/osrt-v6-ckpt") -> None:
+    """Pull arbitrary artifacts from the HF ckpt repo onto this workspace's
+    volumes. Generic bootstrap for a FRESH workspace — checkpoints land in
+    /vol/checkpoints/v5/, anything under data/ lands in /vol/rollouts/."""
+    import os
+    import shutil
+
+    from huggingface_hub import hf_hub_download
+
+    for raw in names_csv.split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        dest = (f"/vol/rollouts/{os.path.basename(name)}"
+                if name.startswith("data/")
+                else f"/vol/checkpoints/v5/{name}")
+        volume = rollouts_vol if name.startswith("data/") else vol
+        if os.path.exists(dest):
+            print(f"already present: {dest}", flush=True)
+            continue
+        print(f"pulling {name}...", flush=True)
+        src = hf_hub_download(hf_repo, name, repo_type="model")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        volume.commit()
+        print(f"  -> {dest} ({os.path.getsize(dest) / 2**20:.0f} MB)", flush=True)
+    print("pull complete.")
+
+
+@app.local_entrypoint()
+def run_pull_artifacts(names_csv: str):
+    """Bootstrap a fresh workspace with artifacts from HF."""
+    pull_artifacts.remote(names_csv=names_csv)
+
+
+@app.function(
+    image=image,
     volumes={"/vol/checkpoints": vol},
     timeout=3600,
 )
@@ -1301,6 +1342,289 @@ def make_soup(
     print(f"soup of {n_ck} checkpoints -> {dest} "
           f"({os.path.getsize(dest) / 2**20:.0f} MB)", flush=True)
     return out_name
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=7200,
+)
+def strict_extraction_probe(ckpt_name: str, n: int = 200,
+                            max_new_tokens: int = 512) -> dict:
+    """Score ON-mode completions with BOTH extractors on the same generations.
+
+    Why this matters before GRPO: every accuracy number we have used the LOOSE
+    extractor (last number inside the answer block). GRPO rewards with the
+    STRICT one, which returns an answer only on high confidence (single number
+    / boxed / concluding phrase) and otherwise pays `ambiguous_answer_penalty`
+    (-0.5) rather than a free zero. If the model habitually writes several
+    numbers in its answer block, the effective reward rate is well below the
+    measured accuracy — and we would only discover that from a flat reward
+    curve, having already committed the workspace.
+
+    Reports both accuracies plus the confidence-label histogram, so we learn
+    the ambiguity rate directly.
+    """
+    _use_inductor_cache()
+
+    import collections
+
+    import torch
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+    from osrt.rewards import (
+        extract_numeric_answer,
+        extract_numeric_answer_strict,
+        numeric_match,
+    )
+    from osrt.sft_eval import _gen_batch, _load_gsm8k_heldout
+    from osrt.system_prompts import sample_system_prompt
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device)
+    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
+                    weights_only=True)
+    sd = ck.get("model_state_dict", ck)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    assert not missing and not unexpected, f"{missing[:3]} {unexpected[:3]}"
+    del ck, sd
+    model.optimize_for_inference(compile_model=True)
+
+    import random
+    _, on_sys = sample_system_prompt(random.Random(0), "on")
+    problems = _load_gsm8k_heldout(n)
+    prompts = [f"<|system|>{on_sys}<|user|>{q}<|assistant|>"
+               for q, _ in problems]
+
+    completions: list[str] = []
+    B = 32
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        for i in range(0, len(prompts), B):
+            completions += _gen_batch(model, tok, prompts[i:i + B], device,
+                                      max_new_tokens, repetition_penalty=1.2)
+            print(f"  generated {min(i + B, len(prompts))}/{len(prompts)}",
+                  flush=True)
+
+    loose_ok = strict_ok = 0
+    labels: collections.Counter = collections.Counter()
+    for (q, gold), text in zip(problems, completions):
+        if numeric_match(extract_numeric_answer(text), gold):
+            loose_ok += 1
+        guess, conf = extract_numeric_answer_strict(text)
+        labels[conf] += 1
+        if guess is not None and numeric_match(guess, gold):
+            strict_ok += 1
+
+    res = {
+        "ckpt": ckpt_name, "n": n,
+        "loose_acc": loose_ok / n, "strict_acc": strict_ok / n,
+        "confidence": dict(labels),
+    }
+    print(f"\n{'=' * 72}\n{ckpt_name}  n={n}")
+    print(f"  LOOSE  acc_on: {100 * loose_ok / n:.1f}%   (what we reported)")
+    print(f"  STRICT acc_on: {100 * strict_ok / n:.1f}%   (what GRPO rewards)")
+    print("  confidence labels:")
+    for k, v in labels.most_common():
+        print(f"    {k:<18}{v:>5}  ({100 * v / n:.1f}%)")
+    amb = labels.get("ambiguous", 0)
+    print(f"\n  ambiguity rate {100 * amb / n:.1f}% -> those rollouts earn the "
+          f"-0.5 penalty instead of credit")
+    return res
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=10800,
+)
+def grpo_signal_probe(
+    ckpt_name: str,
+    n_prompts: int = 100,
+    group_size: int = 16,
+    temps: str = "0.7,0.9,1.0",
+    max_new_tokens: int = 512,
+    skip: int = 60_000,
+) -> dict:
+    """Measure the GRPO gradient signal before spending a workspace on it.
+
+    Greedy pass@1 (what every number so far reports) is the WRONG statistic for
+    GRPO. At temperature 0 all rollouts in a group are identical, rewards are
+    uniform, group-normalised advantages are exactly zero and nothing learns.
+    What matters is the distribution of successes per prompt at the rollout
+    temperature:
+        0 of G       -> dead prompt, zero gradient
+        G of G       -> saturated, zero gradient
+        1..G-1 of G  -> gradient-bearing
+    The recorded failure mode ("Run 2 hit GRPO collapse -> uniform rewards ->
+    zero advantage -> frozen updates") is the dead/saturated case dominating.
+
+    Sweeps temperature and reports, per setting: the success histogram, the
+    dead / saturated / gradient-bearing split, per-rollout accuracy and
+    pass@G. Scored with the STRICT extractor because that is what GRPO
+    rewards. The per-prompt counts double as the difficulty filter.
+
+    Prompts come from orca-math AFTER `skip` streamed rows, so they are
+    problems SFT-v4 never trained on (its builder consumed the head of the
+    stream). Decontaminated against GSM8K-test by the same 8-gram rule.
+    """
+    _use_inductor_cache()
+
+    import collections
+    import re
+
+    import torch
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
+    from osrt.rewards import extract_numeric_answer, extract_numeric_answer_strict, numeric_match
+    from osrt.system_prompts import sample_system_prompt
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    cfg = build_config(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    device = torch.device("cuda")
+    model = OSRTForCausalLM(cfg).to(device)
+    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
+                    weights_only=True)
+    sd = ck.get("model_state_dict", ck)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    assert not missing and not unexpected, f"{missing[:3]} {unexpected[:3]}"
+    del ck, sd
+    model.optimize_for_inference(compile_model=True)
+
+    # ── unseen prompts with reliable numeric gold ─────────────────────
+    problems: list[tuple[str, str]] = []
+    ds = load_dataset("microsoft/orca-math-word-problems-200k", split="train",
+                      streaming=True).skip(skip)
+    for row in ds:
+        if len(problems) >= n_prompts:
+            break
+        q = (row.get("question") or "").strip()
+        gold = extract_numeric_answer(row.get("answer") or "")
+        if q and gold is not None:
+            problems.append((q, str(gold).strip()))
+    print(f"{len(problems)} unseen orca-math prompts (skipped {skip})",
+          flush=True)
+
+    import random
+    _, on_sys = sample_system_prompt(random.Random(0), "on")
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    END_ANS = tok.encode("<|/answer|>", add_special_tokens=False)[0]
+
+    def gen(prompts: list[str], temperature: float) -> list[str]:
+        """Left-padded batched sampling. sft_eval._gen_batch hardcodes
+        temperature=0.0, which is useless here."""
+        enc = [tok.encode(p, add_special_tokens=False) for p in prompts]
+        width = max(len(e) for e in enc)
+        ids_rows = [[pad_id] * (width - len(e)) + e for e in enc]
+        mask_rows = [[0] * (width - len(e)) + [1] * len(e) for e in enc]
+        input_ids = torch.tensor(ids_rows, dtype=torch.long, device=device)
+        attn = torch.tensor(mask_rows, dtype=torch.long, device=device)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.generate(
+                input_ids, attention_mask=attn,
+                max_new_tokens=max_new_tokens, temperature=temperature,
+                top_p=1.0, top_k=0, eos_token_id=tok.eos_token_id,
+                stop_token_ids=[END_ANS],
+            )
+        return [tok.decode(out[i, width:], skip_special_tokens=False)
+                for i in range(out.shape[0])]
+
+    results = {}
+    B = 256
+    for t_str in temps.split(","):
+        T = float(t_str.strip())
+        successes: list[int] = []
+        labels: collections.Counter = collections.Counter()
+        n_roll = n_correct = 0
+        for pi, (q, gold) in enumerate(problems):
+            prompt = f"<|system|>{on_sys}<|user|>{q}<|assistant|>"
+            got = 0
+            todo = group_size
+            while todo > 0:
+                k = min(todo, B)
+                for text in gen([prompt] * k, T):
+                    guess, conf = extract_numeric_answer_strict(text)
+                    labels[conf] += 1
+                    n_roll += 1
+                    if guess is not None and numeric_match(guess, gold):
+                        got += 1
+                        n_correct += 1
+                todo -= k
+            successes.append(got)
+            if (pi + 1) % 25 == 0:
+                print(f"  T={T}: {pi + 1}/{len(problems)} prompts", flush=True)
+
+        dead = sum(1 for s in successes if s == 0)
+        sat = sum(1 for s in successes if s == group_size)
+        grad = len(successes) - dead - sat
+        hist = collections.Counter(successes)
+        results[T] = {
+            "dead": dead, "saturated": sat, "gradient_bearing": grad,
+            "per_rollout_acc": n_correct / max(1, n_roll),
+            "pass_at_g": 1 - dead / len(successes),
+            "hist": dict(sorted(hist.items())),
+            "confidence": dict(labels),
+        }
+        print(f"\n{'=' * 72}\nT={T}  (group_size={group_size}, "
+              f"{len(problems)} prompts)")
+        print(f"  per-rollout accuracy : {100 * n_correct / max(1, n_roll):.1f}%")
+        print(f"  pass@{group_size}             : "
+              f"{100 * (1 - dead / len(successes)):.1f}%")
+        print(f"  DEAD (0/{group_size})          : {dead} "
+              f"({100 * dead / len(successes):.0f}%)  <- zero gradient")
+        print(f"  saturated ({group_size}/{group_size})     : {sat}")
+        print(f"  GRADIENT-BEARING     : {grad} "
+              f"({100 * grad / len(successes):.0f}%)  <- what GRPO learns from")
+        print(f"  successes/prompt hist: {dict(sorted(hist.items()))}")
+        amb = labels.get("ambiguous", 0)
+        print(f"  ambiguous rollouts   : {100 * amb / max(1, n_roll):.1f}% "
+              f"(these earn -0.5, not 0)")
+
+    best = max(results, key=lambda t: results[t]["gradient_bearing"])
+    print(f"\n{'=' * 72}\nBEST TEMPERATURE: {best} "
+          f"({results[best]['gradient_bearing']} of {len(problems)} prompts "
+          f"gradient-bearing)")
+    return results
+
+
+@app.local_entrypoint()
+def run_grpo_signal_probe(ckpt_name: str, n_prompts: int = 100,
+                          group_size: int = 16, temps: str = "0.7,0.9,1.0"):
+    """Measure GRPO gradient signal + pick the rollout temperature."""
+    grpo_signal_probe.remote(ckpt_name=ckpt_name, n_prompts=n_prompts,
+                             group_size=group_size, temps=temps)
+
+
+@app.local_entrypoint()
+def run_strict_probe(ckpt_name: str, n: int = 200):
+    """Compare loose vs strict answer extraction before GRPO."""
+    strict_extraction_probe.remote(ckpt_name=ckpt_name, n=n)
 
 
 @app.local_entrypoint()
