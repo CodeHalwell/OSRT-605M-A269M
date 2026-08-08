@@ -165,6 +165,14 @@ def main() -> int:  # noqa: PLR0915
         weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
     )
 
+    # MoE telemetry does ~21 .item() calls per layer; each is a CUDA sync AND a
+    # dynamo graph break (dynamo even specialises on the scalar VALUE, which
+    # blew the recompile limit on the Modal run). GRPO never reads it.
+    if hasattr(model, "set_moe_telemetry"):
+        model.set_moe_telemetry(False)
+    if hasattr(ref_model, "set_moe_telemetry"):
+        ref_model.set_moe_telemetry(False)
+
     if args.compile:
         print("compiling policy (cold trace is minutes; helps every step "
               "after)...", flush=True)
@@ -223,18 +231,25 @@ def main() -> int:  # noqa: PLR0915
             rewards = [r.reward for r in flat]
             acc = sum(r.correct for r in flat) / max(len(flat), 1)
             live = sum(1 for r in flat if abs(r.advantage) > 1e-8)
+            # Truncation is the silent killer: a rollout that never closes
+            # <|answer|> forfeits the +3.0 exact-format term AND takes the
+            # truncation penalty, so reward sits negative and it reads as "the
+            # model is bad" rather than "max_gen_len is too small".
+            trunc = sum(1 for r in flat if cfg.answer_close not in r.text)
             vram = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
             print(f"step {step:>5d}/{cfg.total_steps} | loss {loss_val:.4f} | "
                   f"reward {sum(rewards) / len(rewards):+.3f} | acc {acc:.1%} | "
-                  f"live {live}/{len(flat)} | kl {mean_kl:.4f} | lr {lr:.2e} | "
+                  f"live {live}/{len(flat)} | trunc {trunc}/{len(flat)} | "
+                  f"kl {mean_kl:.4f} | lr {lr:.2e} | "
                   f"vram {vram:.1f}GB | {time.time() - t0:.0f}s", flush=True)
             if use_wandb:
                 import wandb
                 wandb.log({"grpo/loss": loss_val, "grpo/accuracy": acc,
                            "grpo/mean_reward": sum(rewards) / len(rewards),
                            "grpo/approx_kl": mean_kl, "grpo/lr": lr,
-                           "grpo/live_rollouts": live}, step=step)
+                           "grpo/live_rollouts": live,
+                           "grpo/truncated": trunc}, step=step)
 
         # Real generations — scalars cannot show the text has gone degenerate,
         # and reward hacking looks exactly like a healthy reward curve.
