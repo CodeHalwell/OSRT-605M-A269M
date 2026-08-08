@@ -70,7 +70,7 @@ def main() -> int:  # noqa: PLR0915
     ap.add_argument("--ckpt-interval", type=int, default=50)
     ap.add_argument("--total-steps", type=int, default=0, help="override cfg")
     ap.add_argument("--num-prompts", type=int, default=0, help="override cfg")
-    ap.add_argument("--micro-batch", type=int, default=8,
+    ap.add_argument("--micro-batch", type=int, default=4,
                     help="sequences per log-prob forward")
     ap.add_argument("--no-wandb", action="store_true")
     # ── speed levers ─────────────────────────────────────────────────
@@ -165,6 +165,17 @@ def main() -> int:  # noqa: PLR0915
         weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
     )
 
+    # GRADIENT CHECKPOINTING — required, not optional. `use_ckpt` in
+    # OSRTModel.forward is `self._osrt_grad_ckpt and self.training`, so it
+    # applies ONLY to the log-prob training pass and never to generation
+    # (which runs under eval()/no_grad anyway). Without it, activations for 18
+    # effective layer applications across a micro-batch of long sequences fill
+    # the card: an OOM at 94.07/94.97GB allocated on the very first policy
+    # forward. SFT ran with this on throughout.
+    inner = model.model if hasattr(model, "model") else model
+    inner._osrt_grad_ckpt = True
+    print("gradient checkpointing: ENABLED (_osrt_grad_ckpt=True)", flush=True)
+
     # MoE telemetry does ~21 .item() calls per layer; each is a CUDA sync AND a
     # dynamo graph break (dynamo even specialises on the scalar VALUE, which
     # blew the recompile limit on the Modal run). GRPO never reads it.
@@ -218,6 +229,8 @@ def main() -> int:  # noqa: PLR0915
         model.train()
 
         flat = [r for g in groups for r in g]
+        # Hand the generation KV back before the training pass allocates.
+        torch.cuda.empty_cache()
         optimizer.zero_grad(set_to_none=True)
         loss_val, mean_kl = train_on_rollouts(
             model, ref_model, flat, cfg, model_config.real_vocab_size,
