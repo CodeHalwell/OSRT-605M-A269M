@@ -105,6 +105,7 @@ def run_reasoning_eval(
     n_problems: int = 50, max_new_tokens: int = 512, seed: int = 0,
     batch_size: int = 16, repetition_penalty: float = 1.0,
     on_persona: str = "", off_persona: str = "",
+    return_items: bool = False,
 ) -> dict:
     """Reasoning-on vs -off accuracy on a held-out GSM8K slice.
 
@@ -139,22 +140,32 @@ def run_reasoning_eval(
     problems = _load_gsm8k_heldout(n_problems)
     stats = {"on": {"correct": 0, "len": 0, "fmt": 0},
              "off": {"correct": 0, "len": 0, "fmt": 0}}
+    # PER-ITEM outcomes, indexed by problem. Aggregates alone cannot support a
+    # paired analysis: successive checkpoints are scored on the SAME 200
+    # questions, so their errors are strongly correlated and an ordinary OLS
+    # interval over checkpoint means overstates certainty. A paired item
+    # bootstrap — resampling questions while preserving each item's trajectory
+    # across checkpoints — needs the individual 0/1 outcomes.
+    items: dict[str, list[int]] = {"on": [0] * len(problems),
+                                   "off": [0] * len(problems)}
 
     # One request per (problem, side); batched left-padded generation.
-    requests = []  # (side, gold, prompt_str)
-    for q, gold in problems:
+    # `idx` rides along so each outcome can be attributed to its problem.
+    requests = []  # (side, gold, prompt_str, idx)
+    for idx, (q, gold) in enumerate(problems):
         for side, sys_text in (("on", on_sys), ("off", off_sys)):
             prompt = f"<|system|>{sys_text}<|user|>{q}<|assistant|>"
-            requests.append((side, gold, prompt))
+            requests.append((side, gold, prompt, idx))
 
     for start in range(0, len(requests), batch_size):
         chunk = requests[start:start + batch_size]
         gens = _gen_batch(model, tok, [r[2] for r in chunk], device,
                           max_new_tokens, repetition_penalty)
-        for (side, gold, _), gen in zip(chunk, gens):
+        for (side, gold, _, idx), gen in zip(chunk, gens):
             pred = _norm(extract_numeric_answer(gen))
             if pred is not None and pred == _norm(gold):
                 stats[side]["correct"] += 1
+                items[side][idx] = 1
             stats[side]["len"] += len(tok.encode(gen, add_special_tokens=False))
             if _WELL_FORMED.search(gen):
                 stats[side]["fmt"] += 1
@@ -176,4 +187,9 @@ def run_reasoning_eval(
         "sft_eval/n": n,
         "sft_eval/persona_on": on_name,
         "sft_eval/persona_off": off_name,
+        # Only when asked: a plain list is not wandb-loggable, and callers that
+        # log this dict directly must not suddenly start shipping 200-element
+        # arrays to a metrics backend.
+        **({"items": {"on": items["on"], "off": items["off"],
+                      "gold": [g for _, g in problems]}} if return_items else {}),
     }

@@ -1143,6 +1143,7 @@ def sft_eval_sweep(
     """
     _use_inductor_cache()
 
+    import json
     import os
     import re
 
@@ -1219,7 +1220,24 @@ def sft_eval_sweep(
                 # scoring that stage, or the number measures cross-persona
                 # generalisation instead of the trained objective.
                 on_persona=on_persona, off_persona=off_persona,
+                return_items=True,
             )
+        # Persist PER-ITEM outcomes. Checkpoint means over the same 200
+        # questions are strongly correlated, so an OLS interval across
+        # checkpoints overstates certainty; a paired item bootstrap needs the
+        # individual 0/1 trajectories. Written per checkpoint so any subset can
+        # be assembled later without re-generating.
+        item_dir = "/vol/checkpoints/items"
+        os.makedirs(item_dir, exist_ok=True)
+        tag = f"{name.replace('.pt', '')}__n{n}__on-{m['sft_eval/persona_on']}"
+        with open(f"{item_dir}/{tag}.json", "w") as fh:
+            json.dump({"ckpt": name, "n": n,
+                       "persona_on": m["sft_eval/persona_on"],
+                       "persona_off": m["sft_eval/persona_off"],
+                       "acc_on": m["sft_eval/acc_on"],
+                       "acc_off": m["sft_eval/acc_off"],
+                       "items": m.pop("items")}, fh)
+        vol.commit()
         step = int(re.search(r"_step_(\d+)", name).group(1)) if "_step_" in name else -1
         m["ckpt"] = name
         m["step"] = step
