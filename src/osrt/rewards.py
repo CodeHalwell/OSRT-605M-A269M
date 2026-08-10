@@ -531,35 +531,41 @@ def correctness_partial_credit(
     predicted: str | None,
     ground_truth: str | None,
 ) -> tuple[float, str]:
-    """Unsloth-style tiered correctness reward.
-
-    Instead of binary correct/wrong (which produces zero advantage
-    when all rollouts in a group are wrong — see GRPO run 2/3 stuck
-    pattern), this gives partial credit for "close" answers and
-    negative reward for "way off" or unparseable.
+    """Tiered correctness reward. ONLY an exact answer scores positive.
 
     Returns (score, tier_label). Score ranges from +5.0 (exact) to
     -2.5 (no extractable number).
 
-    Why partial credit matters
-    ──────────────────────────
-    At ~5 % gsm8k baseline accuracy with group_size=8, most groups
-    have ZERO correct rollouts under binary scoring → all rollouts
-    get reward 0 (or just format reward 0.2) → group-relative
-    advantage normalisation gives all zeros → no gradient → policy
-    frozen. Partial credit ensures variance in rollout rewards even
-    when none are exactly right: a rollout that produces "53"
-    against ground truth "18" gets a different reward from one that
-    produces "144" or "blah". Variance → advantages → gradient.
-
-    Tier schedule (matches the Unsloth GRPO tutorial pattern):
-        exact match     +5.0     ← what we want
-        within   5 %    +3.5
-        within  10 %    +2.5
-        within  20 %    +1.5
-        0.5x – 2.0x     -0.5     ← still in same order of magnitude
+    Tier schedule:
+        exact match     +5.0     ← the ONLY positive tier
+        0.5x – 2.0x     -0.5     ← wrong, but same order of magnitude
         wrong number    -2.0     ← off by an order of magnitude+
         no number       -2.5     ← couldn't even parse one
+
+    Why the graded NEGATIVE tiers, and why no positive ones
+    ──────────────────────────────────────────────────────
+    The negative tiers exist to keep variance in a group's rewards when no
+    rollout is exactly right. At ~5 % accuracy with group_size=8, binary
+    scoring left most groups with zero correct rollouts → uniform rewards →
+    group-normalised advantage of all zeros → no gradient → frozen policy.
+    Spreading wrong answers across -0.5 / -2.0 / -2.5 fixes that without ever
+    paying for a wrong answer.
+
+    This originally followed the Unsloth tutorial's *proximity* schedule, which
+    also paid within_5_pct +3.5, within_10_pct +2.5, within_20_pct +1.5. Those
+    were REMOVED on 2026-08-10 because they measurably degraded the model.
+    A wrong answer earning +3.5 against exact's +5.0 is 70 % of the reward for
+    being wrong, and because advantages are group-normalised, a near-miss in a
+    group with no exact hit becomes the BEST rollout and gets a large positive
+    advantage — training the policy toward plausible numbers of roughly the
+    right magnitude rather than correct ones. GRPO v6 wave 1 lost 7.5pp of
+    held-out GSM8K accuracy in 100 steps this way (soup 20.0 % → step 100
+    12.5 %, n=200), degrading in both reasoning modes and under both personas,
+    with format decay and length inflation alongside.
+
+    Note that on arithmetic word problems "within 5 %" is not partial
+    understanding — it is simply wrong, so there is nothing to give credit for.
+    Proximity credit only makes sense where the target is a genuine estimate.
     """
     if predicted is None or predicted == "":
         return -2.5, "no_extraction"
@@ -586,12 +592,9 @@ def correctness_partial_credit(
         return 5.0, "exact_numeric"
 
     ratio = pr / gt
-    if 0.95 <= ratio <= 1.05:
-        return 3.5, "within_5_pct"
-    if 0.90 <= ratio <= 1.10:
-        return 2.5, "within_10_pct"
-    if 0.80 <= ratio <= 1.20:
-        return 1.5, "within_20_pct"
+    # NO positive tier for a wrong answer — see the docstring. Anything within
+    # 20 % is already inside the 0.5x-2.0x band, so the former within_5/10/20
+    # tiers fall through to wrong_same_order (-0.5) with no new constants.
     if 0.50 <= ratio <= 2.00:
         return -0.5, "wrong_same_order"
     return -2.0, "wrong_far_off"
@@ -668,14 +671,14 @@ def compute_reward(
     reward = 0.0
     breakdown = {}
 
-    # 1. Correctness reward (core signal) — Unsloth-style partial credit.
-    # Replaces the original binary correctness (+1 if exact, 0 otherwise)
-    # which caused GRPO collapse on this model: at ~5 % gsm8k baseline
-    # acc with group_size=8, most groups had zero correct rollouts →
-    # uniform rewards → zero advantage → frozen updates. See
-    # correctness_partial_credit() for the tier schedule (+5.0 exact
-    # down to -2.5 no-extract). correctness_weight now scales the
-    # ENTIRE tier output (default 1.0 keeps the raw Unsloth schedule).
+    # 1. Correctness reward (core signal) — tiered, but only an EXACT answer
+    # scores positive. The graded negative tiers replace the original binary
+    # correctness (+1 if exact, 0 otherwise) which caused GRPO collapse on this
+    # model: at ~5 % gsm8k baseline acc with group_size=8, most groups had zero
+    # correct rollouts → uniform rewards → zero advantage → frozen updates. See
+    # correctness_partial_credit() for the tier schedule (+5.0 exact down to
+    # -2.5 no-extract) and for why the positive proximity tiers were removed.
+    # correctness_weight scales the ENTIRE tier output (default 1.0).
     predicted = extract_numeric_answer(
         completion,
         think_close=think_close,
