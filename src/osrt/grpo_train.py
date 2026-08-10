@@ -153,6 +153,15 @@ def generate_rollouts(
     # Exemplar for the regurgitation penalty — empty unless the configured
     # persona actually carries a few-shot demonstration, so unexemplified
     # personas are unaffected.
+    #
+    # SINGLE-PERSONA ONLY. This is a GLOBAL lookup from cfg.system_persona, so
+    # it assumes every prompt in the batch used the same persona. A mixed
+    # 0-shot/1-shot batch CANNOT be scored correctly here: unexemplified
+    # rollouts would be charged against an exemplar they never saw, and the
+    # penalty's measured 0/256 false-positive rate does not cover that case.
+    # Mixed-stratum training requires the persona/exemplar to travel WITH each
+    # prompt; until it does, cfg.system_persona must name one persona for the
+    # whole run.
     exemplar = FEW_SHOT_EXEMPLARS.get(getattr(cfg, "system_persona", "") or "", "")
 
     # Every prompt repeated group_size times -> a single big batch.

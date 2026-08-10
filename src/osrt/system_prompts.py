@@ -22,6 +22,40 @@ import random
 # ── The pool ──
 # Each entry is a (name, prompt_text) tuple. Name is for logging.
 
+# ── matched verification personas, composed from shared constants ─────
+# The 0-shot and 1-shot variants must differ ONLY by the demonstration, or a
+# 0-shot/1-shot comparison confounds "has an exemplar" with "has different
+# instructions". Both are built from _VERIFY_INSTRUCTIONS so they cannot drift.
+#
+# _VERIFY_EXEMPLAR is a NAMED CONSTANT, not a span recovered by splitting the
+# persona on "Example". That derivation had two defects: it swallowed the
+# trailing "Do not repeat..." INSTRUCTION into the penalisable span (so a model
+# quoting its own instructions would be penalised), and it silently registered
+# any future persona containing the word "Example".
+_VERIFY_INSTRUCTIONS = (
+    "You are an assistant for word problems. Inside <|think|>...<|/think|>: "
+    "name the unknown, write the equation, solve it, then CHECK the arithmetic "
+    "by substituting your value back. Inside <|answer|>...<|/answer|>, give "
+    "only the final number, and it must be the value your working arrived at."
+)
+_VERIFY_EXEMPLAR = (
+    "User: A shop sells an article for 625 at a 25% profit. What was the cost "
+    "price?\n"
+    "Assistant: <|think|>Let C be the cost price. A 25% profit means the "
+    "selling price is 1.25C, so 1.25C = 625. Then C = 625 / 1.25 = 500. "
+    "Check: 500 x 1.25 = 625, which matches the selling price given. So the "
+    "cost price is 500.<|/think|><|answer|>500<|/answer|>"
+)
+_VERIFY_NO_REPEAT = (
+    "Do not repeat the example. Solve the user's problem with its own numbers."
+)
+# Values appearing ONLY in the exemplar. A 0-shot vs 1-shot comparison of how
+# often these are emitted on problems whose gold does not contain them measures
+# NUMERIC ANCHORING, which the n-gram penalty cannot see: it catches copied
+# prose, not a copied answer.
+VERIFY_EXEMPLAR_ANCHORS: tuple[str, ...] = ("500", "625", "1.25", "25%")
+
+
 REASONING_ON: list[tuple[str, str]] = [
     (
         "minimal_format",
@@ -120,22 +154,11 @@ REASONING_ON: list[tuple[str, str]] = [
         "Assistant: <|think|>Distance = speed × time. 60 × 2 = 120 miles.<|/think|>"
         "<|answer|>120<|/answer|>",
     ),
+    ("word_problem_verify_0shot", _VERIFY_INSTRUCTIONS),
     (
         "word_problem_verify_1shot",
-        "You are an assistant for word problems. Inside "
-        "<|think|>...<|/think|>: name the unknown, write the equation, solve "
-        "it, then CHECK the arithmetic by substituting your value back. Inside "
-        "<|answer|>...<|/answer|>, give only the final number, and it must be "
-        "the value your working arrived at.\n\n"
-        "Example:\n"
-        "User: A shop sells an article for 625 at a 25% profit. What was the "
-        "cost price?\n"
-        "Assistant: <|think|>Let C be the cost price. A 25% profit means the "
-        "selling price is 1.25C, so 1.25C = 625. Then C = 625 / 1.25 = 500. "
-        "Check: 500 x 1.25 = 625, which matches the selling price given. So the "
-        "cost price is 500.<|/think|><|answer|>500<|/answer|>\n\n"
-        "Do not repeat the example. Solve the user's problem with its own "
-        "numbers.",
+        _VERIFY_INSTRUCTIONS + "\n\nExample:\n" + _VERIFY_EXEMPLAR
+        + "\n\n" + _VERIFY_NO_REPEAT,
     ),
     (
         "general_default",
@@ -239,15 +262,18 @@ def get_by_name(name: str) -> str:
 DEFAULT_EVAL_ON = "instruction_strict"
 DEFAULT_EVAL_OFF = "instruction_direct"
 
-# ── few-shot exemplar spans, for the regurgitation penalty ────────────
-# Maps persona name -> the DEMONSTRATION text only (not the instructions).
-# A few-shot prompt that the policy learns to echo is worse than no few-shot
-# prompt: it stops being a pattern to follow and becomes a template to
-# reproduce, and echoed prose collects the format term for no work. The penalty
-# needs the exemplar span to compare against, so it lives beside the personas
-# rather than being re-derived by string-splitting at reward time.
+# ── few-shot exemplar registry, for the regurgitation penalty ─────────
+# EXPLICIT, not derived. Maps persona name -> the demonstration text only.
+#
+# A few-shot prompt the policy learns to echo is worse than none: it stops
+# being a pattern to follow and becomes a template to reproduce, and echoed
+# prose collects the format term for no work.
+#
+# Only personas that GRPO actually trains under are registered. The six legacy
+# 1-shot personas (math_focused_1shot, reasoning_3shot, ...) are deliberately
+# ABSENT: nothing trains under them with the echo penalty active, and
+# registering them would extend the penalty's surface with no measured
+# false-positive rate to justify it.
 FEW_SHOT_EXEMPLARS: dict[str, str] = {
-    name: text.split("Example", 1)[1] if "Example" in text else ""
-    for name, text in REASONING_ON + REASONING_OFF
+    "word_problem_verify_1shot": _VERIFY_EXEMPLAR,
 }
-FEW_SHOT_EXEMPLARS = {k: v for k, v in FEW_SHOT_EXEMPLARS.items() if v.strip()}

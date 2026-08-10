@@ -398,3 +398,97 @@ makes training `pi(y | q, exemplar)` while all eval personas carry no exemplar.
 Unexemplified `acc_on` is therefore the transfer test — and per A2.1, the
 quantity to watch is the share of non-zero advantage arising from exemplified
 prompts, not the prompt mixture.
+
+---
+
+# Amendment 3 — 2026-08-10. Mixed stratum DECIDED; launch config reverted
+
+## A3.1 The all-exemplar config violated 3.6 by construction — reverted
+
+`GRPOv6Config.system_persona = "word_problem_verify_1shot"` made **every**
+prompt exemplified, so the exemplified share of advantage mass is necessarily
+**100%** and criterion 3.6 (≤60%) fails by construction. That is a
+ready-to-launch configuration silently breaking its own preregistration.
+
+**Reverted to `minimal_format`.** The persona and the echo penalty stay
+committed and tested; only the launch default returns to unexemplified until
+mixed-stratum support passes the frozen audit.
+
+## A3.2 Matched personas, fixed 50/50 PROMPT-LEVEL mixture
+
+- **`word_problem_verify_0shot`** — identical instructions, no demonstration.
+- **`word_problem_verify_1shot`** — the committed exemplar.
+
+Both are composed from a shared `_VERIFY_INSTRUCTIONS` constant so they cannot
+drift apart; a test asserts the 1-shot text starts with the 0-shot text. If the
+instructions differed, a 0-shot vs 1-shot comparison would confound "has an
+exemplar" with "has different instructions".
+
+**Training:** fixed **50/50 prompt-level** mixture, every rollout **group
+persona-consistent**. With 16 prompts that is **eight unique 0-shot questions
+and eight unique 1-shot questions** — NOT eight questions duplicated across
+both modes, which would halve problem diversity. The mixture is **static**;
+it is never adjusted during training.
+
+**Frozen audit:** the *same* underlying questions under *both* personas, so the
+comparison is paired.
+
+## A3.3 Measurements, all AFTER clamping
+
+| quantity | definition |
+|---|---|
+| Exemplified advantage share | `sum(abs(adv_exemplified)) / sum(abs(adv_all))` — **≤ 60%** (criterion 3.6) |
+| Policy-gradient norm | reported **per stratum** |
+| Live rate | reported **per stratum** |
+| Zero-variance group rate | reported **per stratum** |
+| Transfer result | **unexemplified `acc_on`** |
+
+If 50/50 exceeds the 60% cap, the mixture is re-chosen on the **calibration**
+partition; the **locked audit** partition must then satisfy the cap. Never
+tuned on the audit partition.
+
+## A3.4 Implementation blocker: per-prompt persona metadata
+
+`generate_rollouts` (`osrt/grpo_train.py`) looks the exemplar up **globally**
+from `cfg.system_persona`, so it assumes one persona for the whole batch. A
+mixed batch cannot be scored correctly: unexemplified rollouts would be charged
+against an exemplar they never saw, and the penalty's measured 0/256
+false-positive rate does not cover that case. The persona/exemplar identifier
+must travel **with each prompt or rollout**. A loud comment now marks the
+constraint at the lookup site; the code change belongs with the contract work.
+
+## A3.5 Two safeguards added to the fresh-session contract
+
+**Numeric anchoring.** The n-gram penalty catches copied *prose*, not a copied
+*answer*. `VERIFY_EXEMPLAR_ANCHORS = ("500", "625", "1.25", "25%")` are values
+appearing only in the 1-shot prompt; compare 0-shot vs 1-shot emission of them
+on problems whose gold does **not** contain them. A test asserts the asymmetry
+that makes the comparison possible.
+
+**Explicit exemplar storage.** The registry was derived by
+`text.split("Example", 1)[1]`, which had two defects, both now fixed by named
+constants: it swallowed the trailing *"Do not repeat the example"* INSTRUCTION
+into the penalisable span, so a model quoting its own instructions would have
+been penalised; and it silently registered any future persona containing the
+word "Example". `FEW_SHOT_EXEMPLARS` is now explicit and registers **only** the
+personas GRPO trains under — the six legacy 1-shot personas are deliberately
+absent, since nothing trains under them with the penalty active and registering
+them would extend the penalty's surface with no measured false-positive rate.
+
+## A3.6 A guard fired for real, and forced a fix
+
+Adding `word_problem_verify_0shot` took `REASONING_ON` from 13 to 14 entries and
+moved `Random(0).choice` from **`instruction_strict` to `general_default`** —
+which would have silently rebased every recorded `acc_on`/`acc_off` number.
+
+`run_reasoning_eval` now resolves personas **by name** from
+`DEFAULT_EVAL_ON`/`DEFAULT_EVAL_OFF` rather than sampling, making the historical
+panel reproducible however the pools grow. A test asserts the sampled value has
+in fact diverged from the pin, so anyone reintroducing sampling fails loudly.
+
+## A3.7 Next-session order
+
+1. Verification **grammar** and **truth table** (A2.4).
+2. Matched 0-shot/1-shot personas *(done)* and **per-prompt persona metadata**
+   (A3.4).
+3. Only then fixtures, and only then reward code.

@@ -2792,7 +2792,16 @@ class GRPOv6Config(GRPOConfig):
     # Our 0.0%-ambiguity measurement used this persona; strip it and the whole
     # reward signal inverts.
     system_tag: str = "<|system|>"
-    system_persona: str = "word_problem_verify_1shot"
+    # REVERTED to unexemplified until mixed-stratum support passes the frozen
+    # audit. Setting this to word_problem_verify_1shot makes EVERY prompt
+    # exemplified, so the exemplified share of advantage mass is necessarily
+    # 100% and prereg criterion 3.6 (<=60%) is violated by construction — a
+    # ready-to-launch config that silently breaks its own preregistration.
+    # The agreed design is a fixed 50/50 PROMPT-LEVEL mixture of
+    # word_problem_verify_0shot / _1shot with every rollout group
+    # persona-consistent, which needs per-prompt persona metadata that
+    # generate_rollouts does not yet carry.
+    system_persona: str = "minimal_format"
                                              # every eval/probe used
 
     # ── in-flight visibility ─────────────────────────────────────────

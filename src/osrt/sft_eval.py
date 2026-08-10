@@ -21,7 +21,11 @@ import torch
 import torch.nn as nn
 
 from osrt.rewards import extract_gsm8k_answer, extract_numeric_answer
-from osrt.system_prompts import get_by_name, sample_system_prompt
+from osrt.system_prompts import (
+    DEFAULT_EVAL_OFF,
+    DEFAULT_EVAL_ON,
+    get_by_name,
+)
 
 # cache the held-out GSM8K eval batch (prompts + gold) once per process
 _GSM8K_CACHE: list[tuple[str, str]] | None = None
@@ -139,20 +143,20 @@ def run_reasoning_eval(
 
     Returns a wandb-loggable dict. Switches the model to eval mode and restores it.
     """
-    import random
     was_training = model.training
     model.train(False)
 
     # fixed personas for a clean A/B (not sampled — we want the contrast to be
     # the reasoning instruction, not noise across personas)
-    if on_persona:
-        on_name, on_sys = on_persona, get_by_name(on_persona)
-    else:
-        on_name, on_sys = sample_system_prompt(random.Random(seed), "on")
-    if off_persona:
-        off_name, off_sys = off_persona, get_by_name(off_persona)
-    else:
-        off_name, off_sys = sample_system_prompt(random.Random(seed), "off")
+    # PINNED BY NAME, not sampled. The historical default was
+    # `Random(seed).choice(pool)`, whose result depends on POOL LENGTH — adding
+    # word_problem_verify_0shot took REASONING_ON from 13 to 14 and moved it
+    # from instruction_strict to general_default, which would have silently
+    # rebased every recorded acc_on/acc_off number. Resolving by name makes the
+    # historical panel reproducible regardless of how the pools grow.
+    on_name = on_persona or DEFAULT_EVAL_ON
+    off_name = off_persona or DEFAULT_EVAL_OFF
+    on_sys, off_sys = get_by_name(on_name), get_by_name(off_name)
 
     problems = _load_gsm8k_heldout(n_problems, problem_offset)
     stats = {"on": {"correct": 0, "len": 0, "fmt": 0},

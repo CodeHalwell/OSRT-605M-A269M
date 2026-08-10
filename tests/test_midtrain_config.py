@@ -139,7 +139,7 @@ def test_reasoning_pools_split():
     # pool can silently rebase every recorded number. The count is kept as a
     # tripwire, but the load-bearing assertion is that the pinned eval personas
     # do not move.
-    assert len(REASONING_ON) == 13   # +word_problem_verify_1shot (2026-08-10)
+    assert len(REASONING_ON) == 14   # +word_problem_verify_0shot/1shot (2026-08-10)
     assert len(REASONING_OFF) >= 6
     assert SYSTEM_PROMPTS is REASONING_ON  # back-compat
     import random
@@ -172,12 +172,21 @@ def test_pinned_eval_personas_do_not_drift():
     )
     assert DEFAULT_EVAL_ON == "instruction_strict"
     assert DEFAULT_EVAL_OFF == "instruction_direct"
-    assert sample_system_prompt(random.Random(0), "on")[0] == DEFAULT_EVAL_ON
-    assert sample_system_prompt(random.Random(0), "off")[0] == DEFAULT_EVAL_OFF
     names_on = {n for n, _ in REASONING_ON}
     names_off = {n for n, _ in REASONING_OFF}
     assert DEFAULT_EVAL_ON in names_on
     assert DEFAULT_EVAL_OFF in names_off
+    # The eval must NOT depend on Random(seed).choice — that resolution moved
+    # from instruction_strict to general_default the moment the pool went from
+    # 13 to 14 entries, which would have rebased every recorded number. This
+    # asserts the sampled value is now IRRELEVANT to the eval by showing it has
+    # in fact diverged from the pinned default, so anyone reintroducing
+    # sampling here fails loudly.
+    sampled = sample_system_prompt(random.Random(0), "on")[0]
+    assert sampled != DEFAULT_EVAL_ON, (
+        "sampling coincidentally matches the pin again — re-check that "
+        "run_reasoning_eval still resolves personas BY NAME"
+    )
 
 
 def test_few_shot_exemplars_cover_only_shot_personas():
@@ -187,12 +196,42 @@ def test_few_shot_exemplars_cover_only_shot_personas():
     assert "minimal_format" not in FEW_SHOT_EXEMPLARS
     assert "instruction_strict" not in FEW_SHOT_EXEMPLARS
     assert "word_problem_verify_1shot" in FEW_SHOT_EXEMPLARS
+    # the 0-shot twin must NEVER be registered — it has no demonstration, so an
+    # echo penalty against it is meaningless
+    assert "word_problem_verify_0shot" not in FEW_SHOT_EXEMPLARS
     for name, ex in FEW_SHOT_EXEMPLARS.items():
         assert ex.strip(), f"{name} registered an empty exemplar"
         assert "shot" in name, f"{name} has an exemplar but no 'shot' in its name"
-    # every registered exemplar must belong to a real persona
+        # the exemplar must be the DEMONSTRATION only, never the instructions
+        assert "Do not repeat" not in ex, (
+            f"{name}'s exemplar swallowed an instruction; a model quoting its "
+            f"own instructions would be penalised"
+        )
     names = {n for n, _ in REASONING_ON}
-    assert set(FEW_SHOT_EXEMPLARS) <= names | {n for n, _ in REASONING_ON}
+    assert set(FEW_SHOT_EXEMPLARS) <= names
+
+
+def test_verify_personas_are_matched_pairs():
+    """0-shot and 1-shot must differ ONLY by the demonstration."""
+    from osrt.system_prompts import (
+        VERIFY_EXEMPLAR_ANCHORS,
+        FEW_SHOT_EXEMPLARS,
+        get_by_name,
+    )
+    zero = get_by_name("word_problem_verify_0shot")
+    one = get_by_name("word_problem_verify_1shot")
+    assert one.startswith(zero), (
+        "instructions differ between the pair, so a 0-shot vs 1-shot "
+        "comparison would confound 'has an exemplar' with 'has different "
+        "instructions'"
+    )
+    assert FEW_SHOT_EXEMPLARS["word_problem_verify_1shot"] in one
+    assert FEW_SHOT_EXEMPLARS["word_problem_verify_1shot"] not in zero
+    # anchors exist only in the 1-shot prompt; that asymmetry is what makes a
+    # numeric-anchoring comparison possible
+    for a in VERIFY_EXEMPLAR_ANCHORS:
+        assert a in one
+    assert not any(a in zero for a in ("500", "625", "1.25"))
 
 
 def test_few_shot_echo_penalty_catches_copying_not_idiom():
