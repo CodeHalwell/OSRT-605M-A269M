@@ -1283,6 +1283,70 @@ def run_pull_artifacts(names_csv: str):
 @app.function(
     image=image,
     volumes={"/vol/checkpoints": vol},
+    timeout=1800,
+)
+def ckpt_drift(a: str, b: str) -> dict:
+    """Relative weight-space distance ||b-a|| / ||a||, overall and per group.
+
+    Separates two explanations for flat GRPO accuracy that scalars cannot: has
+    the policy barely MOVED (learning rate / step count too small to matter), or
+    has it moved plenty and simply learnt the wrong thing? Analytically an AdamW
+    update is ~lr per parameter, so 290 steps at 1.3e-6 bounds the drift at
+    ~3.8e-4 absolute — but that assumes perfectly coherent gradients, and real
+    ones partly cancel. Only measurement settles where in that range we are.
+    """
+    import torch
+
+    d = "/vol/checkpoints/v5"
+    sa = torch.load(f"{d}/{a}", map_location="cpu", weights_only=True)
+    sb = torch.load(f"{d}/{b}", map_location="cpu", weights_only=True)
+    sa = sa.get("model_state_dict", sa)
+    sb = sb.get("model_state_dict", sb)
+
+    def bucket(name: str) -> str:
+        if "adapters_a" in name or "adapters_b" in name:
+            return "HRA adapters"
+        if "expert" in name or "moe" in name.lower():
+            return "MoE experts"
+        if "embed" in name or "lm_head" in name:
+            return "embeddings"
+        if "norm" in name:
+            return "norms"
+        return "attention/other"
+
+    groups: dict[str, list[float]] = {}
+    tot_d = tot_a = 0.0
+    biggest: list[tuple[float, str]] = []
+    for k, va in sa.items():
+        vb = sb.get(k)
+        if vb is None or va.shape != vb.shape or not va.is_floating_point():
+            continue
+        fa, fb = va.float(), vb.float()
+        dn = torch.linalg.vector_norm(fb - fa).item()
+        an = torch.linalg.vector_norm(fa).item()
+        tot_d += dn ** 2
+        tot_a += an ** 2
+        if an > 0:
+            groups.setdefault(bucket(k), []).append(dn / an)
+            biggest.append((dn / an, k))
+
+    print(f"drift {a} -> {b}", flush=True)
+    print(f"  OVERALL relative L2: {tot_d**0.5 / tot_a**0.5:.6f}"
+          f"  ({100 * tot_d**0.5 / tot_a**0.5:.4f}% of weight norm)", flush=True)
+    for g, vals in sorted(groups.items()):
+        vals.sort()
+        print(f"  {g:<16} n={len(vals):>4}  median {vals[len(vals)//2]:.6f}"
+              f"  max {vals[-1]:.6f}", flush=True)
+    biggest.sort(reverse=True)
+    print("  most-moved tensors:", flush=True)
+    for r, k in biggest[:5]:
+        print(f"    {r:.6f}  {k}", flush=True)
+    return {"overall": tot_d**0.5 / tot_a**0.5}
+
+
+@app.function(
+    image=image,
+    volumes={"/vol/checkpoints": vol},
     timeout=3600,
 )
 def make_soup(
@@ -1836,14 +1900,33 @@ def run_make_soup(prefix: str = "osrt_v5_sft_v4",
 
 
 @app.local_entrypoint()
+def run_ckpt_drift(a: str, b: str):
+    """How far did the weights actually MOVE between two checkpoints?"""
+    ckpt_drift.remote(a=a, b=b)
+
+
+@app.local_entrypoint()
 def run_sft_eval_sweep(prefix: str = "osrt_v5_sft_v4", steps: str = "",
                        n: int = 200, names_csv: str = "",
-                       on_persona: str = "", off_persona: str = ""):
+                       on_persona: str = "", off_persona: str = "",
+                       spawn: bool = False):
     """Score checkpoints by GSM8K accuracy. names_csv overrides discovery.
 
     on_persona/off_persona pin the system prompt (e.g. minimal_format, the one
     GRPO trains on); empty keeps the historical default.
+
+    `--spawn` (with `modal run --detach`) fires and forgets instead of blocking.
+    A sweep is 30+ minutes, and `.remote()` ties it to the local client: one
+    transient DNS failure here killed a sweep 15 minutes in, and a second run
+    took a cancellation signal for reasons never established. Read results from
+    `modal app logs <app-id>` afterwards.
     """
+    if spawn:
+        call = sft_eval_sweep.spawn(
+            prefix=prefix, steps=steps, n=n, names_csv=names_csv,
+            on_persona=on_persona, off_persona=off_persona)
+        print(f"spawned sweep, call id {call.object_id}")
+        return
     sft_eval_sweep.remote(prefix=prefix, steps=steps, n=n,
                           names_csv=names_csv, on_persona=on_persona,
                           off_persona=off_persona)

@@ -2728,9 +2728,36 @@ class GRPOv6Config(GRPOConfig):
     # 43.8% -> 25.0%, and the resulting checkpoint was archived as
     # osrt_v5_grpo_step_800_overconstrained.pt. This is a FRESH run from a
     # fresh SFT base, so use the value that actually worked.
-    kl_coeff: float = 0.15
+    #
+    # 2026-08-10: 0.15 -> 0.04, as a MATCHED pair with the temperature fix in
+    # grpo_train._seq_logprobs. Rationale: log-probs are now computed on the
+    # T=0.4 distribution, which scales the policy term by ~1/T while the KL
+    # approximation (~½·log_ratio² for small ratios) scales by ~1/T², so
+    # holding beta constant would make the anchor ~1/T = 2.5x stronger
+    # RELATIVE to the corrected policy gradient. Preserving the previous
+    # balance implies beta_new ~ beta_old x T = 0.06; 0.04 is the DeepSeekMath
+    # GRPO figure (arXiv 2402.03300) and sits just below that, deliberately
+    # conservative. NOTE: 0.04 is *not* TRL's default — TRL 0.24 (the version
+    # this repo locks) defaults beta to 0.0 and skips loading a reference model
+    # entirely.
+    kl_coeff: float = 0.04
+
+    # ── sampling: top_p 1.0, matching TRL ────────────────────────────
+    # Inherited 0.95 leaves a residual score-function mismatch that the
+    # temperature fix does NOT close: nucleus sampling truncates and
+    # RENORMALISES, so rollouts come from pi_{T,top-p} while _seq_logprobs
+    # scores them under the untruncated pi_T. TRL's default is 1.0, which is
+    # why upstream never hits this. The clean fix is to stop truncating rather
+    # than implement differentiable nucleus-masked log-probs; at T=0.4 the
+    # distribution is already sharp, so the behavioural cost is small.
+    top_p: float = 1.0
 
     # ── anti-hacking (inherited defaults, restated for visibility) ───
+    # WARNING: this flag is currently INERT on the grpo_train path —
+    # compute_reward() has no such parameter, so nothing consumes it and
+    # extract_numeric_answer_strict() is never called. The "verified LOSSLESS"
+    # note below was measured on the SFT soup; the policy has drifted since, so
+    # re-probe rather than assume before relying on it.
     strict_answer_extraction: bool = True   # verified LOSSLESS: strict==loose
                                             # at 18.0%, 0.0% ambiguous
     # ── SYSTEM PROMPT — load-bearing, not cosmetic ───────────────────
@@ -2758,8 +2785,15 @@ class GRPOv6Config(GRPOConfig):
     heldout_eval_interval: int = 50
     heldout_eval_n: int = 50
 
-    stage_prefix: str = "grpo_v6"
-    wandb_run_name: str = "osrt-v6-grpo"
+    # ── fresh lineage, so a restart cannot silently resume the old run ─
+    # _latest_local() scans --ckpt-dir for <stage_prefix>_step_*.pt, so keeping
+    # "grpo_v6" would let a soup restart pick up grpo_v6_step_400.pt instead —
+    # defeating the restart and overwriting forensic checkpoints. The wave-2
+    # artefacts (steps 100-400) were trained with a mis-specified score function
+    # (log-probs at T=1 while sampling at T=0.4) and are diagnostic ONLY; they
+    # must never be a parent checkpoint.
+    stage_prefix: str = "grpo_v6b"
+    wandb_run_name: str = "osrt-v6-grpo-b"
 
 
 class GRPOv6SanityConfig(GRPOv6Config):

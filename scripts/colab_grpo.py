@@ -146,7 +146,16 @@ def main() -> int:  # noqa: PLR0915
             args.hf_repo or "HallD/osrt-v6-ckpt", args.base_ckpt,
             repo_type="model"))
     rck = torch.load(base_for_ref, map_location=device, weights_only=True)
-    ref_model.load_state_dict(rck.get("model_state_dict", rck), strict=False)
+    # ASSERT like the policy load does. strict=False silently tolerates a key
+    # mismatch, which would leave part of the reference randomly initialised —
+    # the KL term would then penalise divergence from noise, inflating KL and
+    # injecting a meaningless gradient, with nothing in the logs to show it.
+    r_missing, r_unexpected = ref_model.load_state_dict(
+        rck.get("model_state_dict", rck), strict=False)
+    assert not r_missing and not r_unexpected, (
+        f"reference state mismatch: missing={r_missing[:3]} "
+        f"unexpected={r_unexpected[:3]}"
+    )
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad_(False)
@@ -164,6 +173,26 @@ def main() -> int:  # noqa: PLR0915
          {"params": hra_params, "lr": cfg.hra_lr}],
         weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
     )
+    # Restore AdamW moments if a matching sidecar exists, so re-running the cell
+    # does not silently restart with cold moments (~20-step rebuild at
+    # beta2=0.95). Only accept it if it belongs to the step we resumed from.
+    opt_path = ckpt_dir / f"{cfg.stage_prefix}_optim.pt"
+    if start_step > 0 and opt_path.exists():
+        try:
+            ock = torch.load(opt_path, map_location=device, weights_only=False)
+            if int(ock.get("step", -1)) == start_step:
+                optimizer.load_state_dict(ock["optimizer_state_dict"])
+                print(f"restored optimizer state from step {start_step}", flush=True)
+            else:
+                print(f"optimizer sidecar is step {ock.get('step')}, "
+                      f"resuming at {start_step} — NOT loading (cold moments)",
+                      flush=True)
+            del ock
+        except Exception as e:  # noqa: BLE001 — cold moments beat a dead run
+            print(f"optimizer restore failed ({type(e).__name__}: {e}); "
+                  f"continuing with cold moments", flush=True)
+    elif start_step > 0:
+        print("no optimizer sidecar — resuming with COLD moments", flush=True)
 
     # GRADIENT CHECKPOINTING — required, not optional. `use_ckpt` in
     # OSRTModel.forward is `self._osrt_grad_ckpt and self.training`, so it
@@ -191,7 +220,26 @@ def main() -> int:  # noqa: PLR0915
 
     # ── prompts (pre-built, unseen, with numeric gold) ────────────────────
     prompts_all = [json.loads(line) for line in open(args.prompts)]
-    print(f"{len(prompts_all)} prompts from {args.prompts}", flush=True)
+    # HARD FAIL on invalid gold — deterministic data validation, not a tunable.
+    # An empty/whitespace gold makes compute_reward return the
+    # `no_ground_truth` tier (0.0 correctness), so EVERY rollout on that prompt
+    # scores format-only (+0.20 observed at step 310) regardless of what it
+    # answers: a pure format-training group with no correctness signal. The
+    # builder's `gold is not None` guard does not catch it, and validating only
+    # in the builder would let an older or hand-made prompt file silently
+    # reintroduce it here.
+    bad = [i for i, p in enumerate(prompts_all)
+           if not str(p.get("answer", "")).strip()
+           or not str(p.get("question", "")).strip()]
+    if bad:
+        raise ValueError(
+            f"{len(bad)} of {len(prompts_all)} prompts in {args.prompts} have an "
+            f"empty question or gold answer (first offending lines: "
+            f"{[i + 1 for i in bad[:5]]}). Rebuild the prompt file; these "
+            f"contribute zero correctness signal and train format only."
+        )
+    print(f"{len(prompts_all)} prompts from {args.prompts} (gold validated)",
+          flush=True)
     rng = random.Random(1234 + start_step)
     sys_text = get_by_name(cfg.system_persona) if cfg.system_persona else ""
     end_ans = tok.encode(cfg.answer_close, add_special_tokens=False)[0]
@@ -278,6 +326,16 @@ def main() -> int:  # noqa: PLR0915
             out = ckpt_dir / f"{cfg.stage_prefix}_step_{step}.pt"
             torch.save({"step": step, "model_state_dict": model.state_dict()}, out)
             print(f"  -> saved {out.name}", flush=True)
+            # Optimizer state goes to a SEPARATE, LOCAL-ONLY file. AdamW moments
+            # for 601M params are ~4.8GB, so pushing them every 10 steps would
+            # cost more upload time than the step itself; but losing them resets
+            # both moments on resume and at beta2=0.95 that is a ~20-step
+            # rebuild, i.e. a fresh discontinuity every Colab session boundary.
+            # Keeping them on disk covers re-running the cell in a LIVE session;
+            # --opt-state-interval controls the (optional) durable copy.
+            opt_out = ckpt_dir / f"{cfg.stage_prefix}_optim.pt"
+            torch.save({"step": step, "optimizer_state_dict": optimizer.state_dict()},
+                       opt_out)
             if args.hf_repo:
                 try:
                     from huggingface_hub import HfApi

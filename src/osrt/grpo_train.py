@@ -93,15 +93,33 @@ def _seq_logprobs(
     seq_lens: list[int],
     real_vocab_size: int,
     grad: bool,
+    temperature: float = 1.0,
 ) -> list[Tensor]:
     """Per-sequence token log-probs over the COMPLETION span only.
 
     Right padding is safe here: causal attention means a real token never
     attends to the pad tail, so its logits match an unpadded forward.
+
+    TEMPERATURE MUST MATCH SAMPLING. Rollouts are drawn from pi(a)^(1/T) with
+    T=0.4, so the score function the policy gradient needs is grad log pi_T,
+    not grad log pi. Computing log-probs at T=1 while sampling at T=0.4 makes
+    the gradient a biased, roughly 1/T-attenuated estimate of the wrong
+    distribution's score. TRL does exactly this division in its GRPO log-prob
+    path (trl/trainer/grpo_trainer.py: "Divide logits by sampling temperature",
+    logits = logits / self.temperature) and it is applied to the policy AND the
+    reference, so the KL compares like with like.
+
+    Omitting it was measured to matter here: with T=0.4 the policy term was
+    ~2.5x under-scaled, stacking with peak_lr 1.5e-6 (base weights moved 0.058%
+    in 180 steps) and kl_coeff 0.15 (the KL term averaged 40% of the policy
+    term's magnitude, opposing it) to leave GRPO with no detectable effect on
+    held-out accuracy across 280 steps.
     """
     ctx = torch.enable_grad() if grad else torch.no_grad()
     with ctx, torch.amp.autocast("cuda", dtype=torch.bfloat16):
         logits = model(batch_ids).logits[:, :, :real_vocab_size].float()
+    if temperature != 1.0:
+        logits = logits / temperature
     out: list[Tensor] = []
     for i, (p_len, s_len) in enumerate(zip(prompt_lens, seq_lens)):
         # predict token t from position t-1
@@ -205,16 +223,20 @@ def train_on_rollouts(
     Returns (summed loss value, mean approx_kl). Backward is called per
     micro-batch; the caller owns optimizer.step().
     """
-    live = [r for r in rollouts if abs(r.advantage) > 1e-8
-            and len(r.ids) - r.prompt_len > 0]
-    if not live:
+    # KL on EVERY usable rollout; policy loss only where the advantage is
+    # non-zero. Previously zero-advantage rollouts were dropped before BOTH
+    # terms, so they were unanchored — TRL keeps them in the batch precisely so
+    # beta*KL still applies. The distinction grows if a correctness clamp is
+    # added, since that zeroes many more advantages.
+    usable = [r for r in rollouts if len(r.ids) - r.prompt_len > 0]
+    if not usable:
         return 0.0, 0.0
 
     total_loss = 0.0
     total_kl = 0.0
-    n = len(live)
+    n = len(usable)
     # Longest-first keeps padding waste down within each micro-batch.
-    live.sort(key=lambda r: len(r.ids), reverse=True)
+    live = sorted(usable, key=lambda r: len(r.ids), reverse=True)
 
     for i in range(0, n, micro_batch):
         chunk = live[i:i + micro_batch]
@@ -226,17 +248,24 @@ def train_on_rollouts(
         p_lens = [r.prompt_len for r in chunk]
         s_lens = [len(r.ids) for r in chunk]
 
-        pol = _seq_logprobs(model, batch, p_lens, s_lens, real_vocab_size, True)
-        ref = _seq_logprobs(ref_model, batch, p_lens, s_lens, real_vocab_size, False)
+        # Same temperature for BOTH, or the KL compares two different
+        # distributions and the penalty becomes meaningless.
+        temp = getattr(cfg, "temperature", 1.0) or 1.0
+        pol = _seq_logprobs(model, batch, p_lens, s_lens, real_vocab_size, True,
+                            temperature=temp)
+        ref = _seq_logprobs(ref_model, batch, p_lens, s_lens, real_vocab_size, False,
+                            temperature=temp)
 
         loss = torch.zeros((), device=device)
         for lp, rlp, r in zip(pol, ref, chunk):
-            adv = torch.tensor(r.advantage, device=device, dtype=torch.float32)
-            policy_loss = -(lp * adv).mean()
             log_ratio = rlp.detach() - lp
             approx_kl = (torch.exp(log_ratio) - log_ratio - 1).mean()
-            loss = loss + (policy_loss + cfg.kl_coeff * approx_kl)
+            loss = loss + cfg.kl_coeff * approx_kl      # anchors EVERY rollout
             total_kl += float(approx_kl.detach())
+            if abs(r.advantage) > 1e-8:                 # policy term only here
+                adv = torch.tensor(r.advantage, device=device,
+                                   dtype=torch.float32)
+                loss = loss + -(lp * adv).mean()
         loss = loss / n          # mean over ALL live rollouts in the step
         loss.backward()
         total_loss += float(loss.detach())
