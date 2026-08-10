@@ -210,6 +210,53 @@ def generate_rollouts(
     return groups
 
 
+def ema_init(model: nn.Module) -> dict[str, Tensor]:
+    """FP32 shadow of the FULL persistent state_dict, for a passive weight EMA.
+
+    Averages EVERY entry, not just parameters. OSRT carries 8 persistent
+    float32 buffers that are mutated during training and read at eval time —
+    `router_balance_bias` (6 loops x 8 experts, per block, the aux-loss-free
+    load balancer) and `gumbel_tau` — plus the constant rope tables. Averaging
+    parameters while pairing them with the LATEST router bias would produce a
+    hybrid model, not an averaged policy. The model has zero non-floating
+    state_dict entries, so covering every floating tensor covers all 229 keys
+    and the shadow stays a complete, strictly-loadable state_dict.
+
+    FP32 deliberately: at decay 0.99 each update contributes 1% of a weight,
+    which bf16 (8 mantissa bits) cannot accumulate reliably.
+    """
+    return {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+
+
+def ema_update(ema: dict[str, Tensor], model: nn.Module, decay: float) -> None:
+    """In-place `ema = decay*ema + (1-decay)*live`. Does NOT touch the model.
+
+    Call AFTER a successful optimizer.step(). Purely an observer: it reads the
+    live state_dict and writes only into `ema`, so the theta trajectory — and
+    therefore the interpretability of the run — is unchanged.
+    """
+    with torch.no_grad():
+        live = model.state_dict()
+        missing = set(ema) - set(live)
+        if missing:
+            raise KeyError(f"EMA shadow has keys absent from the model: "
+                           f"{sorted(missing)[:3]}")
+        for k, e in ema.items():
+            e.mul_(decay).add_(live[k].detach().float(), alpha=1.0 - decay)
+
+
+def ema_weight_of_init(decay: float, updates: int) -> float:
+    """Residual weight on the INITIAL weights after `updates` steps.
+
+    Read this before crediting an early EMA win: at decay 0.99 and 50 updates
+    the shadow is still 0.99^50 = 61% the starting checkpoint. When training
+    starts from a stronger base (the SFT-v4 soup at 20.0% acc_on), an early EMA
+    advantage may only mean "stayed closer to the base", not "averaging helped".
+    Compare against the base AND the post-hoc soup, not just against theta.
+    """
+    return decay ** max(updates, 0)
+
+
 def dump_rollouts(
     path: str,
     groups: list[list[Rollout]],

@@ -42,6 +42,9 @@ import torch  # noqa: E402
 
 from osrt.grpo_train import (  # noqa: E402
     dump_rollouts,
+    ema_init,
+    ema_update,
+    ema_weight_of_init,
     generate_rollouts,
     lr_at_step,
     train_on_rollouts,
@@ -79,6 +82,17 @@ def main() -> int:  # noqa: PLR0915
     ap.add_argument("--micro-batch", type=int, default=4,
                     help="sequences per log-prob forward")
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--ema-decay", type=float, default=0.99,
+                    help="passive weight-EMA decay (0 disables). 0.99 gives a "
+                         "~100-step memory, right for a ~900-step run; 0.999 "
+                         "would average over longer than the run. The shadow "
+                         "NEVER generates rollouts and is never loaded into the "
+                         "training model, so it cannot affect the theta path.")
+    ap.add_argument("--ema-push-interval", type=int, default=50,
+                    help="push the EMA sidecar to HF this often. The fp32 "
+                         "shadow is 2.4GB, so pushing it every ckpt-interval "
+                         "would cost more upload than the steps themselves; the "
+                         "local copy is refreshed every interval for resume.")
     # ── speed levers ─────────────────────────────────────────────────
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the policy. Helps BOTH generation and "
@@ -172,6 +186,31 @@ def main() -> int:  # noqa: PLR0915
                   if "adapters_a" in n or "adapters_b" in n]
     hra_ids = {id(p) for p in hra_params}
     base_params = [p for p in model.parameters() if id(p) not in hra_ids]
+    # ── passive weight EMA (see grpo_train.ema_init for why full state_dict) ──
+    ema_state, ema_updates = None, 0
+    ema_path = ckpt_dir / f"{cfg.stage_prefix}_ema.pt"
+    if args.ema_decay > 0:
+        ema_state = ema_init(model)
+        if start_step > 0 and ema_path.exists():
+            eck = torch.load(ema_path, map_location=device, weights_only=False)
+            if int(eck.get("source_step", -1)) == start_step and \
+                    float(eck.get("ema_decay", -1)) == args.ema_decay:
+                got = eck["model_state_dict"]
+                assert set(got) == set(ema_state), "EMA sidecar key mismatch"
+                for k in ema_state:
+                    ema_state[k].copy_(got[k].float())
+                ema_updates = int(eck.get("ema_updates", 0))
+                print(f"restored EMA (decay {args.ema_decay}, "
+                      f"{ema_updates} updates) from step {start_step}", flush=True)
+            else:
+                print(f"EMA sidecar is step {eck.get('source_step')}/decay "
+                      f"{eck.get('ema_decay')}, resuming at {start_step}/"
+                      f"{args.ema_decay} — RESETTING shadow to current weights",
+                      flush=True)
+            del eck
+        print(f"weight EMA: decay {args.ema_decay}, {len(ema_state)} tensors, "
+              f"fp32 shadow (passive; never samples, never trains)", flush=True)
+
     print(f"full-parameter GRPO: {sum(p.numel() for p in base_params):,} base "
           f"+ {sum(p.numel() for p in hra_params):,} HRA", flush=True)
     optimizer = torch.optim.AdamW(
@@ -300,6 +339,9 @@ def main() -> int:  # noqa: PLR0915
         )
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
+        if ema_state is not None:          # AFTER the step, observer only
+            ema_update(ema_state, model, args.ema_decay)
+            ema_updates += 1
 
         if step % cfg.log_interval == 0 or step == start_step:
             rewards = [r.reward for r in flat]
@@ -349,6 +391,34 @@ def main() -> int:  # noqa: PLR0915
             opt_out = ckpt_dir / f"{cfg.stage_prefix}_optim.pt"
             torch.save({"step": step, "optimizer_state_dict": optimizer.state_dict()},
                        opt_out)
+            if ema_state is not None:
+                # Complete, strictly-loadable state_dict (all 229 keys), so the
+                # eval path can load it into a SEPARATE model. Never loaded into
+                # the compiled training model.
+                torch.save({"step": step, "source_step": step,
+                            "ema_decay": args.ema_decay,
+                            "ema_updates": ema_updates,
+                            "model_state_dict": ema_state}, ema_path)
+                w0 = ema_weight_of_init(args.ema_decay, ema_updates)
+                print(f"  -> saved EMA sidecar ({ema_updates} updates, "
+                      f"{w0:.1%} residual weight on the base)", flush=True)
+                if args.hf_repo and step % args.ema_push_interval == 0:
+                    named = ckpt_dir / f"{cfg.stage_prefix}_ema_step_{step}.pt"
+                    torch.save({"step": step, "source_step": step,
+                                "ema_decay": args.ema_decay,
+                                "ema_updates": ema_updates,
+                                "model_state_dict": ema_state}, named)
+                    try:
+                        from huggingface_hub import HfApi
+                        HfApi().upload_file(
+                            path_or_fileobj=str(named), path_in_repo=named.name,
+                            repo_id=args.hf_repo, repo_type="model",
+                            commit_message=f"grpo EMA step {step}")
+                        print(f"  -> pushed {named.name}", flush=True)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"  EMA push failed ({type(e).__name__}: {e})",
+                              flush=True)
+                    named.unlink(missing_ok=True)
             if args.hf_repo:
                 try:
                     from huggingface_hub import HfApi
