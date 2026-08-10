@@ -1436,8 +1436,18 @@ def grpo_diag_batch(
     },
     timeout=5400,
 )
-def grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8) -> int:
-    """Run scripts/grpo_grad_diag.py on a cached batch. No optimizer step."""
+def grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8,
+                   temperature: float = 0.0, kl_coeff: float = -1.0,
+                   alt_temperature: float = 0.0,
+                   alt_kl_coeff: float = -1.0) -> int:
+    """Run scripts/grpo_grad_diag.py on a cached batch. No optimizer step.
+
+    temperature/kl_coeff override the SCORING config, so the same cached batch
+    can be scored under the corrected v6b objective (T=0.4, beta=0.04) and under
+    the HISTORICAL wave-2 objective (T=1.0, beta=0.15) — measured rather than
+    extrapolated, since changing beta at the corrected temperature describes a
+    configuration that was never trained.
+    """
     import subprocess
     return subprocess.call([
         "python", "/root/scripts/grpo_grad_diag.py",
@@ -1447,6 +1457,10 @@ def grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8) -> int:
         "--base-ckpt",
         "/vol/checkpoints/v5/osrt_v5_sft_v4_soup_1200_1400_1600_1800.pt",
         "--micro-batch", str(micro_batch),
+        "--temperature", str(temperature),
+        "--kl-coeff", str(kl_coeff),
+        "--alt-temperature", str(alt_temperature),
+        "--alt-kl-coeff", str(alt_kl_coeff),
     ])
 
 
@@ -2085,10 +2099,15 @@ def run_grpo_diag_batch(ckpt_name: str = "grpo_v6_step_390.pt",
 
 
 @app.local_entrypoint()
-def run_grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8):
+def run_grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8,
+                       temperature: float = 0.0, kl_coeff: float = -1.0,
+                       alt_temperature: float = 0.0,
+                       alt_kl_coeff: float = -1.0):
     """Unclamped/clamped policy and KL gradient norms + cosines on a dump."""
     grpo_grad_diag.remote(ckpt_name=ckpt_name, dump_name=dump_name,
-                          micro_batch=micro_batch)
+                          micro_batch=micro_batch, temperature=temperature,
+                          kl_coeff=kl_coeff, alt_temperature=alt_temperature,
+                          alt_kl_coeff=alt_kl_coeff)
 
 
 @app.local_entrypoint()

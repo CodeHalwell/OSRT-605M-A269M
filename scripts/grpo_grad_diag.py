@@ -159,11 +159,32 @@ def main() -> int:
     ap.add_argument("--base-ckpt",
                     default="osrt_v5_sft_v4_soup_1200_1400_1600_1800.pt")
     ap.add_argument("--micro-batch", type=int, default=8)
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="override the SCORING temperature (0 = use cfg). Set "
+                         "1.0 to reproduce the HISTORICAL wave-2 objective, "
+                         "which sampled at 0.4 but scored log-probs at 1.0.")
+    ap.add_argument("--alt-temperature", type=float, default=0.0,
+                    help="ALSO score under this temperature and report "
+                         "CROSS-CONFIG cosines. Clipping is a scalar, so it "
+                         "cannot change a cosine — this answers how MISDIRECTED "
+                         "one objective's update is relative to the other's, "
+                         "which norms and clip coefficients cannot.")
+    ap.add_argument("--alt-kl-coeff", type=float, default=-1.0,
+                    help="beta for the --alt-temperature comparison run.")
+    ap.add_argument("--kl-coeff", type=float, default=-1.0,
+                    help="override beta (<0 = use cfg). Combine with "
+                         "--temperature 1.0 --kl-coeff 0.15 to measure what "
+                         "wave 2 ACTUALLY optimised, rather than extrapolating "
+                         "a beta change at the corrected temperature.")
     args = ap.parse_args()
 
     assert torch.cuda.is_available(), "needs a GPU"
     device = torch.device("cuda")
     cfg = GRPOv6Config()
+    if args.temperature > 0:
+        cfg.temperature = args.temperature
+    if args.kl_coeff >= 0:
+        cfg.kl_coeff = args.kl_coeff
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
@@ -199,7 +220,7 @@ def main() -> int:
     n_roll = sum(len(g) for g in groups)
     print(f"replaying {len(groups)} groups / {n_roll} rollouts from {args.dump}")
     print(f"  dump meta: {meta}")
-    print(f"  kl_coeff={cfg.kl_coeff} temperature={cfg.temperature} "
+    print(f"  kl_coeff={cfg.kl_coeff} SCORING temperature={cfg.temperature} "
           f"micro_batch={args.micro_batch}\n")
 
     model.train()
@@ -241,6 +262,29 @@ def main() -> int:
         print(f"  ||beta*KL|| / ||policy_unclamped||  [{grp}] = "
               f"{nk[grp]/nu[grp]:.3f}" if nu[grp] > 0 else "")
 
+    # ── combined gradient: what the optimizer would actually see ───────
+    # policy and beta*KL are gradients of separate loss terms, so they ADD.
+    # Computed from the snapshots rather than a fourth backward pass.
+    print("\n── combined gradient (policy + beta*KL) ───────────────────")
+    import math
+    for label, pk in (("unclamped", "policy_unclamped"),
+                      ("clamped", "policy_clamped")):
+        gp, gk = runs[pk], runs["beta_kl"]
+        np_, nk = _norms(gp)["all"], _norms(gk)["all"]
+        dot = sum(float((gp[k] * gk[k]).sum()) for k in gp.keys() & gk.keys())
+        n_comb = (np_ ** 2 + nk ** 2 + 2 * dot) ** 0.5
+        # angle between the policy term and the combined update
+        cos_pc = (np_ ** 2 + dot) / (np_ * n_comb) if np_ * n_comb > 0 else float("nan")
+        ang = math.degrees(math.acos(max(-1.0, min(1.0, cos_pc))))
+        clip = min(1.0, cfg.grad_clip / n_comb) if n_comb > 0 else 1.0
+        print(f"  {label:<10} ||policy|| {np_:.4f}  ||beta*KL|| {nk:.4f}  "
+              f"||combined|| {n_comb:.4f}")
+        print(f"  {'':<10} KL rotates the update {ang:.1f} deg off the policy "
+              f"direction; clip coef (max_norm {cfg.grad_clip}) = {clip:.4f}")
+    print("  NOTE: raw-gradient geometry only. Translating this into parameter"
+          "\n  movement needs optimizer-state replay — global clipping and"
+          "\n  Adam's per-parameter preconditioning both intervene.")
+
     print("\n── cosines ────────────────────────────────────────────────")
     for grp in ("all", "base", "hra"):
         print(f"  [{grp}] unclamped <-> clamped        "
@@ -249,8 +293,45 @@ def main() -> int:
               f"{_cosine(runs['policy_unclamped'], runs['beta_kl'], grp):+.4f}")
         print(f"  [{grp}] clamped   <-> beta*KL        "
               f"{_cosine(runs['policy_clamped'], runs['beta_kl'], grp):+.4f}")
-    print("\nNegative policy<->KL cosine = the anchor opposes the objective;")
-    print("magnitude ratio says by how much. NO optimizer step was taken.")
+    # ── cross-configuration comparison ─────────────────────────────────
+    if args.alt_temperature > 0:
+        alt_t = args.alt_temperature
+        alt_b = args.alt_kl_coeff if args.alt_kl_coeff >= 0 else cfg.kl_coeff
+        prim_t, prim_b = cfg.temperature, cfg.kl_coeff
+        print(f"\n── cross-config: primary (T={prim_t}, b={prim_b}) vs "
+              f"alt (T={alt_t}, b={alt_b}) ──")
+        cfg.temperature, cfg.kl_coeff = alt_t, alt_b
+        model.zero_grad(set_to_none=True)
+        _backward_policy(model, ref, groups, cfg, mc.real_vocab_size, device,
+                         pad_id, args.micro_batch, clamp=False)
+        runs["alt_policy"] = _grad_snapshot(model)
+        model.zero_grad(set_to_none=True)
+        _backward_kl(model, ref, groups, cfg, mc.real_vocab_size, device,
+                     pad_id, args.micro_batch)
+        runs["alt_beta_kl"] = _grad_snapshot(model)
+        model.zero_grad(set_to_none=True)
+        cfg.temperature, cfg.kl_coeff = prim_t, prim_b
+
+        def _add(a, b):
+            return {k: a[k] + b[k] for k in a.keys() & b.keys()}
+
+        comb_p = _add(runs["policy_unclamped"], runs["beta_kl"])
+        comb_a = _add(runs["alt_policy"], runs["alt_beta_kl"])
+        for grp in ("all", "base", "hra"):
+            print(f"  [{grp}] cos(policy_alt,   policy_primary)   "
+                  f"{_cosine(runs['alt_policy'], runs['policy_unclamped'], grp):+.4f}")
+            print(f"  [{grp}] cos(combined_alt, combined_primary) "
+                  f"{_cosine(comb_a, comb_p, grp):+.4f}")
+            print(f"  [{grp}] cos(combined_alt, policy_primary)   "
+                  f"{_cosine(comb_a, runs['policy_unclamped'], grp):+.4f}"
+                  "   <- alignment of the ALT update with the PRIMARY objective")
+        print(f"  ||alt_policy|| {_norms(runs['alt_policy'])['all']:.4f}  "
+              f"||alt_combined|| {_norms(comb_a)['all']:.4f}  "
+              f"||primary_combined|| {_norms(comb_p)['all']:.4f}")
+
+    print("\nNegative policy<->KL cosine = the anchor opposes the objective.")
+    print("Cosines are clipping-invariant; norms are NOT what the optimizer")
+    print("receives once global clipping binds. NO optimizer step was taken.")
     return 0
 
 
