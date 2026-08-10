@@ -27,11 +27,25 @@ from osrt.system_prompts import get_by_name, sample_system_prompt
 _GSM8K_CACHE: list[tuple[str, str]] | None = None
 
 
-def _load_gsm8k_heldout(n: int) -> list[tuple[str, str]]:
-    """Return n (question, gold_answer) from GSM8K test split. Cached."""
+def _load_gsm8k_heldout(n: int, offset: int = 0) -> list[tuple[str, str]]:
+    """Return n (question, gold) from GSM8K test, skipping the first `offset`.
+
+    DEVELOPMENT PANEL vs CONFIRMATION SET. `offset=0, n=200` is the panel every
+    checkpoint of this project has been scored on. It is the right instrument
+    for checkpoint selection, diagnostics and reward design — and the wrong one
+    for a final claim, because selecting checkpoints and constructing soups
+    AFTER seeing those 200 outcomes imports selection optimism that no
+    per-item bootstrap over the same 200 items can price in.
+
+    GSM8K test holds 1319 problems, so `offset=200` yields ~1119 never-inspected
+    problems for a confirmation run with candidates and metrics declared in
+    advance. Keep the panel and the confirmation set disjoint; the moment the
+    confirmation set is used for selection it becomes another panel.
+    """
     global _GSM8K_CACHE
-    if _GSM8K_CACHE is not None and len(_GSM8K_CACHE) >= n:
-        return _GSM8K_CACHE[:n]
+    need = offset + n
+    if _GSM8K_CACHE is not None and len(_GSM8K_CACHE) >= need:
+        return _GSM8K_CACHE[offset:need]
     from datasets import load_dataset
     ds = load_dataset("openai/gsm8k", "main", split="test", streaming=True)
     out: list[tuple[str, str]] = []
@@ -40,10 +54,13 @@ def _load_gsm8k_heldout(n: int) -> list[tuple[str, str]]:
         if gold is None:
             continue
         out.append((row["question"], gold))
-        if len(out) >= n:
+        if len(out) >= need:
             break
     _GSM8K_CACHE = out
-    return out
+    if len(out) < need:
+        raise ValueError(f"GSM8K test yielded {len(out)} usable problems, "
+                         f"need offset({offset}) + n({n}) = {need}")
+    return out[offset:need]
 
 
 _WELL_FORMED = re.compile(
@@ -105,7 +122,7 @@ def run_reasoning_eval(
     n_problems: int = 50, max_new_tokens: int = 512, seed: int = 0,
     batch_size: int = 16, repetition_penalty: float = 1.0,
     on_persona: str = "", off_persona: str = "",
-    return_items: bool = False,
+    return_items: bool = False, problem_offset: int = 0,
 ) -> dict:
     """Reasoning-on vs -off accuracy on a held-out GSM8K slice.
 
@@ -137,7 +154,7 @@ def run_reasoning_eval(
     else:
         off_name, off_sys = sample_system_prompt(random.Random(seed), "off")
 
-    problems = _load_gsm8k_heldout(n_problems)
+    problems = _load_gsm8k_heldout(n_problems, problem_offset)
     stats = {"on": {"correct": 0, "len": 0, "fmt": 0},
              "off": {"correct": 0, "len": 0, "fmt": 0}}
     # PER-ITEM outcomes, indexed by problem. Aggregates alone cannot support a
@@ -185,6 +202,7 @@ def run_reasoning_eval(
         "sft_eval/format_ok_on": stats["on"]["fmt"] / n,
         "sft_eval/format_ok_off": stats["off"]["fmt"] / n,
         "sft_eval/n": n,
+        "sft_eval/problem_offset": problem_offset,
         "sft_eval/persona_on": on_name,
         "sft_eval/persona_off": off_name,
         # Only when asked: a plain list is not wandb-loggable, and callers that

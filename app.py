@@ -1299,6 +1299,158 @@ def run_pull_artifacts(names_csv: str):
 
 
 @app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=5400,
+)
+def grpo_diag_batch(
+    ckpt_name: str = "grpo_v6_step_390.pt",
+    num_prompts: int = 16,
+    seed: int = 4242,
+    max_gen_len: int = 768,
+    out_name: str = "",
+) -> str:
+    """Generate and PERSIST one seeded rollout batch — the missing producer.
+
+    grpo_grad_diag.py replays a dump but cannot create one; the only other
+    producer is --dump-rollouts inside the Colab training loop. This gives a
+    genuine late-wave policy sample on Modal, so the strict-vs-loose extraction
+    re-probe and the advantage-clamp gradient A/B both consume the SAME cached
+    batch. Byte-identity with what training actually saw is unnecessary — both
+    comparisons only require a common newly-cached batch.
+
+    Also builds the prompt file onto the volume if absent and HARD-FAILS on
+    invalid gold, so the diagnostic cannot silently run on rows that earn
+    format-only reward (the `no_ground_truth` tier, +0.20 observed at step 310).
+    """
+    import json
+    import os
+    import random
+
+    import torch
+
+    from osrt.grpo_train import dump_rollouts, generate_rollouts
+    from osrt.presets import build_config
+    from osrt.system_prompts import get_by_name
+    from osrt.train_config import GRPOv6Config
+
+    cfg = GRPOv6Config()
+    cfg.max_gen_len = max_gen_len
+    prompts_path = "/vol/rollouts/grpo_prompts.jsonl"
+
+    if not os.path.exists(prompts_path):
+        from datasets import load_dataset
+
+        from osrt.rewards import extract_numeric_answer
+        print("building prompt file (orca-math, skip 60k, target 6k)...",
+              flush=True)
+        ds = load_dataset("microsoft/orca-math-word-problems-200k",
+                          split="train", streaming=True).skip(60_000)
+        kept = []
+        for row in ds:
+            if len(kept) >= 6000:
+                break
+            q = (row.get("question") or "").strip()
+            gold = extract_numeric_answer(row.get("answer") or "")
+            if q and gold is not None and str(gold).strip():
+                kept.append({"question": q, "answer": str(gold).strip()})
+        with open(prompts_path, "w") as f:
+            for r in kept:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        rollouts_vol.commit()
+        print(f"wrote {len(kept)} prompts", flush=True)
+
+    prompts_all = [json.loads(line) for line in open(prompts_path)]
+    bad = [i for i, p in enumerate(prompts_all)
+           if not str(p.get("answer", "")).strip()
+           or not str(p.get("question", "")).strip()]
+    if bad:
+        raise ValueError(f"{len(bad)}/{len(prompts_all)} prompts have empty "
+                         f"question or gold (lines {[i + 1 for i in bad[:5]]})")
+    print(f"{len(prompts_all)} prompts, gold validated", flush=True)
+
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+    mc = build_config(vocab_size=len(tok), real_vocab_size=len(tok),
+                      bos_token_id=tok.bos_token_id,
+                      eos_token_id=tok.eos_token_id,
+                      pad_token_id=tok.pad_token_id,
+                      fused_cross_entropy_chunks=8)
+    device = torch.device("cuda")
+
+    from osrt.model import OSRTForCausalLM
+    model = OSRTForCausalLM(mc).to(device)
+    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
+                    weights_only=True)
+    miss, unexp = model.load_state_dict(ck.get("model_state_dict", ck),
+                                        strict=False)
+    assert not miss and not unexp, f"{ckpt_name}: {miss[:3]} {unexp[:3]}"
+    del ck
+    model.eval()
+    if hasattr(model, "set_moe_telemetry"):
+        model.set_moe_telemetry(False)
+
+    rng = random.Random(seed)
+    picks = rng.sample(prompts_all, min(num_prompts, len(prompts_all)))
+    sys_text = get_by_name(cfg.system_persona) if cfg.system_persona else ""
+    batch = [(f"{cfg.system_tag}{sys_text}{cfg.user_tag}{p['question']}"
+              f"{cfg.assistant_tag}" if sys_text else
+              f"{cfg.user_tag}{p['question']}{cfg.assistant_tag}",
+              str(p["answer"])) for p in picks]
+    end_ans = tok.encode(cfg.answer_close, add_special_tokens=False)[0]
+
+    torch.manual_seed(seed)          # reproducible sampling
+    groups = generate_rollouts(model, tok, batch, cfg, device, [end_ans])
+
+    out = out_name or f"diag_{ckpt_name.replace('.pt', '')}_seed{seed}.jsonl"
+    path = f"/vol/rollouts/{out}"
+    if os.path.exists(path):
+        os.remove(path)
+    n = dump_rollouts(path, groups, ckpt=ckpt_name, step=-1, seed=seed,
+                      temperature=cfg.temperature,
+                      top_p=getattr(cfg, "top_p", 1.0))
+    rollouts_vol.commit()
+    n_ok = sum(1 for g in groups for r in g if r.correct)
+    live = sum(1 for g in groups for r in g if abs(r.advantage) > 1e-8)
+    print(f"dumped {n} rollouts -> {path}", flush=True)
+    print(f"  correct {n_ok}/{n} ({n_ok / n:.1%})   live {live}/{n} "
+          f"({live / n:.1%})   T={cfg.temperature} top_p={getattr(cfg, 'top_p', 1.0)}",
+          flush=True)
+    return path
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    timeout=5400,
+)
+def grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8) -> int:
+    """Run scripts/grpo_grad_diag.py on a cached batch. No optimizer step."""
+    import subprocess
+    return subprocess.call([
+        "python", "/root/scripts/grpo_grad_diag.py",
+        "--ckpt", f"/vol/checkpoints/v5/{ckpt_name}",
+        "--dump", f"/vol/rollouts/{dump_name}",
+        "--tokenizer", "/vol/tokenizer",
+        "--base-ckpt",
+        "/vol/checkpoints/v5/osrt_v5_sft_v4_soup_1200_1400_1600_1800.pt",
+        "--micro-batch", str(micro_batch),
+    ])
+
+
+@app.function(
     image=image,
     volumes={"/vol/checkpoints": vol},
     timeout=1800,
@@ -1921,6 +2073,22 @@ def run_make_soup(prefix: str = "osrt_v5_sft_v4",
 def run_ckpt_drift(a: str, b: str):
     """How far did the weights actually MOVE between two checkpoints?"""
     ckpt_drift.remote(a=a, b=b)
+
+
+@app.local_entrypoint()
+def run_grpo_diag_batch(ckpt_name: str = "grpo_v6_step_390.pt",
+                        num_prompts: int = 16, seed: int = 4242,
+                        max_gen_len: int = 768):
+    """Cache ONE seeded rollout batch for the offline strict / clamp A/Bs."""
+    print(grpo_diag_batch.remote(ckpt_name=ckpt_name, num_prompts=num_prompts,
+                                 seed=seed, max_gen_len=max_gen_len))
+
+
+@app.local_entrypoint()
+def run_grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8):
+    """Unclamped/clamped policy and KL gradient norms + cosines on a dump."""
+    grpo_grad_diag.remote(ckpt_name=ckpt_name, dump_name=dump_name,
+                          micro_batch=micro_batch)
 
 
 @app.local_entrypoint()
