@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import torch  # noqa: E402
 
 from osrt.grpo_train import (  # noqa: E402
+    dump_rollouts,
     generate_rollouts,
     lr_at_step,
     train_on_rollouts,
@@ -63,6 +64,11 @@ def main() -> int:  # noqa: PLR0915
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt-dir", default="/content/ckpt")
     ap.add_argument("--prompts", default="/content/grpo_prompts.jsonl")
+    ap.add_argument("--dump-rollouts", default="",
+                    help="JSONL path to append every rollout to. DEFAULT OFF: "
+                         "adds file I/O to the training loop and grows ~2MB per "
+                         "step. Used to cache a fixed batch for offline A/Bs "
+                         "(strict-vs-loose extraction, advantage clamp).")
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
     ap.add_argument("--hf-repo", default="")
     ap.add_argument("--base-ckpt",
@@ -275,6 +281,13 @@ def main() -> int:  # noqa: PLR0915
         model.eval()
         groups = generate_rollouts(model, tok, batch, cfg, device, stop_ids)
         model.train()
+
+        if args.dump_rollouts:
+            dump_rollouts(
+                args.dump_rollouts, groups,
+                ckpt=resume_path.name, step=step, seed=1234 + start_step,
+                temperature=cfg.temperature, top_p=getattr(cfg, "top_p", 1.0),
+            )
 
         flat = [r for g in groups for r in g]
         # Hand the generation KV back before the training pass allocates.

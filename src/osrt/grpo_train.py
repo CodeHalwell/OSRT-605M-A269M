@@ -70,6 +70,8 @@ class Rollout:
     reward: float
     correct: bool
     text: str            # decoded completion only (for printing / rewards)
+    gold: str = ""       # ground-truth answer, for offline re-scoring
+    breakdown: dict | None = None   # compute_reward's per-term breakdown
 
 
 def _left_pad(seqs: list[list[int]], pad_id: int, device) -> tuple[Tensor, Tensor, int]:
@@ -199,13 +201,81 @@ def generate_rollouts(
             rollouts.append(Rollout(
                 ids=full[: cfg.seq_len], prompt_len=p_len, advantage=0.0,
                 reward=reward, correct=bool(breakdown.get("correct")),
-                text=text,
+                text=text, gold=str(gold), breakdown=dict(breakdown),
             ))
         advs = compute_group_advantages(rewards)
         for r, a in zip(rollouts, advs):
             r.advantage = float(a)
         groups.append(rollouts)
     return groups
+
+
+def dump_rollouts(
+    path: str,
+    groups: list[list[Rollout]],
+    *,
+    ckpt: str,
+    step: int,
+    seed: int,
+    temperature: float,
+    top_p: float,
+) -> int:
+    """Append one step's rollouts to a JSONL dump. DEFAULT-OFF in training.
+
+    Stores TOKEN IDS, not just text: `text` round-trips through the tokenizer
+    only if encode(decode(ids)) == ids, which is not guaranteed for a byte-level
+    BPE with special tokens in the stream. Replaying from ids makes the offline
+    A/B consume exactly the sequence the policy produced.
+
+    One line per rollout, with `group` identifying siblings so advantages can be
+    recomputed per group offline.
+    """
+    import json
+
+    n = 0
+    with open(path, "a") as f:
+        for gi, group in enumerate(groups):
+            for r in group:
+                ids = r.ids.tolist()
+                f.write(json.dumps({
+                    "ckpt": ckpt, "step": step, "seed": seed,
+                    "temperature": temperature, "top_p": top_p,
+                    "group": gi,
+                    "prompt_ids": ids[: r.prompt_len],
+                    "completion_ids": ids[r.prompt_len:],
+                    "prompt_len": r.prompt_len,
+                    "gold": r.gold,
+                    "text": r.text,
+                    "reward": r.reward,
+                    "advantage": r.advantage,
+                    "correct": bool(r.correct),
+                    "breakdown": r.breakdown or {},
+                }, ensure_ascii=False) + "\n")
+                n += 1
+    return n
+
+
+def load_rollout_dump(path: str, device) -> tuple[list[list[Rollout]], dict]:
+    """Rebuild grouped Rollouts from a dump. Inverse of dump_rollouts."""
+    import json
+    from collections import OrderedDict
+
+    buckets: OrderedDict[tuple[int, int], list[Rollout]] = OrderedDict()
+    meta: dict = {}
+    with open(path) as f:
+        for line in f:
+            d = json.loads(line)
+            meta = {k: d[k] for k in
+                    ("ckpt", "step", "seed", "temperature", "top_p") if k in d}
+            ids = torch.tensor(d["prompt_ids"] + d["completion_ids"],
+                               dtype=torch.long, device=device)
+            buckets.setdefault((d["step"], d["group"]), []).append(Rollout(
+                ids=ids, prompt_len=int(d["prompt_len"]),
+                advantage=float(d["advantage"]), reward=float(d["reward"]),
+                correct=bool(d["correct"]), text=d.get("text", ""),
+                gold=str(d.get("gold", "")), breakdown=d.get("breakdown") or {},
+            ))
+    return list(buckets.values()), meta
 
 
 def train_on_rollouts(
