@@ -2089,6 +2089,49 @@ def run_ckpt_drift(a: str, b: str):
     ckpt_drift.remote(a=a, b=b)
 
 
+@app.function(
+    image=image,
+    volumes={"/vol/rollouts": rollouts_vol},
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=1800,
+)
+def push_prompts(name: str = "grpo_prompts.jsonl",
+                 hf_repo: str = "HallD/osrt-v6-ckpt") -> str:
+    """Publish the gold-validated prompt file to HF as data/<name>.
+
+    The prompt set must be VERSIONED, not rebuilt from a streaming dataset on
+    each venue. The Colab notebook's builder guards `gold is not None` but not
+    `str(gold).strip()`, so it admits rows whose gold is empty — those score the
+    no_ground_truth tier (+0.20 format-only, observed at step 310) and train
+    format with no correctness signal. The loader now hard-fails on them, which
+    means a locally-rebuilt file blocks the run. Pulling a validated file avoids
+    both the rebuild and the failure.
+    """
+    import json
+
+    from huggingface_hub import HfApi
+
+    path = f"/vol/rollouts/{name}"
+    rows = [json.loads(line) for line in open(path)]
+    bad = [i for i, r in enumerate(rows)
+           if not str(r.get("answer", "")).strip()
+           or not str(r.get("question", "")).strip()]
+    if bad:
+        raise ValueError(f"refusing to publish: {len(bad)}/{len(rows)} rows have "
+                         f"empty question or gold (lines {[i + 1 for i in bad[:5]]})")
+    HfApi().upload_file(path_or_fileobj=path, path_in_repo=f"data/{name}",
+                        repo_id=hf_repo, repo_type="model",
+                        commit_message=f"gold-validated GRPO prompts ({len(rows)} rows)")
+    print(f"published {len(rows)} validated prompts -> {hf_repo}:data/{name}")
+    return f"data/{name}"
+
+
+@app.local_entrypoint()
+def run_push_prompts(name: str = "grpo_prompts.jsonl"):
+    """Publish the validated prompt file so venues pull instead of rebuilding."""
+    print(push_prompts.remote(name=name))
+
+
 @app.local_entrypoint()
 def run_grpo_diag_batch(ckpt_name: str = "grpo_v6_step_390.pt",
                         num_prompts: int = 16, seed: int = 4242,

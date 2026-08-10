@@ -492,3 +492,67 @@ in fact diverged from the pin, so anyone reintroducing sampling fails loudly.
 2. Matched 0-shot/1-shot personas *(done)* and **per-prompt persona metadata**
    (A3.4).
 3. Only then fixtures, and only then reward code.
+
+---
+
+# Amendment 4 — 2026-08-10. Verification semantics SETTLED
+
+A2.4 listed two undefined questions and deferred them to the contract session.
+Both are now decided, so the next session starts from a specification rather
+than an open design.
+
+## A4.1 "Verified support" = a non-identical, machine-checkable witness
+
+Agreement is not verification, and repetition is not verification. For a
+**valid** hint the model must supply a witness that is *independent of the hint
+itself*, in one of three forms:
+
+1. **Substitution** — put the value back into the stated relation and show both
+   sides equal.
+2. **Inverse computation** — derive the hinted quantity by the reverse operation.
+3. **Equality of independently evaluated sides** — evaluate each side separately
+   and show they match.
+
+**Restating the hint earns V=0, not V=+1.** That is the load-bearing rule: it is
+what stops "the hint says 1.25C = 625, I agree" from collecting the same reward
+as actually checking it, and it is the same defect as the current
+`reasoning_bonus` counting steps without validating them.
+
+## A4.2 The truth table
+
+| result | V |
+|---|---|
+| Correct verdict **+ verified witness/repair** | **+1** |
+| Correct verdict, **missing or unverifiable** support/repair | **0** |
+| **Wrong, contradictory, or ambiguous** verdict | **−1** |
+
+Symmetric by construction, and note what is NOT −1: a **correct `invalid`
+verdict without a valid repair earns 0.** It detected the problem but supplied
+no usable reasoning, which is worth nothing rather than worth punishing.
+`V=−1` is reserved for wrong verdicts, self-contradiction, malformed or
+ambiguous output, and **adopting** the poisoned claim.
+
+Final-answer correctness still **gates** the term (A1.1), so `V` moves reward
+only when the submitted answer is correct, and the clamp still prevents positive
+policy advantage on wrong answers.
+
+## A4.3 "Copying" is structural, not lexical
+
+For a poisoned hint, **quoting the bad equation while explicitly rejecting it
+must remain allowed** — that is precisely the target behaviour. "Copying" means
+**adopting the claim as support**, not mentioning it diagnostically.
+
+This must be represented **structurally** (which claim occupies the support
+role), never by substring matching. The concrete failure this avoids is already
+on record: the reference DOUBT implementation's `str(wrong_val) in final_answer`
+test assigns **−7.5** to `<SOLUTION>12 (not 20)</SOLUTION>` — maximum penalty
+for solving correctly *and* naming what it rejected. Substring matching cannot
+distinguish adoption from citation, so it is excluded by contract.
+
+## A4.4 Initial scope boundary
+
+**Support verification is limited to normalised arithmetic and equation claims
+with canonical metadata.** Free-form strategy verification is **out of scope**
+until the deterministic contract proves itself. This keeps the rewarded semantic
+surface as small as A1.6 requires, and keeps every V assignment decidable
+without a judge model.
