@@ -162,3 +162,107 @@ findings:
 - **`delta` is demoted** from primary to diagnostic.
 - Metric hierarchy: primary `acc_on`; co-primary verification accuracy; control
   `acc_off`; diagnostic `delta`.
+
+---
+
+# Amendment 1 — 2026-08-10, still before implementation
+
+Appended rather than edited: silently rewriting a preregistration defeats its
+purpose. Everything above stands unless contradicted here.
+
+## A1.1 Reward form — bounded, correctness-gated, lexicographic in effect
+
+```
+R = R_correctness + R_format + 1[final correct] * lambda * V
+
+V = +1   correct verdict WITH deterministically verified support/correction
+V =  0   verdict present but incomplete or unsupported
+V = -1   wrong, contradictory, copied-poison, ambiguous, or unparsed
+```
+
+- `V` contributes **exactly zero** when the final answer is wrong, so
+  verification is never an independent route to reward. The correctness clamp
+  still prevents positive policy advantage on incorrect answers.
+- The existing **syntactic `reasoning_bonus` is removed on verification
+  prompts** — it counts steps without validating them, which is the defect this
+  term replaces.
+
+**Why a modest weight suffices.** Among final-correct rollouts the +5.0 is
+*constant* and vanishes under group centring, so `V` only has to reorder within
+that subset. It does not need to compete with +5.0. In mixed groups the
+correct/wrong gap stays dominant: even at `lambda=2.0`, correct-with-failed-
+verification scores `5.0 + 0.2 - 2.0 = 3.2` against the best wrong tier's
+`-0.5 + 0.2 = -0.3`.
+
+## A1.2 Criterion 3.5 superseded — materiality required
+
+The original 3.5 ("advantage changes for >=20% of final-correct rollouts") is
+passable by an arbitrarily small floating-point perturbation. **Replaced by:**
+
+> At least **20%** of final-correct rollouts change **standardised advantage by
+> >= 0.25**.
+
+## A1.3 lambda grid REVISED, from a pre-computation against A1.2
+
+Simulating `V` uniform on {-1,0,+1} against the observed reward distribution
+(G=16, ~15% exact, wrong tiers -0.30/-1.80/-2.45):
+
+```
+lambda   median |d adv|   frac >=0.25   frac >=0.10
+  0.25       0.045           0.0%         9.1%
+  0.50       0.088           0.3%        43.0%
+  1.00       0.182          30.7%        68.7%
+  2.00       0.361          59.7%        80.1%
+```
+
+`lambda` in {0.25, 0.5} **cannot pass A1.2** and are eliminated before any
+audit. The declared grid is therefore **{1.0, 1.5, 2.0}**, cap 2.0, select the
+smallest passing value; if none pass, **the verifier design fails** rather than
+the weight being raised further.
+
+Structural note: the group standard deviation (~2.43) is dominated by the
+correct/wrong gap, so differences among correct rollouts are small relative to
+it. That is a headwind for the intended reordering and the reason small weights
+are non-viable. Standardising advantages *within* the correct subset would
+change GRPO's advantage definition materially and is **out of scope** here — if
+the {1.0, 1.5, 2.0} grid fails, that is a separate design decision, not a
+fallback to be taken silently.
+
+## A1.4 Confirmation must be BALANCED, not poison-only
+
+Poison rejection alone is farmed by "always invalid". Confirmation requires
+**both**:
+
+- Balanced verification accuracy, **lower 95% bound > 50%**.
+- Poison rejection **plus correct repair >= 30%**, interval reported.
+
+This supersedes the single poison-rejection row in section 4b.
+
+## A1.5 Calibration and audit partitions are DISJOINT
+
+`lambda` must not be tuned and tested on the same frozen batch. Split paired
+problems deterministically **by question hash**:
+
+- **Calibration partition** — select the smallest passing `lambda`.
+- **Locked audit partition** — evaluate criteria 1-3 **once**, after `lambda` is
+  fixed.
+
+## A1.6 The semantic surface stays deliberately tiny
+
+Rewarded: a **structured verdict** plus a **canonical corrected equation or
+value**, checked against dataset metadata. NOT rewarded: free-form eloquence,
+step count, keyword presence, or any LLM judge. Every one of those is a surface
+the policy can farm, and step count is the specific failure already on record.
+
+## A1.7 Hint conditioning is a distribution shift, and the transfer test is
+unhinted
+
+Hinted GRPO trains `pi(y | q, h)` while the shipped model receives only `q`. A
+verifier can pass every anti-hacking fixture and still teach behaviour that
+disappears when the hint is absent.
+
+- Hinted verification prompts are a **declared mixture stratum**, NOT a
+  replacement for unhinted math prompts.
+- **Unhinted `acc_on` is the transfer test** and remains the primary metric.
+- Report hinted and unhinted `acc_on` separately; a hinted-only gain is not a
+  capability gain.
