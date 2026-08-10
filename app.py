@@ -1123,6 +1123,8 @@ def sft_eval_sweep(
     n: int = 200,
     max_new_tokens: int = 512,
     names_csv: str = "",
+    on_persona: str = "",
+    off_persona: str = "",
 ) -> list[dict]:
     """Score EVERY checkpoint of a run by GSM8K generation accuracy.
 
@@ -1212,6 +1214,11 @@ def sft_eval_sweep(
                 model, tok, device, n_problems=n,
                 max_new_tokens=max_new_tokens, batch_size=32,
                 repetition_penalty=1.2,   # the locked decode hygiene
+                # Empty = the historical default personas (instruction_strict /
+                # instruction_direct). Pass the persona a stage TRAINED on when
+                # scoring that stage, or the number measures cross-persona
+                # generalisation instead of the trained objective.
+                on_persona=on_persona, off_persona=off_persona,
             )
         step = int(re.search(r"_step_(\d+)", name).group(1)) if "_step_" in name else -1
         m["ckpt"] = name
@@ -1830,10 +1837,16 @@ def run_make_soup(prefix: str = "osrt_v5_sft_v4",
 
 @app.local_entrypoint()
 def run_sft_eval_sweep(prefix: str = "osrt_v5_sft_v4", steps: str = "",
-                       n: int = 200, names_csv: str = ""):
-    """Score checkpoints by GSM8K accuracy. names_csv overrides discovery."""
+                       n: int = 200, names_csv: str = "",
+                       on_persona: str = "", off_persona: str = ""):
+    """Score checkpoints by GSM8K accuracy. names_csv overrides discovery.
+
+    on_persona/off_persona pin the system prompt (e.g. minimal_format, the one
+    GRPO trains on); empty keeps the historical default.
+    """
     sft_eval_sweep.remote(prefix=prefix, steps=steps, n=n,
-                          names_csv=names_csv)
+                          names_csv=names_csv, on_persona=on_persona,
+                          off_persona=off_persona)
 
 
 @app.local_entrypoint()

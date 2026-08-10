@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from osrt.rewards import extract_gsm8k_answer, extract_numeric_answer
-from osrt.system_prompts import sample_system_prompt
+from osrt.system_prompts import get_by_name, sample_system_prompt
 
 # cache the held-out GSM8K eval batch (prompts + gold) once per process
 _GSM8K_CACHE: list[tuple[str, str]] | None = None
@@ -104,22 +104,37 @@ def run_reasoning_eval(
     model: nn.Module, tok, device, *,
     n_problems: int = 50, max_new_tokens: int = 512, seed: int = 0,
     batch_size: int = 16, repetition_penalty: float = 1.0,
+    on_persona: str = "", off_persona: str = "",
 ) -> dict:
     """Reasoning-on vs -off accuracy on a held-out GSM8K slice.
 
-    Fixed persona per side (the first ON / first OFF persona) so the A/B isolates
-    the reasoning-mode instruction, not persona variance. Returns a wandb-loggable
-    dict. Switches the model to eval mode and restores it.
+    Fixed persona per side so the A/B isolates the reasoning-mode instruction,
+    not persona variance. The defaults are `Random(0).choice` of each pool,
+    which resolves to `instruction_strict` (ON) and `instruction_direct` (OFF)
+    — NOT the first entry of either list, despite how it reads.
+
+    That default is a trap when scoring a stage that TRAINED on one specific
+    persona: GRPO runs under `minimal_format`, so the default measures
+    cross-persona generalisation rather than the objective being optimised, and
+    a drop cannot be told apart from real damage. Pass `on_persona` /
+    `off_persona` (any name in either pool) to score the trained prompt.
+
+    Returns a wandb-loggable dict. Switches the model to eval mode and restores it.
     """
     import random
-    rng = random.Random(seed)
     was_training = model.training
     model.train(False)
 
     # fixed personas for a clean A/B (not sampled — we want the contrast to be
     # the reasoning instruction, not noise across personas)
-    on_name, on_sys = sample_system_prompt(random.Random(0), "on")
-    off_name, off_sys = sample_system_prompt(random.Random(0), "off")
+    if on_persona:
+        on_name, on_sys = on_persona, get_by_name(on_persona)
+    else:
+        on_name, on_sys = sample_system_prompt(random.Random(seed), "on")
+    if off_persona:
+        off_name, off_sys = off_persona, get_by_name(off_persona)
+    else:
+        off_name, off_sys = sample_system_prompt(random.Random(seed), "off")
 
     problems = _load_gsm8k_heldout(n_problems)
     stats = {"on": {"correct": 0, "len": 0, "fmt": 0},
