@@ -133,7 +133,13 @@ def test_reasoning_pools_split():
     from osrt.system_prompts import (
         REASONING_ON, REASONING_OFF, SYSTEM_PROMPTS, sample_system_prompt,
     )
-    assert len(REASONING_ON) == 12
+    # A bare count is the wrong invariant — it fires on any addition while
+    # missing the thing that actually breaks: `Random(0).choice(pool)` is the
+    # historical eval default, and its result depends on POOL LENGTH. Growing a
+    # pool can silently rebase every recorded number. The count is kept as a
+    # tripwire, but the load-bearing assertion is that the pinned eval personas
+    # do not move.
+    assert len(REASONING_ON) == 13   # +word_problem_verify_1shot (2026-08-10)
     assert len(REASONING_OFF) >= 6
     assert SYSTEM_PROMPTS is REASONING_ON  # back-compat
     import random
@@ -145,6 +151,91 @@ def test_reasoning_pools_split():
     import pytest
     with pytest.raises(ValueError):
         sample_system_prompt(r, "bogus")
+
+
+def test_pinned_eval_personas_do_not_drift():
+    """Every recorded acc_on/acc_off number was measured under these two.
+
+    `Random(0).choice(pool)` resolving to them is an accident of pool length,
+    not a guarantee. This asserts the accident still holds AND that the pinned
+    constants name the same personas, so a future pool addition that would
+    rebase the historical panel fails here rather than silently.
+    """
+    import random
+
+    from osrt.system_prompts import (
+        DEFAULT_EVAL_OFF,
+        DEFAULT_EVAL_ON,
+        REASONING_OFF,
+        REASONING_ON,
+        sample_system_prompt,
+    )
+    assert DEFAULT_EVAL_ON == "instruction_strict"
+    assert DEFAULT_EVAL_OFF == "instruction_direct"
+    assert sample_system_prompt(random.Random(0), "on")[0] == DEFAULT_EVAL_ON
+    assert sample_system_prompt(random.Random(0), "off")[0] == DEFAULT_EVAL_OFF
+    names_on = {n for n, _ in REASONING_ON}
+    names_off = {n for n, _ in REASONING_OFF}
+    assert DEFAULT_EVAL_ON in names_on
+    assert DEFAULT_EVAL_OFF in names_off
+
+
+def test_few_shot_exemplars_cover_only_shot_personas():
+    """The echo penalty must not fire on personas with no demonstration."""
+    from osrt.system_prompts import FEW_SHOT_EXEMPLARS, REASONING_ON
+
+    assert "minimal_format" not in FEW_SHOT_EXEMPLARS
+    assert "instruction_strict" not in FEW_SHOT_EXEMPLARS
+    assert "word_problem_verify_1shot" in FEW_SHOT_EXEMPLARS
+    for name, ex in FEW_SHOT_EXEMPLARS.items():
+        assert ex.strip(), f"{name} registered an empty exemplar"
+        assert "shot" in name, f"{name} has an exemplar but no 'shot' in its name"
+    # every registered exemplar must belong to a real persona
+    names = {n for n, _ in REASONING_ON}
+    assert set(FEW_SHOT_EXEMPLARS) <= names | {n for n, _ in REASONING_ON}
+
+
+def test_few_shot_echo_penalty_catches_copying_not_idiom():
+    from osrt.rewards import compute_reward, few_shot_echo_score
+    from osrt.system_prompts import FEW_SHOT_EXEMPLARS
+
+    ex = FEW_SHOT_EXEMPLARS["word_problem_verify_1shot"]
+    kw = dict(think_open="<|think|>", think_close="<|/think|>",
+              answer_open="<|answer|>", answer_close="<|/answer|>",
+              max_tokens=768, completion_tokens=120)
+
+    copied = ("<|think|>Let C be the cost price. A 25% profit means the selling "
+              "price is 1.25C, so 1.25C = 625. Then C = 625 / 1.25 = 500. "
+              "Check: 500 x 1.25 = 625, which matches the selling price "
+              "given.<|/think|><|answer|>500<|/answer|>")
+    own = ("<|think|>Let P be the price. A 40% discount means 0.6P = 300, so "
+           "P = 300 / 0.6 = 500. Check: 500 x 0.6 = 300, matches.<|/think|>"
+           "<|answer|>500<|/answer|>")
+
+    assert few_shot_echo_score(copied, ex)[0] > 0
+    assert few_shot_echo_score(own, ex)[0] == 0, (
+        "the SAME reasoning discipline with different numbers must not be "
+        "penalised — that pattern is what the exemplar exists to teach"
+    )
+    # inactive without an exemplar, so unexemplified personas are untouched
+    assert few_shot_echo_score(copied, "")[0] == 0
+
+    r_copy, b_copy = compute_reward(copied, "500", few_shot_exemplar=ex, **kw)
+    r_own, b_own = compute_reward(own, "500", few_shot_exemplar=ex, **kw)
+    assert b_copy["few_shot_echo_penalty"] < 0
+    assert b_own["few_shot_echo_penalty"] == 0.0
+    assert r_own > r_copy, "copying must never outrank solving"
+    # and copying while WRONG must be worse than failing honestly
+    wrong_copy, _ = compute_reward(
+        copied.replace("<|answer|>500", "<|answer|>499"), "500",
+        few_shot_exemplar=ex, **kw)
+    wrong_honest, _ = compute_reward(
+        own.replace("<|answer|>500", "<|answer|>499"), "500", **kw)
+    assert wrong_copy < wrong_honest
+
+    # special tags are stripped: they appear in BOTH sides by construction and
+    # would otherwise guarantee a match that has nothing to do with copying.
+    assert few_shot_echo_score("<|think|><|/think|><|answer|>1<|/answer|>", ex)[0] == 0
 
 
 def test_format_tulu_single_vs_multi_turn():

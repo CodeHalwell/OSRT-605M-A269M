@@ -2742,6 +2742,27 @@ class GRPOv6Config(GRPOConfig):
     # entirely.
     kl_coeff: float = 0.04
 
+    # ── few-shot reasoning exemplar + anti-echo penalty ──────────────
+    # The observed failures are not format failures: the model sets equations up
+    # correctly and then botches the arithmetic (250/3200 = 0.5 at step 190;
+    # 4025.25/0.45 giving three different answers at step 220), or reaches a
+    # value in the trace and submits a different one (computed 40, answered 10
+    # at step 250). The existing 1-shot personas all demonstrate FORMAT with
+    # trivial sums, so none of them address that. word_problem_verify_1shot
+    # demonstrates name-the-unknown -> equation -> solve -> SUBSTITUTE BACK ->
+    # answer-consistent-with-working.
+    #
+    # DISTRIBUTION SHIFT, declared: this trains pi(y | q, exemplar) while the
+    # eval personas carry no exemplar, so unexemplified acc_on is the TRANSFER
+    # test — the same structure as the hinted-prompt fork (prereg A1.7).
+    #
+    # few_shot_echo_penalty is deliberately large relative to what echoing can
+    # earn. At -3.0: copy-and-correct nets +2.20 vs +5.20 for real work, and
+    # copy-and-wrong lands at -3.3, below the worst non-copying tier (-2.3). So
+    # echoing is strictly worse than both solving and failing honestly.
+    # Measured 0/256 false positives on real step-390 rollouts at n=8..16.
+    few_shot_echo_penalty: float = -3.0
+
     # ── sampling: top_p 1.0, matching TRL ────────────────────────────
     # Inherited 0.95 leaves a residual score-function mismatch that the
     # temperature fix does NOT close: nucleus sampling truncates and
@@ -2771,7 +2792,7 @@ class GRPOv6Config(GRPOConfig):
     # Our 0.0%-ambiguity measurement used this persona; strip it and the whole
     # reward signal inverts.
     system_tag: str = "<|system|>"
-    system_persona: str = "minimal_format"   # the ON persona the SFT corpus and
+    system_persona: str = "word_problem_verify_1shot"
                                              # every eval/probe used
 
     # ── in-flight visibility ─────────────────────────────────────────

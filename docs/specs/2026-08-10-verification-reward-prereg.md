@@ -266,3 +266,135 @@ disappears when the hint is absent.
 - **Unhinted `acc_on` is the transfer test** and remains the primary metric.
 - Report hinted and unhinted `acc_on` separately; a hinted-only gain is not a
   capability gain.
+
+---
+
+# Amendment 2 — 2026-08-10, still before verifier implementation
+
+## A2.1 CORRECTION: prior hint design DOES exist, and it is sharper than A1.7
+
+Amendment 1 asserted "no prior hint-design contract in the repo". **That was
+wrong**, and the search was at fault: it grepped `poison|obfuscated
+untruth|hint injection|suggested answer` and so missed a section titled
+**"Hint-augmented GRPO"** entirely.
+
+`docs/specs/2026-07-26-precision-and-sft-objective.md` §6 already contains
+graded hints, adaptive difficulty selection, the hinted/unhinted policy
+mismatch, and a recommendation toward **filtered context distillation** (§9.6).
+What does *not* exist is a specification for **poisoned** hints, structured
+verification output, or semantic scoring — so the gated verifier is greenfield
+*semantically*, but the older transfer analysis applies in full and supersedes
+A1.7's weaker framing.
+
+**§6.5 is sharper than A1.7 in one specific way.** A1.7 proposed hinted prompts
+as a "declared mixture stratum". §6 shows that is **not sufficient**:
+
+> hinted prompts are precisely the ones producing nonzero advantage — so a
+> disproportionate share of the actual gradient teaches the hint-conditioned
+> policy. The x% mixing does **not** save this, because the unhinted remainder
+> is mostly the zero-gradient set. You would be optimising the mode you don't
+> ship.
+
+So mixture fractions do not control the gradient share; **advantage mass does**.
+Any hinted design must therefore report the *fraction of non-zero advantage*
+arising from hinted prompts, not merely the prompt mixture ratio. Added as a
+frozen-audit requirement:
+
+| # | criterion | threshold |
+|---|---|---|
+| 3.6 | Share of total non-zero-advantage mass arising from **hinted** prompts | report; **≤ 60%** |
+
+§6 also names **Option B** (sample with hint, score without — STaR-style
+rationalisation) and two concrete breakages. Both transfer to
+`osrt/grpo_train.py`: `Rollout.prompt_len` is computed from the **hinted**
+prompt and slices `shift_logits` in `_seq_logprobs`, so scoring against an
+unhinted prefix would misalign the labels; and the loss is a direct policy
+gradient with no importance ratio, so an off-policy prefix change is
+uncorrected. Option B is **out of scope** here and must not be attempted
+without fixing both.
+
+§6's own status is "unranked pending measurement" — its ROI case was retracted
+because `correctness_partial_credit` had removed the variance trap that
+motivated it. **Note the interaction:** those proximity tiers were removed on
+2026-08-10, so the retraction's stated premise no longer holds. It does not
+resurrect the variance argument, though — measured live rate is 87.5%
+unclamped / 58.6% clamped and all-wrong groups are 7.7%, so variance is not the
+binding constraint. Our purpose for hints is **chain-dependent reward signal**,
+a different objective from §6's sample efficiency.
+
+## A2.2 lambda: {1.0, 2.0} are candidates; {0.25, 0.5} are NEGATIVE CONTROLS
+
+A1.3 called the grid {1.0, 1.5, 2.0}. Corrected: the candidates are
+**{1.0, 2.0}** — two, not three. The eliminated values are still **run in the
+frozen audit as negative controls**, to confirm the simulation predicted their
+failure correctly rather than assuming it.
+
+**The pre-screen is a PREDICTION, not a result.** It used wave-2's *unhinted*
+reward distribution with *simulated* uniform `V`. A real hint-conditioned batch
+may have different group variance and a different verification-outcome
+distribution, either of which moves the materiality figures. So `lambda = 1.0`
+is the **predicted** smallest pass; it is not established until the audit.
+
+Corrected arithmetic: with the +0.3 step bonus removed on verification prompts,
+the maximum becomes `5.0 + 0.2 + 1.0 = 6.2`, so `lambda = 1.0` contributes
+**16.1%** of maximum reward, not the 18% previously stated.
+
+## A2.3 Criterion 3.5 is measured on the AUDIT partition
+
+A1.2 set the materiality bar; A1.5 split calibration from audit. Joining them
+explicitly, because the gap allowed choosing `lambda` and declaring materiality
+on the same examples:
+
+> Criterion 3.5 (≥20% of final-correct rollouts changing standardised advantage
+> by ≥0.25) is evaluated **on the locked audit partition only**, after `lambda`
+> is fixed on the calibration partition.
+
+## A2.4 Write the CONTRACT before the fixtures
+
+Criterion 1.1's fixtures must *instantiate* a specification, not silently
+*become* it. The next session starts with a contract, not test cases:
+
+1. Exact output **grammar** for the verification block.
+2. **Canonicalisation** rules for numbers and equations.
+3. **Precedence** for missing, duplicate, ambiguous and contradictory blocks.
+4. A **truth table** over (final correctness) x (hint validity) x (verdict) x
+   (supporting step) x (correction present) x (poison copied), with the
+   resulting `V` in {-1, 0, +1} for **every row**.
+5. Fixtures covering every truth-table row, plus adversarial formatting
+   variants.
+
+Two questions the contract must answer explicitly, currently undefined:
+
+- What does **"verified support"** mean for a *valid* hint — is agreeing with a
+  correct hint enough, or must the model independently derive it?
+- Does a **correct `invalid` verdict without a correct repair** earn `0` or
+  `-1`?
+
+## A2.5 Landed now (declared, not hypotheses)
+
+Implemented in this session, ahead of the verifier:
+
+- **`word_problem_verify_1shot`** added to `REASONING_ON` and set as
+  `GRPOv6Config.system_persona`. Every pre-existing 1-shot persona demonstrates
+  *format* with trivial sums (`12 + 8x3`, `25-9`, `60x2`); none addresses the
+  observed failures. This one demonstrates name-the-unknown -> equation ->
+  solve -> **substitute back** -> answer-consistent-with-working, mirroring the
+  step-190 (`250/3200 = 0.5`), step-220 (`4025.25/0.45` giving three answers)
+  and step-250 (computed 40, answered 10) rollouts.
+- **`few_shot_echo_penalty = -3.0`**, fired by a 12-word verbatim run against
+  the persona's exemplar (special tags stripped from both sides, since both
+  necessarily contain them). Ordering achieved: copy-and-correct +2.20 vs +5.20
+  for real work; copy-and-wrong -3.3, below the worst non-copying tier (-2.3).
+  So echoing is strictly worse than both solving and failing honestly.
+  **Measured 0/256 false positives** on real step-390 rollouts at n=8..16, and
+  a test asserts the same *pattern* with different numbers is NOT penalised.
+- **Eval personas pinned by name** (`DEFAULT_EVAL_ON/OFF`). The historical
+  default `Random(0).choice(pool)` depends on pool LENGTH, so adding a persona
+  can silently rebase every recorded number. A test now asserts the pinned
+  names and that the accident still holds.
+
+**This is itself a distribution shift**, and A2.1 applies to it: the exemplar
+makes training `pi(y | q, exemplar)` while all eval personas carry no exemplar.
+Unexemplified `acc_on` is therefore the transfer test — and per A2.1, the
+quantity to watch is the share of non-zero advantage arising from exemplified
+prompts, not the prompt mixture.

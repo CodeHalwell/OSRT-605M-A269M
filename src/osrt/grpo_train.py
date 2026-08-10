@@ -58,6 +58,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from osrt.rewards import compute_group_advantages, compute_reward
+from osrt.system_prompts import FEW_SHOT_EXEMPLARS
 
 
 @dataclass
@@ -149,6 +150,10 @@ def generate_rollouts(
     """
     g = cfg.group_size
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    # Exemplar for the regurgitation penalty — empty unless the configured
+    # persona actually carries a few-shot demonstration, so unexemplified
+    # personas are unaffected.
+    exemplar = FEW_SHOT_EXEMPLARS.get(getattr(cfg, "system_persona", "") or "", "")
 
     # Every prompt repeated group_size times -> a single big batch.
     enc = [tok.encode(p, add_special_tokens=False) for p, _ in prompts]
@@ -191,6 +196,9 @@ def generate_rollouts(
                 reasoning_bonus=cfg.reasoning_bonus,
                 truncation_penalty=cfg.truncation_penalty,
                 empty_think_penalty=cfg.empty_think_penalty,
+                few_shot_exemplar=exemplar,
+                few_shot_echo_penalty=getattr(
+                    cfg, "few_shot_echo_penalty", -3.0),
             )
             rewards.append(reward)
             # full sequence = the UNPADDED prompt + this completion

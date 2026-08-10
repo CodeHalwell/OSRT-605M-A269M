@@ -600,6 +600,46 @@ def correctness_partial_credit(
     return -2.0, "wrong_far_off"
 
 
+_SPECIAL_TAG = re.compile(r"<\|[^|]*\|>")
+
+
+def few_shot_echo_score(
+    completion: str,
+    exemplar: str,
+    n: int = 12,
+) -> tuple[int, int]:
+    """Verbatim overlap between a completion and a few-shot exemplar.
+
+    Returns (matching_ngrams, total_completion_ngrams) over WORD n-grams.
+
+    Why n-grams and not a similarity ratio: we want to catch a long verbatim
+    RUN, not stylistic resemblance. A shared 12-word span is copying; a shared
+    4-word span ("let C be the") is idiom that good reasoning legitimately
+    reuses, and penalising it would punish the very pattern the exemplar is
+    there to teach. n=12 is long enough that the exemplar's generic phrasing
+    does not trip it.
+
+    Special tags are stripped from BOTH sides first. Every well-formed
+    completion necessarily contains `<|think|>` and `<|answer|>`, and so does
+    the exemplar, so leaving them in would produce guaranteed matches that have
+    nothing to do with copying.
+    """
+    if not exemplar.strip():
+        return 0, 0
+
+    def grams(text: str) -> list[tuple[str, ...]]:
+        words = _SPECIAL_TAG.sub(" ", text).split()
+        if len(words) < n:
+            return []
+        return [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+
+    ex = set(grams(exemplar))
+    comp = grams(completion)
+    if not ex or not comp:
+        return 0, len(comp)
+    return sum(1 for g in comp if g in ex), len(comp)
+
+
 def length_ramp_penalty(completion_tokens: int, max_tokens: int) -> float:
     """Smooth length penalty that ramps as the completion approaches the
     output budget.
@@ -650,6 +690,8 @@ def compute_reward(
     reasoning_bonus: float = 0.3,
     truncation_penalty: float = -0.5,
     empty_think_penalty: float = -0.1,
+    few_shot_exemplar: str = "",
+    few_shot_echo_penalty: float = -3.0,
 ) -> tuple[float, dict]:
     """Compute the total reward for a single completion.
 
@@ -659,6 +701,9 @@ def compute_reward(
         3. Reasoning bonus (+0.3): multi-step thinking when correct
         4. Truncation penalty (-0.5): output hit 90% of max tokens
         5. Empty thinking penalty (-0.1): thinking block has no content
+        5b. Few-shot echo penalty (-3.0): a 12-word verbatim run from the
+            supplied exemplar appears in the completion (inactive when no
+            exemplar is passed)
         6. Length penalty (0.0 default): disabled, reasoning needs room
 
     IMPORTANT: pass the actual tag strings used during training (e.g. v4 uses
@@ -741,6 +786,23 @@ def compute_reward(
         breakdown["reasoning_bonus"] = step_bonus
     else:
         breakdown["reasoning_bonus"] = 0.0
+
+    # 3b. Few-shot regurgitation penalty. Only active when an exemplar is
+    # supplied, so unhinted/unexemplified prompts are untouched.
+    #
+    # A few-shot prompt the policy learns to ECHO is worse than none: it stops
+    # being a pattern to follow and becomes a template to reproduce. The direct
+    # incentive is small (copied prose collects the +0.2 format term and, if the
+    # answer happens to be right, the +0.3 step bonus) but the failure mode is
+    # exactly the one already on record — a trace that looks like reasoning and
+    # does none. The penalty is deliberately LARGE relative to what echoing can
+    # earn, so copying is never the cheapest route to a well-formed trace.
+    echo_hits, echo_total = few_shot_echo_score(completion, few_shot_exemplar)
+    echo_pen = few_shot_echo_penalty if echo_hits > 0 else 0.0
+    reward += echo_pen
+    breakdown["few_shot_echo_hits"] = echo_hits
+    breakdown["few_shot_echo_ngrams"] = echo_total
+    breakdown["few_shot_echo_penalty"] = echo_pen
 
     # 4. Length-ramp penalty (smooth, scales toward output token budget)
     # Replaces the old binary truncation_penalty (which only fired at

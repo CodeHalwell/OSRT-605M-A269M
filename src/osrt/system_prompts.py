@@ -121,6 +121,23 @@ REASONING_ON: list[tuple[str, str]] = [
         "<|answer|>120<|/answer|>",
     ),
     (
+        "word_problem_verify_1shot",
+        "You are an assistant for word problems. Inside "
+        "<|think|>...<|/think|>: name the unknown, write the equation, solve "
+        "it, then CHECK the arithmetic by substituting your value back. Inside "
+        "<|answer|>...<|/answer|>, give only the final number, and it must be "
+        "the value your working arrived at.\n\n"
+        "Example:\n"
+        "User: A shop sells an article for 625 at a 25% profit. What was the "
+        "cost price?\n"
+        "Assistant: <|think|>Let C be the cost price. A 25% profit means the "
+        "selling price is 1.25C, so 1.25C = 625. Then C = 625 / 1.25 = 500. "
+        "Check: 500 x 1.25 = 625, which matches the selling price given. So the "
+        "cost price is 500.<|/think|><|answer|>500<|/answer|>\n\n"
+        "Do not repeat the example. Solve the user's problem with its own "
+        "numbers.",
+    ),
+    (
         "general_default",
         "You are a helpful, harmless assistant. For every question: "
         "reason inside <|think|>...<|/think|>, then commit to a final "
@@ -212,3 +229,25 @@ def get_by_name(name: str) -> str:
             if n == name:
                 return t
     raise KeyError(f"unknown system prompt: {name}")
+
+# ── pinned evaluation personas ────────────────────────────────────────
+# The historical default was `Random(0).choice(pool)`, which resolves to these
+# two ONLY for the pool sizes that happened to exist. Growing a pool can move
+# it, silently rebasing every recorded number — the same fragility that already
+# caused one misdiagnosis (a stage scored under a persona it never trained on).
+# Pin them by name so eval defaults are a guarantee rather than an accident.
+DEFAULT_EVAL_ON = "instruction_strict"
+DEFAULT_EVAL_OFF = "instruction_direct"
+
+# ── few-shot exemplar spans, for the regurgitation penalty ────────────
+# Maps persona name -> the DEMONSTRATION text only (not the instructions).
+# A few-shot prompt that the policy learns to echo is worse than no few-shot
+# prompt: it stops being a pattern to follow and becomes a template to
+# reproduce, and echoed prose collects the format term for no work. The penalty
+# needs the exemplar span to compare against, so it lives beside the personas
+# rather than being re-derived by string-splitting at reward time.
+FEW_SHOT_EXEMPLARS: dict[str, str] = {
+    name: text.split("Example", 1)[1] if "Example" in text else ""
+    for name, text in REASONING_ON + REASONING_OFF
+}
+FEW_SHOT_EXEMPLARS = {k: v for k, v in FEW_SHOT_EXEMPLARS.items() if v.strip()}
