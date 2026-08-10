@@ -112,12 +112,52 @@ def main() -> int:
         # panel — `>0` has zero mass and the naive 2*min(p, 1-p) reports
         # p=0.000, i.e. maximal significance for a slope that is identically
         # zero. Same failure with sign flipped for an all-negative slope.
-        p_le = sum(1 for x in v if x <= 0) / len(v)
-        p_ge = sum(1 for x in v if x >= 0) / len(v)
-        pval = min(1.0, 2 * min(p_le, p_ge))
+        # (+1)/(B+1) correction: with finite replicates a tail can be EMPTY,
+        # and reporting p=0.000 asserts more than B replicates can support. The
+        # smallest p this can express is 2/(B+1). The interval is the more
+        # informative statistic regardless.
+        n_le = sum(1 for x in v if x <= 0)
+        n_ge = sum(1 for x in v if x >= 0)
+        pval = min(1.0, 2 * (min(n_le, n_ge) + 1) / (len(v) + 1))
         crosses = "crosses 0" if lo <= 0 <= hi else "EXCLUDES 0"
         print(f"  {k:<6} slope {point[k]:+6.2f} pp/100 steps   "
               f"95% CI [{lo:+.2f}, {hi:+.2f}]   p={pval:.3f}   {crosses}")
+
+    # ── paired differences against non-trend artefacts ─────────────────
+    # The soup->step-100 discontinuity is a LEVEL SHIFT, not part of the
+    # post-100 trend; one linear slope cannot represent both. So references
+    # (artefacts with no step: the SFT soup, the wave-2 soup) are compared as
+    # PAIRED differences on the same items, with a McNemar-style discordant
+    # count, rather than being fitted into the regression.
+    if baseline and rows:
+        last = rows[-1]
+        print("\npaired differences on the same items "
+              f"({args.reps} reps; discordant counts are McNemar's view)")
+        comparisons = [(b, last) for b in baseline]
+        for i, b1 in enumerate(baseline):
+            for b2 in baseline[i + 1:]:
+                comparisons.append((b1, b2))
+        for a, b in comparisons:
+            for key in ("on", "off"):
+                av, bv = a[key], b[key]
+                d_obs = 100.0 * (sum(av) - sum(bv)) / n_items
+                a_only = sum(1 for i in range(n_items) if av[i] and not bv[i])
+                b_only = sum(1 for i in range(n_items) if bv[i] and not av[i])
+                reps = []
+                for _ in range(args.reps):
+                    idx = [rng.randrange(n_items) for _ in range(n_items)]
+                    reps.append(100.0 * sum(av[i] - bv[i] for i in idx) / n_items)
+                reps.sort()
+                lo = reps[int(0.025 * len(reps))]
+                hi = reps[int(0.975 * len(reps))]
+                n_le = sum(1 for x in reps if x <= 0)
+                n_ge = sum(1 for x in reps if x >= 0)
+                pv = min(1.0, 2 * (min(n_le, n_ge) + 1) / (len(reps) + 1))
+                an = a["ckpt"].replace(".pt", "")[:34]
+                bn = b["ckpt"].replace(".pt", "")[:26]
+                print(f"  acc_{key:<3} {an:<34} - {bn:<26} "
+                      f"{d_obs:+6.2f}pp  CI [{lo:+.2f}, {hi:+.2f}]  p={pv:.3f}  "
+                      f"discordant {a_only}/{b_only}")
 
     # ── leave-one-checkpoint-out ───────────────────────────────────────
     print("\nleave-one-checkpoint-out slopes (pp/100 steps)")
