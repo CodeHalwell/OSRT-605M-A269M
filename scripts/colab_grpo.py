@@ -351,12 +351,23 @@ def main() -> int:  # noqa: PLR0915
             # <|answer|> forfeits the +3.0 exact-format term AND takes the
             # truncation penalty, so reward sits negative and it reads as "the
             # model is bad" rather than "max_gen_len is too small".
-            trunc = sum(1 for r in flat if cfg.answer_close not in r.text)
+            # TWO DISTINCT failure modes, previously conflated under one
+            # counter. `no_close` counts completions missing the answer-close
+            # tag; `cap` counts completions that actually hit max_gen_len, which
+            # compute_reward already flags as breakdown["truncated"]
+            # (completion_tokens >= max_tokens) and which this logger ignored.
+            # Reading no_close as "hit the cap" made "truncation self-corrected"
+            # and "1024 was required" look measured when neither was: a model
+            # learning to emit <|/answer|> moves no_close without touching cap.
+            no_close = sum(1 for r in flat if cfg.answer_close not in r.text)
+            cap = sum(1 for r in flat if (r.breakdown or {}).get("truncated"))
+            trunc = no_close  # keep the historical column comparable
             vram = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
             print(f"step {step:>5d}/{cfg.total_steps} | loss {loss_val:.4f} | "
                   f"reward {sum(rewards) / len(rewards):+.3f} | acc {acc:.1%} | "
-                  f"live {live}/{len(flat)} | trunc {trunc}/{len(flat)} | "
+                  f"live {live}/{len(flat)} | noclose {no_close}/{len(flat)} | "
+                  f"cap {cap}/{len(flat)} | "
                   f"kl {mean_kl:.4f} | lr {lr:.2e} | "
                   f"vram {vram:.1f}GB | {time.time() - t0:.0f}s", flush=True)
             if use_wandb:
@@ -365,7 +376,9 @@ def main() -> int:  # noqa: PLR0915
                            "grpo/mean_reward": sum(rewards) / len(rewards),
                            "grpo/approx_kl": mean_kl, "grpo/lr": lr,
                            "grpo/live_rollouts": live,
-                           "grpo/truncated": trunc}, step=step)
+                           "grpo/truncated": trunc,
+                           "grpo/no_answer_close": no_close,
+                           "grpo/hit_cap": cap}, step=step)
 
         # Real generations — scalars cannot show the text has gone degenerate,
         # and reward hacking looks exactly like a healthy reward curve.
