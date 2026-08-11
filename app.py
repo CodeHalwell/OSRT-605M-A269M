@@ -1467,6 +1467,71 @@ def grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8,
 @app.function(
     image=image,
     volumes={"/vol/checkpoints": vol},
+    timeout=3600,
+)
+def debias_ema(ema_name: str, base_name: str, out_name: str = "") -> str:
+    """Remove the initial checkpoint's residual weight from a weight EMA.
+
+    An EMA started at theta_0 satisfies
+        e_n = d^n * theta_0 + (1-d) * sum_{t=1..n} d^(n-t) * theta_t
+    with coefficients summing to 1. At d=0.99, n=40 the first term is
+    0.99^40 = 0.669 — TWO THIRDS of the shadow is still the starting
+    checkpoint. So an EMA scoring like its base proves nothing about averaging;
+    it may simply have stayed near a strong base. Measured: the seed-2 EMA hit
+    19.5% acc_on against the soup's 20.0% (p=0.913, indistinguishable) while
+    being 66.9% soup.
+
+    Solving for the trajectory term:
+        theta_avg = (e_n - d^n * theta_0) / (1 - d^n)
+    which is EXACTLY the convex, exponentially-weighted soup of theta_1..theta_n
+    with the base contribution removed (its weights are (1-d)*d^(n-t)/(1-d^n),
+    summing to 1, so the result stays inside the trajectory's convex hull —
+    this is a re-weighting, not an extrapolation).
+
+    Evaluating theta_avg on the development panel isolates genuine averaging
+    from base proximity WITHOUT waiting for 900 steps to wash the base out.
+
+    Reads decay and update count from the EMA sidecar's own metadata.
+    """
+    import torch
+
+    d = "/vol/checkpoints/v5"
+    eck = torch.load(f"{d}/{ema_name}", map_location="cpu", weights_only=True)
+    bck = torch.load(f"{d}/{base_name}", map_location="cpu", weights_only=True)
+    decay = float(eck.get("ema_decay", 0.99))
+    updates = int(eck.get("ema_updates", 0))
+    if not updates:
+        raise ValueError(f"{ema_name} records no ema_updates; cannot debias")
+    w0 = decay ** updates
+    if w0 >= 0.999:
+        raise ValueError(f"residual base weight {w0:.4f} leaves nothing to "
+                         f"debias ({updates} updates at decay {decay})")
+    es = eck.get("model_state_dict", eck)
+    bs = bck.get("model_state_dict", bck)
+    print(f"decay {decay}  updates {updates}  residual base weight "
+          f"{w0:.4f}  divisor {1 - w0:.4f}", flush=True)
+
+    out = {}
+    for k, v in es.items():
+        if k not in bs or bs[k].shape != v.shape or not v.is_floating_point():
+            out[k] = v.clone()
+            continue
+        # (e - w0*theta_0) / (1 - w0), in fp32 then cast back
+        out[k] = (((v.float() - w0 * bs[k].float()) / (1.0 - w0))
+                  .to(v.dtype))
+    name = out_name or ema_name.replace(".pt", "_debiased.pt")
+    torch.save({"step": eck.get("step"), "model_state_dict": out,
+                "ema_decay": decay, "ema_updates": updates,
+                "debiased_from": ema_name, "debias_base": base_name,
+                "residual_base_weight_removed": w0}, f"{d}/{name}")
+    vol.commit()
+    print(f"wrote {name}", flush=True)
+    return name
+
+
+@app.function(
+    image=image,
+    volumes={"/vol/checkpoints": vol},
     timeout=1800,
 )
 def ckpt_drift(a: str, b: str) -> dict:
@@ -2081,6 +2146,13 @@ def run_make_soup(prefix: str = "osrt_v5_sft_v4",
     """Average checkpoints into a soup, then score it against the baseline."""
     name = make_soup.remote(prefix=prefix, steps=steps)
     print(f"created {name}")
+
+
+@app.local_entrypoint()
+def run_debias_ema(ema_name: str, base_name: str, out_name: str = ""):
+    """Strip the base's residual weight from an EMA to test averaging alone."""
+    print(debias_ema.remote(ema_name=ema_name, base_name=base_name,
+                            out_name=out_name))
 
 
 @app.local_entrypoint()

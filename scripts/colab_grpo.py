@@ -30,6 +30,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -63,6 +64,54 @@ def _latest_local(ckpt_dir: Path, prefix: str) -> tuple[Path | None, int]:
     return best, best_step
 
 
+def _latest_hf(repo: str, prefix: str, ckpt_dir: Path) -> tuple[Path | None, int]:
+    """Newest <prefix>_step_N.pt on the HF repo, downloaded into ckpt_dir.
+
+    REQUIRED for multi-session runs. /content/ckpt dies with the VM, so a run
+    spanning several Colab sessions has NO local checkpoint at the start of each
+    one — and without this it silently restarted from step 0 every time. A
+    200-step run across three sessions would have produced three ~65-step runs
+    and never reached 200. The docstring above claimed "else HF"; the code did
+    not implement it.
+
+    Also pulls the matching EMA sidecar when one was pushed, so the shadow
+    resumes rather than restarting from the resumed weights. Optimizer state is
+    deliberately local-only (4.8GB), so AdamW moments WILL be cold after a
+    session boundary — a ~20-step rebuild at beta2=0.95, reported so it is not
+    mistaken for a training anomaly.
+    """
+    if not repo:
+        return None, -1
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+        pat = re.compile(rf"^{re.escape(prefix)}_step_(\d+)\.pt$")
+        best, best_step = None, -1
+        for f in HfApi().list_repo_files(repo, repo_type="model"):
+            m = pat.match(f)
+            if m and int(m.group(1)) > best_step:
+                best, best_step = f, int(m.group(1))
+        if best is None:
+            return None, -1
+        print(f"resuming from HF: {best} (step {best_step})", flush=True)
+        dest = ckpt_dir / best
+        shutil.copy2(hf_hub_download(repo, best, repo_type="model"), dest)
+        ema_name = f"{prefix}_ema_step_{best_step}.pt"
+        try:
+            shutil.copy2(hf_hub_download(repo, ema_name, repo_type="model"),
+                         ckpt_dir / f"{prefix}_ema.pt")
+            print(f"  also pulled {ema_name} -> EMA sidecar", flush=True)
+        except Exception:
+            print("  no matching EMA sidecar on HF; shadow restarts from the "
+                  "resumed weights", flush=True)
+        print("  NOTE: optimizer state is local-only, so AdamW moments are COLD "
+              "(~20-step rebuild at beta2=0.95)", flush=True)
+        return dest, best_step
+    except Exception as e:  # noqa: BLE001 — a failed scan must not kill the run
+        print(f"HF resume scan failed ({type(e).__name__}: {e}); "
+              f"falling back to the base checkpoint", flush=True)
+        return None, -1
+
+
 def main() -> int:  # noqa: PLR0915
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt-dir", default="/content/ckpt")
@@ -82,6 +131,17 @@ def main() -> int:  # noqa: PLR0915
     ap.add_argument("--micro-batch", type=int, default=4,
                     help="sequences per log-prob forward")
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--seed", type=int, default=1234,
+                    help="seeds Python, CPU torch AND CUDA RNGs, and is logged "
+                         "and stored in every checkpoint. Previously NOTHING "
+                         "seeded torch: only prompt choice was fixed (via "
+                         "random.Random(1234 + start_step)), so rollout "
+                         "sampling was unrecorded and two 'seed' runs were "
+                         "irreproducible — they demonstrated sensitivity but "
+                         "could not estimate between-run variance. Default 1234 "
+                         "keeps prompt selection identical to earlier runs; "
+                         "torch seeding is new, so a --seed 1234 run will NOT "
+                         "reproduce the unseeded ones.")
     ap.add_argument("--peak-lr", type=float, default=0.0,
                     help="override cfg.peak_lr (0 = use cfg). For an LR "
                          "calibration probe, compare at STEP 30: lr_at_step "
@@ -136,6 +196,11 @@ def main() -> int:  # noqa: PLR0915
     args = ap.parse_args()
 
     cfg = GRPOv6Config()
+    import random as _random
+    _random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    print(f"seed: {args.seed} (python + cpu torch + cuda)", flush=True)
     if args.total_steps:
         cfg.total_steps = args.total_steps
     if args.max_gen_len:
@@ -174,6 +239,9 @@ def main() -> int:  # noqa: PLR0915
     from osrt.model import OSRTForCausalLM
     model = OSRTForCausalLM(model_config).to(device)
     resume_path, start_step = _latest_local(ckpt_dir, cfg.stage_prefix)
+    if resume_path is None:
+        resume_path, hf_step = _latest_hf(args.hf_repo, cfg.stage_prefix, ckpt_dir)
+        start_step = hf_step if resume_path is not None else 0
     if resume_path is None:
         start_step = 0
         local_base = ckpt_dir / args.base_ckpt
@@ -323,7 +391,7 @@ def main() -> int:  # noqa: PLR0915
         )
     print(f"{len(prompts_all)} prompts from {args.prompts} (gold validated)",
           flush=True)
-    rng = random.Random(1234 + start_step)
+    rng = random.Random(args.seed + start_step)
     sys_text = get_by_name(cfg.system_persona) if cfg.system_persona else ""
     end_ans = tok.encode(cfg.answer_close, add_special_tokens=False)[0]
     stop_ids = [end_ans]
@@ -441,6 +509,7 @@ def main() -> int:  # noqa: PLR0915
             # LR provenance: a calibration sweep produces checkpoints that are
             # otherwise indistinguishable from each other.
             torch.save({"step": step, "model_state_dict": model.state_dict(),
+                        "seed": args.seed,
                         "peak_lr": cfg.peak_lr, "hra_lr": cfg.hra_lr,
                         "kl_coeff": cfg.kl_coeff, "temperature": cfg.temperature,
                         "top_p": getattr(cfg, "top_p", 1.0),
