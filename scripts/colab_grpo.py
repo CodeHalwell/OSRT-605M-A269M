@@ -435,6 +435,30 @@ def main() -> int:  # noqa: PLR0915
     torch.save({"step": cfg.total_steps, "model_state_dict": model.state_dict()},
                final)
     print(f"\nGRPO complete. {final}", flush=True)
+    # PUSH IT. The upload above only runs inside the ckpt_interval block, so the
+    # final weights previously stayed on an ephemeral Colab VM and were lost
+    # when the session ended — the newest surviving checkpoint was whatever the
+    # last interval happened to be (step 40 of a 50-step run). Also push the EMA
+    # shadow, which is a separate evaluation candidate.
+    if args.hf_repo:
+        from huggingface_hub import HfApi
+        to_push = [final]
+        if ema_state is not None:
+            ema_final = ckpt_dir / f"{cfg.stage_prefix}_ema_final.pt"
+            torch.save({"step": cfg.total_steps, "source_step": cfg.total_steps,
+                        "ema_decay": args.ema_decay, "ema_updates": ema_updates,
+                        "model_state_dict": ema_state}, ema_final)
+            to_push.append(ema_final)
+        for f in to_push:
+            try:
+                HfApi().upload_file(
+                    path_or_fileobj=str(f), path_in_repo=f.name,
+                    repo_id=args.hf_repo, repo_type="model",
+                    commit_message=f"grpo final ({cfg.total_steps} steps)")
+                print(f"  -> pushed {f.name}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"  push failed for {f.name} "
+                      f"({type(e).__name__}: {e})", flush=True)
     return 0
 
 
