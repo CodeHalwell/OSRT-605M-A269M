@@ -82,6 +82,34 @@ def main() -> int:  # noqa: PLR0915
     ap.add_argument("--micro-batch", type=int, default=4,
                     help="sequences per log-prob forward")
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--peak-lr", type=float, default=0.0,
+                    help="override cfg.peak_lr (0 = use cfg). For an LR "
+                         "calibration probe, compare at STEP 30: lr_at_step "
+                         "computes warmup as peak_lr*eff/warmup_steps "
+                         "independently of total_steps, and at step 30 "
+                         "eff == warmup_steps so the cosine term is cos(0)=1 "
+                         "and returns exactly peak_lr. Steps 0-30 are therefore "
+                         "schedule-matched for ANY total_steps; divergence "
+                         "starts at 31.")
+    ap.add_argument("--hra-lr", type=float, default=0.0,
+                    help="override cfg.hra_lr (0 = use cfg). HOLD THIS FIXED "
+                         "while raising --peak-lr to attack adapter dominance: "
+                         "measured HRA:base movement was 49x against a 10x lr "
+                         "ratio, so scaling both together preserves the "
+                         "imbalance. The HRA group is driven at "
+                         "scheduled_lr * (hra_lr / peak_lr).")
+    ap.add_argument("--run-tag", default="",
+                    help="appended to cfg.stage_prefix. REQUIRED for an LR "
+                         "sweep: without it every setting writes the same "
+                         "<prefix>_step_N.pt names, so HF pushes collide and "
+                         "_latest_local can resume a run at one LR from a "
+                         "checkpoint trained at another.")
+    ap.add_argument("--kl-abort", type=float, default=0.0,
+                    help="stop if approx_kl exceeds this (0 = disabled). A "
+                         "calibration probe at a raised LR multiplies drift: "
+                         "KL ran ~0.0024/step at beta=0.04 and peak_lr 1.5e-6, "
+                         "so 3.3x LR implies ~0.008/step, nearing wave 1's "
+                         "worst of 0.33 by step 30.")
     ap.add_argument("--ema-decay", type=float, default=0.99,
                     help="passive weight-EMA decay (0 disables). 0.99 gives a "
                          "~100-step memory, right for a ~900-step run; 0.999 "
@@ -96,7 +124,7 @@ def main() -> int:  # noqa: PLR0915
     # ── speed levers ─────────────────────────────────────────────────
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the policy. Helps BOTH generation and "
-                         "the log-prob passes (~20%+). Weights are not dynamo "
+                         "the log-prob passes (~20%%+). Weights are not dynamo "
                          "guards, so the graph stays valid across updates. Do "
                          "NOT prepack experts here — a gradient step would "
                          "leave the packed copies stale.")
@@ -112,6 +140,16 @@ def main() -> int:  # noqa: PLR0915
         cfg.total_steps = args.total_steps
     if args.max_gen_len:
         cfg.max_gen_len = args.max_gen_len
+    if args.peak_lr:
+        cfg.peak_lr = args.peak_lr
+    if args.hra_lr:
+        cfg.hra_lr = args.hra_lr
+    if args.run_tag:
+        cfg.stage_prefix = f"{cfg.stage_prefix}_{args.run_tag}"
+        cfg.wandb_run_name = f"{cfg.wandb_run_name}-{args.run_tag}"
+    print(f"lr: peak {cfg.peak_lr:.3e}  hra {cfg.hra_lr:.3e}  "
+          f"ratio {cfg.hra_lr / cfg.peak_lr:.1f}x | prefix {cfg.stage_prefix}",
+          flush=True)
     num_prompts = args.num_prompts or cfg.grad_accum_steps
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -382,6 +420,14 @@ def main() -> int:  # noqa: PLR0915
 
         # Real generations — scalars cannot show the text has gone degenerate,
         # and reward hacking looks exactly like a healthy reward curve.
+        if args.kl_abort and mean_kl > args.kl_abort:
+            print(f"\nABORT: approx_kl {mean_kl:.4f} exceeded --kl-abort "
+                  f"{args.kl_abort} at step {step}. The policy is drifting off "
+                  f"the frozen reference faster than the anchor holds; wave 1's "
+                  f"worst was 0.33. Checkpoint at the last interval is intact.",
+                  flush=True)
+            break
+
         if step % cfg.sample_print_interval == 0:
             print(f"  ---- rollouts @ step {step} (T={cfg.temperature}) ----",
                   flush=True)
@@ -392,7 +438,13 @@ def main() -> int:  # noqa: PLR0915
 
         if step > 0 and step % args.ckpt_interval == 0:
             out = ckpt_dir / f"{cfg.stage_prefix}_step_{step}.pt"
-            torch.save({"step": step, "model_state_dict": model.state_dict()}, out)
+            # LR provenance: a calibration sweep produces checkpoints that are
+            # otherwise indistinguishable from each other.
+            torch.save({"step": step, "model_state_dict": model.state_dict(),
+                        "peak_lr": cfg.peak_lr, "hra_lr": cfg.hra_lr,
+                        "kl_coeff": cfg.kl_coeff, "temperature": cfg.temperature,
+                        "top_p": getattr(cfg, "top_p", 1.0),
+                        "max_gen_len": cfg.max_gen_len}, out)
             print(f"  -> saved {out.name}", flush=True)
             # Optimizer state goes to a SEPARATE, LOCAL-ONLY file. AdamW moments
             # for 601M params are ~4.8GB, so pushing them every 10 steps would
