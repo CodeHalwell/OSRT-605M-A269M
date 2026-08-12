@@ -1,0 +1,22 @@
+[
+ {
+  "question": "1500 is increased by a certain percentage, resulting in a final number of 1800. What is the percentage increase?",
+  "answer": "20"
+ },
+ {
+  "question": "The salary of a typist was at first raised by 10% and then the same was reduced by 5%. He presently draws some amount. His original salary was Rs. 2000. What is his present salary?",
+  "answer": "2090."
+ },
+ {
+  "question": "The salary of a typist was at first raised by 10% and then the same was reduced by 5%. He presently draws Rs. 2090. What was his original salary?",
+  "answer": "2000."
+ },
+ {
+  "question": "The salary of a typist was at first raised by 10% and then the same was reduced by some percentage. He presently draws Rs. 2090. His original salary was Rs. 2000. What was the percentage decrease in his salary?",
+  "answer": "5"
+ },
+ {
+  "question": "The salary of a typist was at first raised by some percentage and then the same was reduced by 5%. He presently draws Rs. 2090. His original salary was Rs. 2000. What was the percentage increase in his salary?",
+  "answer": "10"
+ }
+]

@@ -30,6 +30,7 @@ dependencies = [
     "google-genai>=2.8.0",
     "openrouter>=0.9.1",
     "openai>=2.41.0",
+    "unsloth>=2026.8.7",
 ]
 
 [build-system]

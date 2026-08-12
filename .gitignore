@@ -79,3 +79,6 @@ wheels/
 .son-of-anton/v6_tokenizer_export/
 rollouts/sft_v2.jsonl
 rollouts/sft_v3.jsonl
+# sft_v4.jsonl is 103MB — over GitHub's 100MB hard limit, would be rejected.
+rollouts/sft_v4.jsonl
+rollouts/sft_v4_val.jsonl
