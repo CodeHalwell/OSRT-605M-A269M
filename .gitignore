@@ -77,6 +77,9 @@ wheels/
 .junie/
 .ruff_cache/
 .son-of-anton/v6_tokenizer_export/
+# Third-party paper PDFs: arXiv's default licence does not grant
+# redistribution rights. Cite the arXiv ID; keep PDFs local.
+research/*.pdf
 rollouts/sft_v2.jsonl
 rollouts/sft_v3.jsonl
 # sft_v4.jsonl is 103MB — over GitHub's 100MB hard limit, would be rejected.
