@@ -1,6 +1,14 @@
 # MoE & Routing
 
-*Part of the OSRT-605M `docs/` architecture series. Companion to `../docs/ARCHITECTURE.md §7`.*
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
+*Part of the OSRT-605M `docs/` architecture series. Companion to `ARCHITECTURE.md §7`.*
 
 This document explains the **mixture-of-experts (MoE)** sub-block of the
 OSRT-605M model — the part that replaces the dense feed-forward network of a
@@ -10,7 +18,7 @@ each token to only a few of them. Everything here is grounded in
 canonical preset `OSRT_605M_A288M` in `src/osrt/presets.py`.
 
 > **A note on ground truth.** Three sources describe this block and they do
-> *not* fully agree. The **code** wins. `../docs/ARCHITECTURE.md §7` contains stale
+> *not* fully agree. The **code** wins. `ARCHITECTURE.md §7` contains stale
 > draft numbers (12 experts, `mod 12`, a duplicated §7.6), and the
 > `OSRTConfig` *constructor defaults* in `config.py` are deliberately neutral
 > (and actually invert the routed/shared widths). The real model is built
@@ -128,8 +136,11 @@ A few things worth teaching here:
   smoothly toward zero on the negative side, so a huge *negative* gate is
   harmless. The `up` path is clamped on **both** sides because it enters the
   product *linearly* and a large magnitude of either sign is dangerous. This
-  is a DeepSeek-V4-style stability measure (`../docs/ARCHITECTURE.md §7.8`); for a
-  healthy model it is a no-op that only caps the tails.
+  is a DeepSeek-V4-style stability measure (`ARCHITECTURE.md §7.8`); for a
+  healthy model it is a no-op that only caps the tails. **Since 2026-08-31
+  `OSRT_V7` sets `situ_glu=True`** (roadmap §14.1), whose param-free smooth
+  cap *replaces* SwiGLU + this hard clamp; the clamp value stays in the
+  preset as the fallback for the G3 ladder's SiTU-vs-clamp A/B.
 - **`hidden` is rounded up to a multiple of 64** (`model.py:101`) for
   tensor-core alignment. Both preset widths (3,840 and 2,816) are already
   multiples of 64, so nothing changes for OSRT-605M.
@@ -248,7 +259,7 @@ This is DeepSeek-V3's "aux-loss-free" load balancing: the router weights learn
 balance. No fragile trade-off between an auxiliary balance loss and the LM
 loss.
 
-> **Two divergences from `../docs/ARCHITECTURE.md §7.6` and the project notes — code
+> **Two divergences from `ARCHITECTURE.md §7.6` and the project notes — code
 > wins:**
 >
 > 1. **The update is proportional, not a fixed `±γ`.** The design notes
@@ -274,7 +285,7 @@ bias row per loop corrects each loop's load independently (`model.py:226-231`).
 ### 5.2 Where the bias does *and does not* act — the real DeepSeek trick
 
 This is the subtle, important part, and it is where the code and the design
-notes most clearly diverge. The notes (and `../docs/ARCHITECTURE.md §7.4`) say *"bias
+notes most clearly diverge. The notes (and `ARCHITECTURE.md §7.4`) say *"bias
 only in TOP-K selection, not in gating weights."* **The code does not do
 that.** The gating weights are renormalised from `raw_top_probs`, which come
 from `probs` — the bias-and-Gumbel affinity (`model.py:600, 614`). So the bias
@@ -344,9 +355,9 @@ logits so it disciplines the learned router, not the controller or the noise.
 
 There is also a per-sequence Switch loss (`model.py:665-683`) that penalises
 imbalance *inside* a single sequence — useful at long context where one
-document can dominate a micro-batch. It is **off in the preset**:
-`router_seq_balance_loss_coeff` defaults to `0.0` (`config.py:122`) and the
-preset does not enable it. Opt-in only.
+document can dominate a micro-batch. `router_seq_balance_loss_coeff`
+defaults to `0.0` in `OSRTConfig`, but since 2026-08-31 `OSRT_V7` sets it
+to `1e-4` per the roadmap's §14.1 committed router line.
 
 ---
 
@@ -527,7 +538,7 @@ tensors** (kept non-`None` so the wrapper's accumulation stays well-defined)
 and populates telemetry from the hard histogram so the collapse monitor never
 reads stale learned-router values (`model.py:426-466`).
 
-> `../docs/ARCHITECTURE.md §7.5` still says `hash(token_id) mod 12` on "blocks 0 and
+> `ARCHITECTURE.md §7.5` still says `hash(token_id) mod 12` on "blocks 0 and
 > 1." That is stale draft prose — the authoritative spec is the
 > "DECISION MADE" box in §7.5 and the `_hash_route` code: `(token_id +
 > loop_idx) % num_routed_experts`, off by default.
@@ -658,11 +669,10 @@ truth. Running it on the canonical preset (`OSRT_605M_A288M`) reports:
 
 ```
 cfg: dim=1536 vocab=65536 blocks=3 loops=6 kv_heads=8
-     experts=8 top_k=2 h_routed=3840 h_shared=2816 rank=256 mtp=2 mhc=True
+     experts=28 top_k=4 h_routed=2112 h_shared=2816 rank=256 mtp=2
 ----------------------------------------------------------------
   embedding           100,690,944
   attention            17,308,032
-  mhc                     921,766
   shared_expert        38,928,384
   routed_experts      424,673,280
   router                   36,867
@@ -691,7 +701,7 @@ Takeaways:
 ## 13. Failure modes this design guards against
 
 The MoE block is shaped by hard lessons from earlier OSRT iterations
-(`../docs/LEARNINGS.md`). Each mechanism above maps to a failure it prevents:
+(`LEARNINGS.md`). Each mechanism above maps to a failure it prevents:
 
 - **Router collapse** (a few experts win everything). Guarded by the
   *combination* of the non-learned balance bias (§5.1–5.2), the Switch
@@ -708,7 +718,7 @@ The MoE block is shaped by hard lessons from earlier OSRT iterations
   giving each expert a distinct starting subspace (§9), and the choice of
   **8 routed experts instead of 12** so top-2 yields denser routing (25% vs
   16.7%) — more capacity per token, less idle capacity at 601M scale
-  (`presets.py:31`, `../docs/ARCHITECTURE.md §7.1`).
+  (`presets.py:31`, `ARCHITECTURE.md §7.1`).
 
 - **The "dense crutch"** (routed branch zeroed out, shared expert does
   everything). Guarded by the softplus-reparameterised `moe_gate` that can
@@ -721,7 +731,7 @@ The MoE block is shaped by hard lessons from earlier OSRT iterations
 
 - **Loop-depth collapse** — the project's single biggest discovery: probing
   showed one recursive loop was doing ~90% of the cross-entropy reduction
-  while the others were near-idle (`../docs/LEARNINGS.md §1.1`). **Important
+  while the others were near-idle (`LEARNINGS.md §1.1`). **Important
   scoping:** this is *not* fixed inside `MoELayer`. It is addressed at the
   loop/training level by `aux_loop_loss_weight` (apply the LM head at every
   loop) and `loop_dropout_prob` (randomly truncate the loop chain so no single

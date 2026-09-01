@@ -1,4 +1,4 @@
-# ../docs/LEARNINGS.md — Everything we learned from nano-osrt v5 (363M)
+# LEARNINGS.md — Everything we learned from nano-osrt v5 (363M)
 
 **Scope:** the full lineage of v5 nano-osrt training, from pretrain →
 SFT → GRPO → MOPD distillation → grpo_multi → system-prompt
@@ -9,8 +9,8 @@ repeat any of the v5 mistakes.
 
 **Companion docs:**
 - [`README.md`](../README.md) — the v6 design that bakes in these lessons
-- [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) — v6 technical spec
-- [`../docs/RESEARCH.md`](../docs/RESEARCH.md) — external research that shaped v6
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — v6 technical spec
+- [`RESEARCH.md`](RESEARCH.md) — external research that shaped v6
 
 ---
 

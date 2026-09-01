@@ -1,5 +1,13 @@
 # Recursion: Depth Recurrence, Loop Embeddings & Loop Aux
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
 > the model gets deep without getting big: it runs **3 physical decoder blocks
 > 6 times** (recursive depth recurrence), how it keeps the six iterations from
@@ -8,8 +16,8 @@
 
 A note on sourcing. Where this document states a *mechanic* it cites
 `src/osrt/model.py` (and `src/osrt/config.py`) by line — that is the source of
-truth. `../docs/ARCHITECTURE.md` and `../docs/RESEARCH.md` are cited only for *intent*, project
-*history*, and *research grounding*. `../docs/ARCHITECTURE.md §10` itself says its
+truth. `ARCHITECTURE.md` and `RESEARCH.md` are cited only for *intent*, project
+*history*, and *research grounding*. `ARCHITECTURE.md §10` itself says its
 pseudocode is "illustrative ... the implementation in `model.py` is the source
 of truth," and in two places below the code and the prose disagree. When they
 do, the code wins and the discrepancy is flagged.
@@ -40,7 +48,7 @@ num_blocks: int = 3,
 recursive_loops: int = 6,
 ```
 
-`../docs/ARCHITECTURE.md §16.1` makes the contract explicit: the recursive forward
+`ARCHITECTURE.md §16.1` makes the contract explicit: the recursive forward
 "MUST apply the SAME 3 physical blocks 6 times (not 18 different block
 instances)." If you accidentally instantiated 18 blocks you'd have a vanilla
 deep transformer and would have thrown away the whole design.
@@ -107,7 +115,7 @@ to *specialize* ("loop 0, you do early syntactic work; loop 5, you do final
 output shaping"). The recurrence degenerates toward a single fixed-point step
 repeated. The looped-LM literature is blunt about this: "pure weight-tying
 without loop conditioning degenerates" and "loop embeddings ... are critical"
-(`../docs/RESEARCH.md:276-277`). They are the Universal-Transformer "depth embedding"
+(`RESEARCH.md:276-277`). They are the Universal-Transformer "depth embedding"
 idea: tell the shared block *which iteration it is on*.
 
 ### Where the loop embedding actually enters (read this carefully)
@@ -138,7 +146,7 @@ stream that flows through attention and the expert FFNs. The conditioning is
 "loop 5 should route to a different mix of experts than loop 0," which is exactly
 the lever you want for per-iteration specialization in a sparse MoE.
 
-> **Discrepancy flagged (code vs. docs).** `../docs/ARCHITECTURE.md §5.2` and the
+> **Discrepancy flagged (code vs. docs).** `ARCHITECTURE.md §5.2` and the
 > common project shorthand describe the loop embedding as a residual *bias* —
 > "Added BEFORE the first physical block at each loop ... the only parameter
 > that differs across loop iterations." The shipped code does **not** do that.
@@ -156,7 +164,7 @@ and let training pull them apart only as much as it needs.
 ### How hash-routed early blocks break symmetry *without* the loop embedding
 
 There is a subtlety: early blocks can use deterministic hash routing instead of
-the learned router (`hash_routing_blocks`, `../docs/ARCHITECTURE.md §7.5`). On that path
+the learned router (`hash_routing_blocks`, `ARCHITECTURE.md §7.5`). On that path
 the code `return`s *before* the `loop_emb` addition (`src/osrt/model.py:506-512`),
 so a hash-routed block never reads `loop_embeddings`. Those loops still
 differentiate because the hash itself is **loop-indexed**
@@ -200,7 +208,7 @@ This is not hypothetical. Loop collapse was hit empirically — the project's v5
 history lists "loop collapse" among the late-discovered failures
 (`README.md:45,135`), and a dedicated training stage (`loop_fix` / `loop_fix_v2`)
 was built specifically to repair it. (Note: this is distinct from the *router*/
-representation collapse in `../docs/RESEARCH.md:645-651` Cells B/D — that is a routing
+representation collapse in `RESEARCH.md:645-651` Cells B/D — that is a routing
 load-balance failure. Loop collapse is about *iterations going idle*, a different
 problem with a different fix.)
 
@@ -213,8 +221,7 @@ objective. Two pieces cooperate.
 
 ```python
 if capture_aux and loop < n_loops_to_run - 1:
-    # Collapse the mHC stream to a single vector for the aux head
-    intermediate_hiddens.append(self._collapse(x) if self.use_mhc else x)
+    intermediate_hiddens.append(x)
 
 loop_rms.append(x.float().pow(2).mean().sqrt())
 if loop < n_loops_to_run - 1:
@@ -223,10 +230,8 @@ if loop < n_loops_to_run - 1:
 
 The intermediate hidden is captured at the **end of each non-final loop**, after
 the 3 blocks but **before `norm_loop`** (the `norm_loop` is applied on the *next*
-line, only for non-final loops). It uses the dedicated learnable collapse head
-`mhc_collapse` via `_collapse(...)` (`src/osrt/model.py:1288-1291`) — never a
-stale dynamic mixing matrix — to mix the multi-channel residual stream down to a
-single `dim`-vector. `capture_aux` is on only when
+line, only for non-final loops). The residual stream is a single `dim`-vector
+per token, so the hidden is captured directly. `capture_aux` is on only when
 `aux_loop_loss_weight > 0 and self.training` (`src/osrt/model.py:1423-1426`), so
 this entire path is **train-only**.
 
@@ -249,7 +254,7 @@ Three things to notice:
 
 - **The LM head is the tied embedding** — `F.linear(h_norm, embedding.weight)`.
   No new parameters: the same matrix that maps tokens→embeddings (and final
-  hidden→logits) is reused on every intermediate loop. `../docs/ARCHITECTURE.md §9.2`:
+  hidden→logits) is reused on every intermediate loop. `ARCHITECTURE.md §9.2`:
   "the LM head is SHARED across all loop outputs (it IS the embedding). No
   additional parameters."
 - **The normalization applied to the capture is `norm_out`** (line 1722), the
@@ -270,11 +275,11 @@ isn't polluted. Per-loop weights can override the uniform weight via
 > **Weight value.** The *code default* is `aux_loop_loss_weight = 0.0`
 > (`config.py:136`) — i.e. off unless a training stage turns it on. The training
 > stages set it to **0.05** (pretrain/MOPD/SFT) and 0.03 during GRPO
-> (`../docs/ARCHITECTURE.md §11.2`). `../docs/ARCHITECTURE.md §16.1` warns: if it is 0, "training
+> (`ARCHITECTURE.md §11.2`). `ARCHITECTURE.md §16.1` warns: if it is 0, "training
 > MUST monitor for loop collapse." So 0.05 is the *operating* value; 0.0 is just
 > the inert default.
 
-The payoff is twofold (`../docs/ARCHITECTURE.md §9.2`): (1) loops 0..N-2 actually
+The payoff is twofold (`ARCHITECTURE.md §9.2`): (1) loops 0..N-2 actually
 contribute, defeating collapse; and (2) because each intermediate loop now emits
 a usable next-token distribution, you can read off a *draft* prediction at an
 early loop and verify it at the full loop count — the speculative-decode hook of
@@ -440,7 +445,7 @@ def _resolve_num_loops(self, num_loops: int | None) -> int:
   historical path: every downstream count and index is unchanged.
 - `K` in `[1, recursive_loops]` → run only the **first K** loops before
   collapse/`norm_out` + the LM head. Fewer loops = faster, slightly lower
-  quality. `../docs/ARCHITECTURE.md §12.2` sketches a rough trade-off (≈3 loops at ~85%
+  quality. `ARCHITECTURE.md §12.2` sketches a rough trade-off (≈3 loops at ~85%
   quality, 5 at ~98%); treat those numbers as targets, not measurements.
 
 What makes a reduced K *usable* rather than garbage is the §4 aux training: each
@@ -450,7 +455,7 @@ heads, an early loop's hidden would be uncalibrated scratch state and
 short-circuiting would degrade badly.
 
 **Speculative-draft connection.** The same property powers greedy speculative
-decoding (`src/osrt/model.py:2082-2147`, `../docs/ARCHITECTURE.md §12.3`): the **drafter**
+decoding (`src/osrt/model.py:2082-2147`, `ARCHITECTURE.md §12.3`): the **drafter**
 runs at the cheap `spec_draft_loops` count and the **verifier** runs the full
 loop count, accepting the longest greedy-matching prefix. The drafter is capped
 at the verifier's loop count — `draft_loops = min(spec_draft_loops, full_loops)`
@@ -473,7 +478,7 @@ idx = loop * num_blocks + block_idx
 So for `recursive_loops=6, num_blocks=3` there are **18** cache entries per
 token — one per effective layer — and the entry for (loop, block) lives at
 `loop*3 + block_idx`. Each loop computes its own fresh K from that loop's input
-(`../docs/ARCHITECTURE.md §16.5`: "Each loop's K is computed FRESH from that loop's
+(`ARCHITECTURE.md §16.5`: "Each loop's K is computed FRESH from that loop's
 input"), so loop 0's block 0 and loop 5's block 0 occupy *different* cache slots
 even though they share weights.
 
@@ -494,7 +499,7 @@ makes the recursion↔cache indexing explicit.
 ## 9. Research grounding (Ouro / Huginn)
 
 The recursive design is not invented here; it tracks a validated line of
-looped-LM research (`../docs/RESEARCH.md §4`, lines 245-296):
+looped-LM research (`RESEARCH.md §4`, lines 245-296):
 
 - **Huginn-3.5B** (Geiping et al., arXiv 2502.05171): prelude → recurrent core
   (a few blocks applied N times) → coda, trained with variable iteration counts
@@ -507,12 +512,12 @@ looped-LM research (`../docs/RESEARCH.md §4`, lines 245-296):
   stabilization. OSRT's choice of R=6 and its hard refusal to run past
   `recursive_loops` (§10) are downstream of that finding.
 - **Loop embeddings** as the Universal-Transformer depth-conditioning idea
-  (`../docs/RESEARCH.md:276-277`): weight-tying without per-iteration conditioning
+  (`RESEARCH.md:276-277`): weight-tying without per-iteration conditioning
   degenerates.
 
-What OSRT adopted (`../docs/RESEARCH.md:282-287`): the recursive 3×6 design, loop
+What OSRT adopted (`RESEARCH.md:282-287`): the recursive 3×6 design, loop
 embeddings, a cap at R=6, and the aux per-loop LM-head losses. Sandwich RMSNorm
-in the recurrent block (`../docs/ARCHITECTURE.md §5.3`) follows Huginn's recipe for
+in the recurrent block (`ARCHITECTURE.md §5.3`) follows Huginn's recipe for
 surviving many iterations without blowing up.
 
 ---
@@ -531,7 +536,7 @@ surviving many iterations without blowing up.
 
 - **Fewer loops trades quality for speed.** Reduced-K inference is usable only
   because of the aux per-loop training; quality still degrades as K drops
-  (`../docs/ARCHITECTURE.md §12.2`). It is a throughput dial, not a free lunch.
+  (`ARCHITECTURE.md §12.2`). It is a throughput dial, not a free lunch.
 
 - **The aux heads are a *training* fix, not an inference component.** Their job
   is to keep gradient flowing into intermediate loops during training. At
@@ -544,5 +549,5 @@ surviving many iterations without blowing up.
 
 - **Loop collapse can recur if you turn the aux weight off.** With
   `aux_loop_loss_weight = 0`, the architecture has nothing forcing intermediate
-  loops to work, and `../docs/ARCHITECTURE.md §16.1` explicitly mandates monitoring for
+  loops to work, and `ARCHITECTURE.md §16.1` explicitly mandates monitoring for
   collapse in that regime. The 0.05 operating value is load-bearing.

@@ -10,10 +10,10 @@ that combines three ideas no released frontier model puts together at once:
 
 - **3 physical decoder blocks**, applied **6 times via a loop** (weights reused
   each pass) → **18 effective layers** from one-third the parameters.
-- Per block: **1 shared expert + 8 routed experts (top-2)**, GQA attention with
+- Per block: **1 shared expert + 28 routed experts (top-4)**, GQA attention with
   an MLA-style compressed-latent KV cache, rank-256 HRA adapters, and a 4-channel
-  manifold-constrained "hyper-connection" (mHC) residual stream.
-- **~601M physical params / ~278M active per token** (the "605M/A269M/A288M"
+  a plain residual stream (mHC removed in v7 — roadmap §12.3).
+- **968,468,355 physical / 263,035,779 active per token** (the "605M/A269M/A288M"
   numbers in the repo name and presets are *stale* — see "Naming" below).
 - Trained with **Muon (hidden 2D matrices) + AdamW (embeddings/norms/biases)**.
 
@@ -54,7 +54,8 @@ app.py                # Modal deployment entry point — all training stages liv
 scripts/              # CPU smoke tests, probes, data builders, tokenizer training
 tests/                # pytest suite (run on CPU)
 configs/              # exported HF config.json
-v6_tokenizer_export/  # 65K byte-level BPE tokenizer (v6 contract) — USE THIS
+tokenizer/            # OSRT-Ostinato tokenizer (SmolLM2 base + 32 specials) — USE THIS
+v6_tokenizer_export/  # 65K v6 BPE — superseded at gate G2, do not use for v7
 tokenizer/            # STALE 32K artefact (pre-v6) — do not load for v6 ckpts
 docs/                 # numbered architecture chapters (00-overview → 10-...)
 docs/ARCHITECTURE.md       # terse technical spec (config-value source of truth)
@@ -130,8 +131,9 @@ that subclass each other (e.g. `MidtrainConfig(PretrainConfig)`, `SFTv2Config`,
   from instantiating the real model on a `meta` device.
 - **Naming is stale on purpose.** The repo `OSRT-605M-A269M`, the preset
   `OSRT_605M_A288M`, and `OSRT_605M_A279M` (a back-compat alias → same preset)
-  all predate the corrected count. The instantiated model is **601M physical /
-  278M active**. Trust `compute_budget.py` and `presets.py`, not the names.
+  all predate v7 entirely. `build_v7_config()` instantiates **968,468,355
+  physical / 263,035,779 active**. Trust `compute_budget.py` and
+  `presets.py`, never a name.
 - **Doc precedence.** When `docs/` chapters and `docs/ARCHITECTURE.md` disagree, the
   chapters cite the code (`file:line`) and **the code wins**. `src/osrt/` is
   ground truth. When you change behaviour, update the relevant `docs/0X-*.md`

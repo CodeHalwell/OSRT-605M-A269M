@@ -1,5 +1,13 @@
 # Output Heads & Training Losses
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
 > the model turns its final hidden state into token predictions, and the full
 > stack of training losses that shape it: the tied LM head and its
@@ -9,7 +17,7 @@
 
 A note on sourcing. Where this document states a *mechanic* it cites
 `src/osrt/model.py`, `src/osrt/config.py`, and `src/osrt/presets.py` by line —
-that is the source of truth. `../docs/ARCHITECTURE.md` is cited only for *intent* and
+that is the source of truth. `ARCHITECTURE.md` is cited only for *intent* and
 *history*. Its §9/§11 pseudocode is explicitly "illustrative ... the
 implementation in `model.py` is the source of truth," and in a few places the
 prose has drifted from the code. **When they disagree, the code wins, and the
@@ -82,10 +90,8 @@ physical budget. An untied LM head would *double* that to ~200M for no quality
 gain at this scale. Tying also couples "what a token means as input" to "what
 predicting that token requires," which is a mild but real inductive prior.
 
-The hidden state fed in (`hidden`) is the final loop's residual stream after the
-dedicated mHC collapse and `norm_out` (`src/osrt/model.py:1533-1535`); see
-chapter 04 for the mHC collapse and chapter 06 for the recursion that produces
-it.
+The hidden state fed in (`hidden`) is the final loop's residual stream after
+`norm_out`; see chapter 05 for the recursion that produces it.
 
 ### 2.2 The main task loss (next-token cross-entropy)
 
@@ -142,8 +148,7 @@ each non-final loop:
 ```python
 # src/osrt/model.py:1524-1527
 if capture_aux and loop < n_loops_to_run - 1:
-    # Collapse the mHC stream to a single vector for the aux head
-    intermediate_hiddens.append(self._collapse(x) if self.use_mhc else x)
+    intermediate_hiddens.append(x)
 ```
 
 The LM wrapper then runs each captured hidden through `norm_out` + the **same
@@ -243,7 +248,7 @@ projection. The *vocab* projection still reuses the tied embedding — only this
 small per-head transform is new. So an MTP head is "partly tied": new
 `dim×dim` projection, tied final readout.
 
-> **Discrepancy flag.** `../docs/ARCHITECTURE.md §9.3` says MTP heads "are tied with
+> **Discrepancy flag.** `ARCHITECTURE.md §9.3` says MTP heads "are tied with
 > embedding too — no separate params." That is wrong for the projection layer:
 > the `RMSNorm + Linear(dim,dim)` per head is genuinely new weight. The
 > `compute_budget.py` `mtp_heads` category confirms **4,721,664 params** for the
@@ -279,7 +284,7 @@ Mechanics:
   main LM head already covers +1; MTP extends past it. (The brief's "+2/+3" is
   correct and matches code.)
 
-  > **Discrepancy flag.** `../docs/ARCHITECTURE.md §9.3/§11.4` describes MTP at offsets
+  > **Discrepancy flag.** `ARCHITECTURE.md §9.3/§11.4` describes MTP at offsets
   > **+1/+2**. The code uses **+2/+3** (`offset = k + 2`,
   > `src/osrt/model.py:1762`). The ARCHITECTURE doc is stale here; the code and
   > this chapter use +2/+3.
@@ -365,14 +370,13 @@ DeepSeek-V3 §5.2 sequence-wise balance: the same Switch formula but computed
 single long document dominating one expert even when the *global* batch is
 balanced — a long-context (phase 3, `seq_len=8192`) failure mode.
 
-> **Status: implemented but OFF in the canonical config.**
-> `router_seq_balance_loss_coeff` defaults to `0.0` (`src/osrt/config.py:122`)
-> and the preset does not set it. So `seq_balance_loss` is *computed* and
-> *logged* every step but contributes **exactly 0** to the gradient until you
-> opt in (intended for the long-context phase). It appears in the total-loss
-> formula below for completeness; in the standard run its coefficient zeroes it
-> out. (Ignore `../docs/ARCHITECTURE.md §11.3`'s `α=0.0001` — that section is stale and
-> conflates the global and sequence balance losses.)
+> **Status: ON in the canonical config since 2026-08-31.**
+> `router_seq_balance_loss_coeff` defaults to `0.0` in `OSRTConfig` (so
+> v6-reproduction runs are untouched), but `OSRT_V7` sets it to `1e-4` per
+> the roadmap's §14.1 committed router line (V4 runs exactly this
+> coefficient). `seq_balance_loss` is computed and logged every step either
+> way. (Ignore `ARCHITECTURE.md §11.3`'s `α=0.0001` — that section is stale
+> and conflates the global and sequence balance losses.)
 
 The aux-loss-**free** balance-bias controller is a *separate* heuristic: a
 per-expert additive bias updated outside the gradient. It is **not** one of these
@@ -434,13 +438,13 @@ else:
     loss = task_loss
 ```
 
-With the canonical `OSRT_605M_A288M` coefficients:
+With the canonical `OSRT_V7` coefficients:
 
 ```
 L_train = task_loss
         + 0.10  · (Σ_layers balance_loss   / n_moe_layers)
         + 1e-3  · (Σ_layers z_loss          / n_moe_layers)
-        + 0.0   · (Σ_layers seq_balance_loss / n_moe_layers)   # off in canonical
+        + 1e-4  · (Σ_layers seq_balance_loss / n_moe_layers)   # on since 2026-08-31
         + 0.05  · Σ_{r=1}^{5} aux_loop_CE_r                     # uniform per-loop
         + 0.30  · (mtp_CE_{+2} + mtp_CE_{+3})
 
@@ -559,11 +563,11 @@ Takeaways:
 
 ## 10. Cross-references
 
-- **Tied embedding / mHC collapse producing `hidden`** — chapter 04 (mHC).
+- **Tied embedding producing `hidden`** — chapter 01.
 - **Recursion, loop dropout, why aux heads exist** — chapter 06 (recursion); the
   normalization-by-actual-loops fix (§6 here) is referenced from there.
 - **The aux-loss-free balance-bias controller** (the non-gradient heuristic that
   shares load at deploy time) — chapter 03 (MoE & routing). It is *not* one of
   the three differentiable router losses in §5.
-- **MTP / DeepSeek-V3-V4 intent** — `../docs/ARCHITECTURE.md §9.3, §11.4` (note the
+- **MTP / DeepSeek-V3-V4 intent** — `ARCHITECTURE.md §9.3, §11.4` (note the
   +1/+2 vs code's +2/+3 drift flagged in §4.3).

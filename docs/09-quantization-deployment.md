@@ -1,5 +1,13 @@
 # Quantization & Deployment
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how a
 > **601M-parameter mixture-of-experts model** is squeezed down to run on small /
 > edge hardware (phones, a Raspberry Pi 5): the deployment memory budget and why
@@ -10,16 +18,16 @@
 A note on sourcing. Where this document states a *mechanic that exists in code*
 it cites `src/osrt/quant.py` by line — that is the source of truth. The
 parameter counts come from `scripts/compute_budget.py` (run live; numbers below
-are its output). `../docs/ARCHITECTURE.md §13`–`§15` is cited for *design intent* and
+are its output). `ARCHITECTURE.md §13`–`§15` is cited for *design intent* and
 the deployment plan. **Be careful about the word "implemented":** only the
 int4 KV quantizer is code. The int8 base and FP4/AlphaQ expert quantization are
-*design intent* in `../docs/ARCHITECTURE.md §14` — they are not coded yet. Each section
+*design intent* in `ARCHITECTURE.md §14` — they are not coded yet. Each section
 is labelled IMPLEMENTED or PLANNED, and section 7 has the full table. Where the
 code and the spec disagree, the code wins and the discrepancy is flagged.
 
 A naming note. The `docs/` series brands the model **OSRT-605M**;
 `compute_budget.py` reports **601,444,393 physical parameters** ("~601M"); and
-`../docs/ARCHITECTURE.md §2.5` brands it "OSRT-600M". These are the same model — the
+`ARCHITECTURE.md §2.5` brands it "OSRT-600M". These are the same model — the
 suffix is a round marketing label, not a precise count. This document uses the
 exact figure **601M physical** for all memory math.
 
@@ -47,7 +55,7 @@ enough to sit alongside an OS and an app. Two facts drive every decision:
 1. **The routed experts are ~71% of the physical weights** (424.7M of 601M).
    Whatever you do to them dominates the budget. Expert quantization is *the*
    deployment lever.
-2. **The KV cache grows with context** (`../docs/ARCHITECTURE.md §13.2`: 18 KB/token,
+2. **The KV cache grows with context** (`ARCHITECTURE.md §13.2`: 18 KB/token,
    72 MB at 4K). Unlike weights it is unbounded, so it gets its own quantizer.
 
 ---
@@ -60,7 +68,6 @@ The real per-component parameter breakdown, straight from
 ```
   embedding           100,690,944    (16.7%)
   attention            17,308,032    ( 2.9%)
-  mhc                     921,766    ( 0.2%)
   shared_expert        38,928,384    ( 6.5%)
   routed_experts      424,673,280    (70.6%)   ← the dominant term
   router                   36,867
@@ -75,7 +82,7 @@ The real per-component parameter breakdown, straight from
 Two things to read off this table.
 
 **Routed experts are ~71% of the model.** (`compute_budget.py` reports 70.6%;
-`../docs/ARCHITECTURE.md §14.2` rounds to "71%". Either way the conclusion is the same.)
+`ARCHITECTURE.md §14.2` rounds to "71%". Either way the conclusion is the same.)
 If you only quantize one thing aggressively, quantize these. Every other
 component combined is smaller than the routed experts alone.
 
@@ -87,8 +94,8 @@ above already excludes them.
 
 ### The on-disk estimate (~377 MB, the as-specified stack)
 
-Applying the `../docs/ARCHITECTURE.md §14.1` per-component plan — int8 base, mixed-FP4
-routed experts, bf16 for the small sensitive bits — gives (`../docs/ARCHITECTURE.md
+Applying the `ARCHITECTURE.md §14.1` per-component plan — int8 base, mixed-FP4
+routed experts, bf16 for the small sensitive bits — gives (`ARCHITECTURE.md
 §14.2`; decimal MB, 1 MB = 1,000,000 bytes, no allocator/metadata overhead):
 
 ```
@@ -98,7 +105,7 @@ Shared experts (int8, 38.9M)                          39 MB
 Routed experts (mixed FP4 @ ~3.5 bit avg, 424.7M):
     424.7M × 3.5 bits / 8  ≈ 186 MB (+~2% AlphaQ meta) ~190 MB
 HRA adapters (bf16, 14.2M × 2 bytes)                  28 MB
-mHC + router + norms + loop_emb (bf16)                ~2 MB
+router + norms + loop_emb (bf16)                      ~2 MB
 MTP heads (dropped at deploy)                          0 MB
   ----------------------------------------------------------
 TOTAL ON DISK / RESIDENT                             ~377 MB
@@ -110,7 +117,7 @@ target precisely because it is the next-largest component.
 
 ### 377 MB vs the "~250 MB" headline — not a contradiction
 
-`../docs/ARCHITECTURE.md §15.3` quotes a "~250 MB" total inference footprint (weights
+`ARCHITECTURE.md §15.3` quotes a "~250 MB" total inference footprint (weights
 ~150–200 MB + ~5 MB KV + ~50 MB activations). That is a **different scenario**,
 not a conflicting number:
 
@@ -143,12 +150,12 @@ cache. Keep that distinction: implemented ≠ active.
 ### 3a. Why the cache needs compressing
 
 The model caches only the **K_DOWN latent** — the compressed key — not full K
-and V (`../docs/ARCHITECTURE.md §13.1`; V is recomputed from K via `V = W_V_FROM_K @ K`,
+and V (`ARCHITECTURE.md §13.1`; V is recomputed from K via `V = W_V_FROM_K @ K`,
 which already halves the cache). Even so, the cache is **18 effective layers ×
 512 floats/token = 18 KB/token in bf16**, growing linearly with context:
-**72 MB at 4K, 144 MB at 8K** (`../docs/ARCHITECTURE.md §13.2`). Unlike the weights,
+**72 MB at 4K, 144 MB at 8K** (`ARCHITECTURE.md §13.2`). Unlike the weights,
 this term has no ceiling — long contexts blow past the weight budget. int4 cuts
-it 4× (bf16 → 4 bits): to **~9–18 MB at 4K** (`../docs/ARCHITECTURE.md §13.3`), and a
+it 4× (bf16 → 4 bits): to **~9–18 MB at 4K** (`ARCHITECTURE.md §13.3`), and a
 sliding window on top can reach ~2–5 MB.
 
 The quantizer compresses the cached **K_DOWN latent** to symmetric int4. The
@@ -196,7 +203,7 @@ the last dim into blocks, then `blocked @ r`. On dequant it is undone with
 `work @ r.T` (`quant.py:237`).
 
 > **The rotation is internal to the round-trip — it never touches the cache
-> layout.** Do not confuse it with RoPE. `../docs/ARCHITECTURE.md §13.4` stores the
+> layout.** Do not confuse it with RoPE. `ARCHITECTURE.md §13.4` stores the
 > *un-rotated* K_DOWN in the cache (RoPE is applied at attention time so the
 > linear KDV (Key-Derived Value) K→V relationship survives). The TurboQuant
 > Hadamard rotation lives *entirely inside* `quantize_kv_latent` →
@@ -286,14 +293,14 @@ reconstruction error `‖x − x̂‖ / ‖x‖` — a handy calibration check.
 > **Status: design intent, not yet coded.** A search of `src/` finds *no*
 > AlphaQ, FP4, PL-Alpha-Hill, or int8-base implementation — `quant.py` (the
 > int4 KV quantizer) is the only quantization code in the tree. Everything in
-> this section is from `../docs/ARCHITECTURE.md §14.1/§14.3` and describes what the
+> this section is from `ARCHITECTURE.md §14.1/§14.3` and describes what the
 > deployment plan *intends*, not what runs today.
 
 The routed experts are 71% of the model (§2), so their bit budget decides the
 deployment size. The plan is **AlphaQ**: a calibration-free, mixed-precision
 allocation of bits across experts.
 
-The core idea (`../docs/ARCHITECTURE.md §14.3`):
+The core idea (`ARCHITECTURE.md §14.3`):
 
 - For each routed expert weight matrix, compute the **PL Alpha Hill** metric —
   a heavy-tailed self-regularization measure from the weight's eigenvalue
@@ -306,7 +313,7 @@ The core idea (`../docs/ARCHITECTURE.md §14.3`):
   Each up/gate/down projection is allocated independently.
 
 The expected result is **near-lossless quality at a 3.5-bit average**
-(`../docs/ARCHITECTURE.md §14.3` cites AlphaQ results on Qwen1.5-MoE, a similar
+(`ARCHITECTURE.md §14.3` cites AlphaQ results on Qwen1.5-MoE, a similar
 8-experts-per-block regime). Note this is *mixed* precision — the §14.1 table's
 "FP4 (MXFP4)" label is the base format, but AlphaQ then varies the per-expert
 bit-width 2/3/4 around it. Describe it as **mixed FP4**, not uniform FP4.
@@ -326,7 +333,7 @@ different thing. Only the last layer (int4 KV) is implemented today.
 | **Base weights** (embedding, attention, shared experts) | int8, symmetric per-channel | 2× over bf16 on the ~157M "dense" params; int8 is near-lossless for these | PLANNED |
 | **Routed experts** | mixed FP4 (MXFP4 + AlphaQ 2/3/4-bit) | the big win — ~5× over bf16 on the 71% term, ~190 MB | PLANNED |
 | **KV cache** | int4 TurboQuant (rotation + symmetric grid + nibble pack) | 4× over bf16 on the *runtime* cache; bounds context growth | IMPLEMENTED (`quant.py`, standalone) |
-| HRA adapters, router, mHC, loop-emb, norms | bf16 | kept full precision — small and sensitive | (no quant needed) |
+| HRA adapters, router, loop-emb, norms | bf16 | kept full precision — small and sensitive | (no quant needed) |
 
 **Why each layer, and the order to apply them:**
 
@@ -342,8 +349,8 @@ different thing. Only the last layer (int4 KV) is implemented today.
    change the on-disk weight size at all; it bounds the *runtime* memory so a
    long context does not dwarf the weights.
 
-**Leave alone:** HRA adapters (14.2M), router, mHC, loop embeddings, norms, and
-biases stay **bf16** (`../docs/ARCHITECTURE.md §14.1`). They are small (a few MB total)
+**Leave alone:** HRA adapters (14.2M), router, loop embeddings, norms, and
+biases stay **bf16** (`ARCHITECTURE.md §14.1`). They are small (a few MB total)
 and quantization-sensitive — the HRA adapters carry the RL-tuned behaviour, the
 router decides expert selection, and norms/biases are numerically delicate.
 Spending bits to shrink them buys almost nothing and risks quality.
@@ -353,8 +360,8 @@ Spending bits to shrink them buys almost nothing and risks quality.
 ## 6. Levers to hit a tighter envelope (~150–250 MB)
 
 The ~377 MB stack of §2 is the spec'd baseline. To reach the ~150–250 MB
-footprint of `../docs/ARCHITECTURE.md §15.3`, pull these levers in priority order
-(`../docs/ARCHITECTURE.md §14.2`):
+footprint of `ARCHITECTURE.md §15.3`, pull these levers in priority order
+(`ARCHITECTURE.md §14.2`):
 
 1. **Routed experts → 2-bit average (~190 MB → ~110 MB).** They are 71% of the
    model, so this is the dominant lever by a wide margin. Halving their average
@@ -373,7 +380,7 @@ A fourth, *system-level* lever: **active-only resident loading.** Load just the
 top-2 routed experts per layer into RAM and page the rest from disk/CPU. This is
 an *inference-system* choice, not a *weight* choice — it changes the resident
 set, not the file size — so state the assumption explicitly when you quote a
-number that depends on it (`../docs/ARCHITECTURE.md §14.2`).
+number that depends on it (`ARCHITECTURE.md §14.2`).
 
 Stacking levers 1–3: routed ~110 MB + embedding ~50 MB + int8 base (attention
 ~17 + shared ~39) + folded HRA (0) + misc ~2 ≈ **~220 MB** of weights, which is
@@ -389,16 +396,16 @@ residency or more aggressive routed bits).
 | **KV-cache int4 quantizer** | TurboQuant random rotation + symmetric [−7,7] int4 + nibble pack | **IMPLEMENTED** (standalone utility; **not** wired into training or `generate()` by default) | `src/osrt/quant.py` |
 | Randomized Sylvester-Hadamard rotation | `±1` sign-flipped Hadamard, QR fallback, `lru_cache`'d | **IMPLEMENTED** | `quant.py:61-106` |
 | int4 nibble packing | 2 nibbles / `uint8` | **IMPLEMENTED** | `quant.py:112-136` |
-| int8 base weights | symmetric per-channel QAT (embedding, attention, shared experts) | **PLANNED** (no code) | `../docs/ARCHITECTURE.md §14.1` |
-| Routed-expert FP4 / AlphaQ | mixed 2/3/4-bit, PL-Alpha-Hill + ILP, ~3.5 bit avg | **PLANNED** (no code) | `../docs/ARCHITECTURE.md §14.3` |
-| HRA / router / mHC / norms bf16 | keep full precision | **PLANNED** (deploy policy) | `../docs/ARCHITECTURE.md §14.1` |
+| int8 base weights | symmetric per-channel QAT (embedding, attention, shared experts) | **PLANNED** (no code) | `ARCHITECTURE.md §14.1` |
+| Routed-expert FP4 / AlphaQ | mixed 2/3/4-bit, PL-Alpha-Hill + ILP, ~3.5 bit avg | **PLANNED** (no code) | `ARCHITECTURE.md §14.3` |
+| HRA / router / norms bf16 | keep full precision | **PLANNED** (deploy policy) | `ARCHITECTURE.md §14.1` |
 | MTP-head drop at deploy | omit 4.72M head params | **PLANNED** (deploy policy) | `compute_budget.py`, §2 |
 
 **The one-line summary:** the int4 **KV-cache** quantizer is real, tested code
 (`src/osrt/quant.py`) — but it is a standalone utility a caller must invoke, not
 something the default model does. The int8 base and the FP4/AlphaQ **expert**
 quantization that actually shrink the *weights* to ~377 MB are **design intent
-in `../docs/ARCHITECTURE.md §14`, not yet implemented**.
+in `ARCHITECTURE.md §14`, not yet implemented**.
 
 ---
 
@@ -459,13 +466,13 @@ imports (`fused_ce`, `hra`, `muon`) are **not auto-copied** by
 
 ## 9. Cross-references
 
-- **KV cache layout, size, and decode update:** `../docs/ARCHITECTURE.md §13.2` (cache
+- **KV cache layout, size, and decode update:** `ARCHITECTURE.md §13.2` (cache
   growth: 18 KB/token, 72 MB at 4K) and `§13.4` (un-rotated K_DOWN is what gets
   cached; RoPE applied at attention time). A dedicated `docs/` inference chapter
   is forthcoming; until then §13 is the reference.
 - **Why V is recomputed from K** (the halving that makes the K-only cache
-  possible): `../docs/ARCHITECTURE.md §6.3`, `§13.1`.
+  possible): `ARCHITECTURE.md §6.3`, `§13.1`.
 - **Parameter budget & active-vs-physical:** `scripts/compute_budget.py`,
-  `../docs/ARCHITECTURE.md §2.1`; HRA adapters `docs/05-hra-adapters.md`; routed experts
+  `ARCHITECTURE.md §2.1`; HRA adapters `docs/04-hra-adapters.md`; routed experts
   `docs/03-moe-and-routing.md`.
-- **Full memory math at inference:** `../docs/ARCHITECTURE.md §15.3`.
+- **Full memory math at inference:** `ARCHITECTURE.md §15.3`.

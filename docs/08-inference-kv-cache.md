@@ -1,13 +1,21 @@
 # Inference, KV Cache & Speculative Decoding
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
 > the trained model actually turns a prompt into text: the two phases of
 > generation (prefill and decode), the unusual *latent-only* KV cache (KDV,
 > Key-Derived Value), the CPU-GPU-sync-aware standard decode loop, sampling,
 > and a **greedy-only** speculative-decode accelerator. It cross-references
 > `docs/02-attention.md` (the attention sub-block / MLA latent),
-> `docs/06-recursion.md` (the 3-blocks-×-6-loops depth recurrence),
-> `../docs/ARCHITECTURE.md` §12 (inference) and §13 (KV cache), and the shipping
+> `docs/05-recursion.md` (the 3-blocks-×-6-loops depth recurrence),
+> `ARCHITECTURE.md` §12 (inference) and §13 (KV cache), and the shipping
 > implementation in `src/osrt/model.py`.
 
 ---
@@ -39,13 +47,13 @@ transformer, and both get their own section below:
 
 1. **The cache stores only a compressed latent, not K and V.** OSRT uses an
    MLA-inspired attention where K and V are both *linear functions of one cached
-   latent* `c_kv` (see `docs/02-attention.md` and `../docs/ARCHITECTURE.md` §6.2-6.3).
+   latent* `c_kv` (see `docs/02-attention.md` and `ARCHITECTURE.md` §6.2-6.3).
    We cache `c_kv` and rebuild K (with RoPE) and V on the fly. V in particular
    is the **Key-Derived Value (KDV)**: a single learned
    `Linear(512→512)+bias` (`v_from_k`) reading the cached latent and producing
    V. That is ~half a normal GQA cache.
 2. **Depth comes from recursion, not distinct layers.** The model runs 3
-   physical decoder blocks 6 times (`docs/06-recursion.md`). Each
+   physical decoder blocks 6 times (`docs/05-recursion.md`). Each
    *(loop, block)* pair is an **effective layer** with its own cache slot, so the
    cache has `num_blocks × recursive_loops = 3 × 6 = 18` slots — and the variable
    loop-count knob (§8) changes how many of those slots exist.
@@ -144,7 +152,7 @@ With `num_blocks = 3` and `recursive_loops = 6` that is 18 slots: `(loop 0,
 block 0) → 0`, `(loop 0, block 1) → 1`, …, `(loop 5, block 2) → 17`. Each loop
 genuinely recomputes a fresh latent — the input to loop *r* is loop *r-1*'s
 output, so the 18 latents are 18 different representations, not 6 copies (see
-`../docs/ARCHITECTURE.md` §13.4 and `docs/06-recursion.md`). If `num_loops=K` is set
+`ARCHITECTURE.md` §13.4 and `docs/05-recursion.md`). If `num_loops=K` is set
 (§8), only the first `K × num_blocks` slots exist, and that is exactly what
 `forward()` validates the incoming cache against
 (`src/osrt/model.py:1361`, `expected_past_layers = num_blocks * n_loops_to_run`).
@@ -202,9 +210,9 @@ present_kv = c_kv if use_cache else None
 
 Per token per effective layer the cache holds a single 512-d latent. Against a
 hypothetical GQA baseline that caches K **and** V (2 × 512 floats), this is
-exactly **half**. `../docs/ARCHITECTURE.md` §13.2-13.3 works the numbers: at BF16 the
+exactly **half**. `ARCHITECTURE.md` §13.2-13.3 works the numbers: at BF16 the
 K-only baseline is 18 layers × 512 × 2 bytes = **18 KB/token**, vs ~36 KB/token
-for K+V. (`../docs/ARCHITECTURE.md` §13.2's worked examples quote an 8K context and an
+for K+V. (`ARCHITECTURE.md` §13.2's worked examples quote an 8K context and an
 `eos_token_id` of 1 from an earlier draft; the shipped 605M config uses
 `max_position_embeddings=4096` and `eos_token_id=2`, so treat those §13.2/§12.1
 constants as illustrative, not as the deployed values.)
@@ -420,8 +428,8 @@ padding ids in the embedding table can never be emitted.
 (`src/osrt/model.py:1901-1910`, `2075`). The idea exploits OSRT's recursion: a
 *cheap draft* is produced by running only the first `spec_draft_loops` loops
 (3 by default, config `spec_draft_loops=3`), and the *expensive verifier* runs
-the full loop count. The per-loop aux LM-head training (`docs/06-recursion.md`,
-`../docs/ARCHITECTURE.md` §9.2) is what makes the low-loop draft predictive of the
+the full loop count. The per-loop aux LM-head training (`docs/05-recursion.md`,
+`ARCHITECTURE.md` §9.2) is what makes the low-loop draft predictive of the
 full-loop output, so the draft and verifier agree often.
 
 ### 7.1 The draft/verify/commit round
@@ -509,9 +517,9 @@ forward.
 > acceptance check exact (`src/osrt/model.py:2126-2129`). Callers must
 > `model.eval()`.
 
-### 7.4 Reconciling with `../docs/ARCHITECTURE.md` §12.3
+### 7.4 Reconciling with `ARCHITECTURE.md` §12.3
 
-`../docs/ARCHITECTURE.md` §12.3 sketches the same loop-as-draft idea and quotes an
+`ARCHITECTURE.md` §12.3 sketches the same loop-as-draft idea and quotes an
 expected accept rate of 60-75% and ~1.8-2.4× net speed-up. Two honest
 clarifications against the shipped code: (a) the doc's pseudocode reuses a single
 `kv_cache`, whereas the implementation keeps **separate** draft/verify caches
@@ -523,8 +531,8 @@ shipped routine is explicitly greedy-only, as its banner states.
 
 ## 8. `num_loops` — variable test-time compute
 
-`num_loops` is an inference knob (`../docs/ARCHITECTURE.md` §12.2;
-`docs/06-recursion.md`) that runs fewer than the trained 6 loops at every step
+`num_loops` is an inference knob (`ARCHITECTURE.md` §12.2;
+`docs/05-recursion.md`) that runs fewer than the trained 6 loops at every step
 for a speed/quality trade-off. It is validated by `_resolve_num_loops()`
 (`src/osrt/model.py:1293-1310`): `None` → `config.recursive_loops` (full
 quality, the default, bit-identical to before); otherwise `K` must lie in
@@ -535,7 +543,7 @@ prefill and every decode step (§2), because the cache has `num_blocks × K` slo
 and `forward()` validates the incoming cache against exactly that count
 (`src/osrt/model.py:1361`). Mixing loop counts mid-generation would misalign the
 per-effective-layer cache and is therefore disallowed. In the speculative path
-`K` also caps the draft loops (`src/osrt/model.py:2146-2147`). `../docs/ARCHITECTURE.md`
+`K` also caps the draft loops (`src/osrt/model.py:2146-2147`). `ARCHITECTURE.md`
 §12.2 gives the indicative trade-off: loops=3 ≈ 2× faster at ~85% quality, up to
 loops=6 = baseline full quality.
 
@@ -567,7 +575,7 @@ loops=6 = baseline full quality.
   (`src/osrt/presets.py:54`), so every attention call goes through fused
   `F.scaled_dot_product_attention` and the score matrix is never materialised
   (`src/osrt/model.py:1177-1183`). The learnable per-head attention sink
-  (`../docs/ARCHITECTURE.md` §6.6) needed an extra term in the softmax denominator that
+  (`ARCHITECTURE.md` §6.6) needed an extra term in the softmax denominator that
   SDPA cannot express, so when it was on it routed to a manual log-sum-exp
   rescale path (`_attention_with_sink`, `src/osrt/model.py:1187-1251`) that
   materialised the full `(B, H, S, total_len)` score matrix per head. At the
@@ -618,7 +626,7 @@ text as greedy decode, fewer expensive forwards.
 ### Cross-references
 
 - `docs/02-attention.md` — GQA + MLA latent, KDV (Key-Derived Value), RoPE, attention sink.
-- `docs/06-recursion.md` — 3 blocks × 6 loops, loop embeddings, per-loop aux head.
-- `../docs/ARCHITECTURE.md` §6 (attention), §12 (inference), §13 (KV cache).
+- `docs/05-recursion.md` — 3 blocks × 6 loops, loop embeddings, per-loop aux head.
+- `ARCHITECTURE.md` §6 (attention), §12 (inference), §13 (KV cache).
 - `src/osrt/model.py` — `generate()` (1841), `_generate_speculative()` (2075),
   `_attention()` (979), `OSRTModel.forward()` cache loop (1461).

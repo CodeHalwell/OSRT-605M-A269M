@@ -88,6 +88,14 @@ OSRT_605M_A288M: dict = dict(
 # the paid trunk must not launch before that result is recorded.
 OSRT_V7: dict = {
     **OSRT_605M_A288M,
+    # Gate G2 resolved to the OSRT-Ostinato tokenizer: SmolLM2's 49,152 base
+    # (Apache-2.0) + 32 OSRT special tokens = 49,184 real, padded to 49,280.
+    # Chosen for single-digit number tokenization at 100% context consistency
+    # — the v6 65,536 BPE made 1-3 digit numbers ATOMIC (100/100/96.7%
+    # single-token) at 75% consistency, which is what motivated G2. Also -25M
+    # params, and because the head is tied those are ACTIVE. See roadmap §16.
+    "vocab_size": 49280,
+    "real_vocab_size": 49184,
     "num_routed_experts": 28,
     "top_k_experts": 4,
     "expert_hidden": 2112,

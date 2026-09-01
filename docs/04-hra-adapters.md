@@ -1,5 +1,13 @@
 # HRA — High-Rank Adapters
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 *Part of the `docs/` OSRT-605M architecture series.*
 
 This document explains the **HRA (High-Rank Adapter)** block of OSRT-605M:
@@ -23,7 +31,7 @@ substantial, full-time learning subspace that the model can grow into. The
 argument is **capacity**:
 
 - OSRT is a *recursive* transformer: 3 physical blocks are unrolled 6 times
-  to give 18 effective layers (`../docs/ARCHITECTURE.md:131`). Weight sharing across
+  to give 18 effective layers (`ARCHITECTURE.md:131`). Weight sharing across
   loops keeps the parameter count down but forces every loop to reuse the
   same block weights.
 - A high-rank adapter that is **distinct per (block, loop)** gives each of
@@ -65,7 +73,7 @@ contains *two distinct* `A@B` adapter systems, and they are easy to confuse
 
 Both use the identical math. They differ in *where* they are attached, *how
 many* there are, and *when* they come into existence. Keeping them separate is
-the key to reading the rest of this doc — and to reading `../docs/ARCHITECTURE.md`,
+the key to reading the rest of this doc — and to reading `ARCHITECTURE.md`,
 where §2.4 describes mechanism (1) and §5.4 describes mechanism (2).
 
 ---
@@ -132,7 +140,7 @@ the residual stream.)
 ## 4. Where the 18 adapters live (the corrected §2.4 enumeration)
 
 There is **one rank-256 adapter pair per effective layer**: 3 blocks × 6
-loops = **18 pairs** (`../docs/ARCHITECTURE.md:166-168`). They are stored as two
+loops = **18 pairs** (`ARCHITECTURE.md:166-168`). They are stored as two
 parallel `ParameterList`s on the model (`model.py:1254-1264`):
 
 ```python
@@ -163,11 +171,11 @@ So loop 0 / block 0 gets adapter 0, loop 0 / block 1 gets adapter 1, …, loop
 adapter even though it shares block weights with the other five loops.
 
 **It is one parallel path per block forward — NOT per-projection.** An early
-draft of `../docs/ARCHITECTURE.md` (and §5.4, which still describes the *other*
+draft of `ARCHITECTURE.md` (and §5.4, which still describes the *other*
 mechanism) envisioned 87 or 132 injection points spread across Q/K/V/O, every
 expert, and the router. The canonical inline mechanism is far simpler: **18
-attention-path adapters** (`../docs/ARCHITECTURE.md:164-184`, corrected in the
-errata at `../docs/ARCHITECTURE.md:1464`). The 87/132 numbers are not nonsense — they
+attention-path adapters** (`ARCHITECTURE.md:164-184`, corrected in the
+errata at `ARCHITECTURE.md:1464`). The 87/132 numbers are not nonsense — they
 correctly describe the injected `HRALinear` path of section 7 — but they are
 not what the 18 are.
 
@@ -314,7 +322,7 @@ adapter_b : rank × dim = 256 × 1,536 = 393,216
 per pair  : 786,432
 ```
 
-Across all 18 pairs (`../docs/ARCHITECTURE.md:105-110`, `../docs/ARCHITECTURE.md:181`):
+Across all 18 pairs (`ARCHITECTURE.md:105-110`, `ARCHITECTURE.md:181`):
 
 ```
 18 × 786,432 = 14,155,776 params  (~14.16M)
@@ -346,7 +354,7 @@ different mechanism or config, and only the first is "the architecture":
   (`config.py:52`); the number the `train.py:1268` comment references.
 - **~86M** — the **injected** `HRALinear` path at rank 256, spread across
   seven projections per layer at SFT/RL time
-  (`train_config.py:1846`, `../docs/ARCHITECTURE.md:314`). This is the GRPO-stage
+  (`train_config.py:1846`, `ARCHITECTURE.md:314`). This is the GRPO-stage
   delta, not the day-1 architecture.
 
 ---
@@ -363,7 +371,7 @@ in the literature are most pronounced at low rank.
 **Attention-path only.** The 18 adapters currently sit only on the attention
 sub-block. The injected path already shows the alternative — per-projection
 adapters across Q/K/V/O, expert gate/up/down, and the router
-(`../docs/ARCHITECTURE.md:380`). Moving (some of) the inline 18 to a per-projection
+(`ARCHITECTURE.md:380`). Moving (some of) the inline 18 to a per-projection
 layout would trade a larger parameter count for finer-grained capacity; it is
 a deliberate simplicity-vs-capacity choice, not an oversight.
 
@@ -377,7 +385,7 @@ reason about.
 **Deployment folding.** Because the adapter is a linear residual, post-RL it
 can be folded into the base weights (`W ← W_base`, then the attention-path
 delta absorbed) to eliminate its separate memory and compute at inference, or
-quantized alongside the base (`../docs/ARCHITECTURE.md:1168`). The day-1, always-active
+quantized alongside the base (`ARCHITECTURE.md:1168`). The day-1, always-active
 design does not force a permanent inference cost.
 
 ---

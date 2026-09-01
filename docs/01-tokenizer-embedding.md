@@ -1,9 +1,17 @@
 # Tokenizer & Embedding
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 *Chapter 1 of the `docs/` architecture series. Read [`00-overview.md`](00-overview.md)
 first. Like every chapter, this one is grounded in the real artifacts on disk
 (`tokenizer/`, `src/osrt/`) and cites `file:line`; where the code or the on-disk
-tokenizer disagrees with the older spec (`../docs/ARCHITECTURE.md`), this chapter trusts
+tokenizer disagrees with the older spec (`ARCHITECTURE.md`), this chapter trusts
 the artifacts and flags the drift.*
 
 ---
@@ -181,12 +189,12 @@ because their spans must be unambiguous. A single turn:
 <|assistant|><|think|>{reasoning}<|/think|><|answer|>{final_answer}<|/answer|>
 ```
 
-This is the project's documented convention (`../docs/ARCHITECTURE.md:264-271`). The
+This is the project's documented convention (`ARCHITECTURE.md:264-271`). The
 `<|think|>…<|/think|><|answer|>…<|/answer|>` structure is verified by the
 tokenizer's own round-trip self-test, which encodes exactly this string
 (`scripts/train_tokenizer.py:398-401`).
 
-> **Discrepancy — ../docs/ARCHITECTURE.md §3.2 claims "IDs 21-31 reserved, real vocab
+> **Discrepancy — ARCHITECTURE.md §3.2 claims "IDs 21-31 reserved, real vocab
 > begins at id 32."** That is **false against the file**. On disk, ID 14 is the
 > literal character `"!"`, ID 15 is `"\""`, … the printable-ASCII run starts
 > *immediately* after the 14 special tokens (`tokenizer.json:251-298`). There is
@@ -229,7 +237,7 @@ files show.)
 **Practical guard:** before any tool-use or vision training, retrain/extend the
 tokenizer to register 14–20 (or place them in the 32768+ range) and add a
 contract test asserting e.g. `tok("<|end_turn|>")` returns a single ID
-(`../docs/ARCHITECTURE.md:229-230` recommends exactly this).
+(`ARCHITECTURE.md:229-230` recommends exactly this).
 
 ---
 
@@ -277,7 +285,7 @@ the *same* token space, so sharing a representation is a sensible inductive bias
 (input "what does token *t* mean" and output "how likely is token *t*" are dual
 views of the same vector). The auxiliary per-loop heads and the Multi-Token
 Prediction heads reuse this same tied weight as well — no extra projection params
-(`../docs/ARCHITECTURE.md:749-777`).
+(`ARCHITECTURE.md:749-777`).
 
 > The docstring at `src/osrt/model.py:1570` says tying *"saves ~50M params … for
 > 32K×1536 embedding."* That figure is for the **32K** case
@@ -320,7 +328,7 @@ mean 0, std 0.02**. (The per-loop *loop embeddings* — a different tensor, see 
 — *do* set `_osrt_init_std = 0.1` via `loop_embedding_init_std`,
 `model.py:213-214` / `config.py:248`.)
 
-> **Discrepancy — ../docs/ARCHITECTURE.md §4.2** specifies *"truncated normal,
+> **Discrepancy — ARCHITECTURE.md §4.2** specifies *"truncated normal,
 > std = 1/√1536 ≈ 0.0255"* and *"divide logits by √1536 at output for μP."* Both
 > diverge from the code: the implementation uses **non-truncated `normal_` with
 > std 0.02** (not 0.0255), and the tied LM head is a **bare `F.linear` with no
@@ -337,8 +345,6 @@ The embedding output is the **loop-0 input** to the recursive stack. In
 ```python
 # src/osrt/model.py:1351-1355
 x = self.embedding(input_ids)
-if self.use_mhc:
-    x = x.unsqueeze(2).repeat(1, 1, self.config.n_hc, 1)   # → n_hc-channel stream
 ```
 
 Two things to notice:
@@ -348,17 +354,15 @@ Two things to notice:
    lookup; the blocks then transform `x` in place. The embedding therefore sets
    the *scale and geometry* of the entire residual stream — which is why its init
    and its no-weight-decay treatment matter.
-2. **mHC expansion.** When Manifold-Constrained Hyper-Connections are enabled
-   (`use_mhc=True` in the preset, `presets.py:43`), the single `dim`-vector per
-   token is broadcast into an `n_hc`-channel residual stream right after embedding
-   — `.repeat`, not `.expand`, so the channels are independent storage. The
-   mechanics of that multi-channel stream are the subject of
-   [`04-mhc.md`](04-mhc.md); the loop-conditioning that breaks symmetry between
-   passes lives in [`06-recursion.md`](06-recursion.md).
+2. **Single residual stream.** The embedding output feeds one `dim`-vector
+   per token straight into the recursive blocks. (v6 expanded this into a
+   4-channel mHC stream; mHC was removed in v7 — roadmap §12.3.) The
+   loop-conditioning that breaks symmetry between passes lives in
+   [`05-recursion.md`](05-recursion.md).
 
 For the full depth-recurrence story — loop embeddings, per-pass adapters, the
-tied LM head applied at intermediate loops — see [`06-recursion.md`](06-recursion.md)
-and [`07-heads-and-losses.md`](07-heads-and-losses.md).
+tied LM head applied at intermediate loops — see [`05-recursion.md`](05-recursion.md)
+and [`06-heads-and-losses.md`](06-heads-and-losses.md).
 
 ---
 
@@ -402,7 +406,7 @@ the vocabulary — the actual token-embedding matrix is exactly **100,663,296**.
 Against the preset's **~601M physical** parameters
 ([`00-overview.md`](00-overview.md), from `compute_budget.py`), the token
 embedding is **≈ 16.6 %** of the model (`100,663,296 / 601,444,393`). (The
-"embedding" *budget line*, 100,690,944, is ~16.7 %; ../docs/ARCHITECTURE.md §4.1 quotes
+"embedding" *budget line*, 100,690,944, is ~16.7 %; ARCHITECTURE.md §4.1 quotes
 16.9 % against an older total. The spread is just numerator/denominator choice.)
 
 This ~16–17 % is the **deliberate "embedding tax" target**. The lesson from
@@ -434,12 +438,12 @@ choice of a 64K (not 128K+) vocabulary is the other half of the same bet.
   **weight-tied** as the LM head (`model.py:1658`), saving ~100M params.
 - **Embedding tax ≈ 16.6 %** of ~601M physical — the LFM2 "params into blocks"
   regime, far from Gemma-3-270M's ~63 % embedding catastrophe.
-- **Live discrepancies to fix** (code/file vs `../docs/ARCHITECTURE.md`):
+- **Live discrepancies to fix** (code/file vs `ARCHITECTURE.md`):
   1. Tokenizer on disk is **32K**, model is built for **64K** — IDs 32768–65535
      are dead embedding rows until the tokenizer is retrained.
   2. Special tokens **14–20** (tool-use + multimodal) are **not on disk**; those
      strings byte-BPE into fragments → silent mis-tokenization for tool/vision.
   3. There are **no reserved IDs 21–31**; real (non-special) tokens start at
-     **ID 14**, contra ../docs/ARCHITECTURE.md §3.2.
+     **ID 14**, contra ARCHITECTURE.md §3.2.
   4. Embedding init is **`normal_(std=0.02)`**, not truncated-normal 0.0255; and
-     there is **no √1536 μP logit scaling**, contra ../docs/ARCHITECTURE.md §4.2.
+     there is **no √1536 μP logit scaling**, contra ARCHITECTURE.md §4.2.

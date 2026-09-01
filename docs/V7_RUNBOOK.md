@@ -11,8 +11,9 @@ economics.
 
 - 1,536 hidden width; 3 physical blocks × 6 recursive loops.
 - 28 routed experts × h2,112, top-4; one h2,816 shared expert.
-- 993,437,571 physical parameters / 288,004,995 active per token with the
-  current 65,536-token vocabulary and two MTP heads.
+- 968,468,355 physical parameters / 263,035,779 active per token with the
+  OSRT-Ostinato 49,280-row vocabulary (49,184 real) and two MTP heads.
+  Active sits BELOW v6's 278,217,769 despite a 61% larger model.
 - mHC off; SiTU-GLU on.
 - sqrt(softplus) routing, Quantile Balancing, z-loss, sequence balance at
   `1e-4`, and the existing `0.10` learned-router auxiliary loss. The auxiliary
