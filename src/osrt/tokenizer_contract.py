@@ -16,43 +16,36 @@ class _Tokenizer(Protocol):
     def convert_tokens_to_ids(self, token: str) -> int: ...
 
 
-V6_SPECIAL_TOKEN_IDS: dict[str, int] = {
-    "<|padding|>": 0,
-    "<|begin_of_text|>": 1,
-    "<|end_of_text|>": 2,
-    "<|unknown|>": 3,
-    "<|fim_prefix|>": 4,
-    "<|fim_middle|>": 5,
-    "<|fim_suffix|>": 6,
-    "<|think|>": 7,
-    "<|/think|>": 8,
-    "<|answer|>": 9,
-    "<|/answer|>": 10,
-    "<|user|>": 11,
-    "<|assistant|>": 12,
-    "<|system|>": 13,
-    "<|end_turn|>": 14,
-    "<|tool_call|>": 15,
-    "<|/tool_call|>": 16,
-    "<|tool_result|>": 17,
-    "<|/tool_result|>": 18,
-    "<|image|>": 19,
-    "<|audio|>": 20,
-    **{f"<|reserved_{token_id}|>": token_id for token_id in range(21, 32)},
+OSTINATO_SPECIAL_TOKEN_IDS: dict[str, int] = {
+    "<|begin_of_text|>": 49152,
+    "<|end_of_text|>": 49153,
+    "<|padding|>": 49154,
+    "<|unknown|>": 49155,
+    "<|think|>": 49159,
+    "<|/think|>": 49160,
+    "<|answer|>": 49161,
+    "<|/answer|>": 49162,
+    "<|user|>": 49163,
+    "<|assistant|>": 49164,
+    "<|system|>": 49165,
+    "<|end_turn|>": 49166,
+    "<|tool_call|>": 49167,
+    "<|/tool_call|>": 49168,
+    "<|tool_result|>": 49169,
+    "<|/tool_result|>": 49170,
 }
 
-V6_ROLE_TOKEN_IDS = {
-    "pad_token_id": 0,
-    "bos_token_id": 1,
-    "eos_token_id": 2,
-    "unk_token_id": 3,
+OSTINATO_ROLE_TOKEN_IDS = {
+    "bos_token_id": 49152,
+    "eos_token_id": 49153,
+    "pad_token_id": 49154,
 }
 
 
 def validate_tokenizer_contract(
     tokenizer: _Tokenizer,
     *,
-    expected_vocab_size: int = 65_536,
+    expected_vocab_size: int = 49_184,
 ) -> None:
     """Raise when vocab size or any structural-token ID has drifted."""
     errors: list[str] = []
@@ -62,12 +55,12 @@ def validate_tokenizer_contract(
             f"vocab size is {actual_vocab_size}, expected {expected_vocab_size}"
         )
 
-    for token, expected_id in V6_SPECIAL_TOKEN_IDS.items():
+    for token, expected_id in OSTINATO_SPECIAL_TOKEN_IDS.items():
         actual_id = tokenizer.convert_tokens_to_ids(token)
         if actual_id != expected_id:
             errors.append(f"{token} has id {actual_id}, expected {expected_id}")
 
-    for attribute, expected_id in V6_ROLE_TOKEN_IDS.items():
+    for attribute, expected_id in OSTINATO_ROLE_TOKEN_IDS.items():
         actual_id = getattr(tokenizer, attribute, None)
         if actual_id != expected_id:
             errors.append(f"{attribute} is {actual_id}, expected {expected_id}")

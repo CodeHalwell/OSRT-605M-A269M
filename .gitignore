@@ -80,10 +80,13 @@ wheels/
 # Third-party paper PDFs: arXiv's default licence does not grant
 # redistribution rights. Cite the arXiv ID; keep PDFs local.
 research/*.pdf
-rollouts/sft_v2.jsonl
-rollouts/sft_v3.jsonl
-# sft_v4.jsonl is 103MB — over GitHub's 100MB hard limit, would be rejected.
-rollouts/sft_v4.jsonl
-rollouts/sft_v4_val.jsonl
+# Training-data jsonl. Patterns are path-INDEPENDENT on purpose: the earlier
+# path-specific rules (rollouts/sft_v2.jsonl) silently stopped applying when
+# rollouts/ moved into archive/v6/, and a 267MB blob went into a commit that
+# GitHub then refused (its hard limit is 100MB per file).
+**/rollouts/sft_v2.jsonl
+**/rollouts/sft_v3.jsonl
+**/rollouts/sft_v4.jsonl
+**/rollouts/sft_v4_val.jsonl
 .son-of-anton/
 .junie/

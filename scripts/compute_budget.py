@@ -3,7 +3,7 @@
 Replaces the hand-derived tables in README.md / ../docs/ARCHITECTURE.md with numbers
 generated from the real model on a meta device (no memory allocated).
 
-IMPORTANT: by default this reports the canonical preset OSRT_605M_A288M, which
+IMPORTANT: by default this reports the committed v7 preset OSRT_V7, which
 is the config that actually trains. Do NOT trust loose CLI overrides to
 reproduce the preset — the CLI only exposes a handful of knobs and everything
 else falls back to OSRTConfig defaults (e.g. num_kv_heads=None => MHA, not the
@@ -24,7 +24,7 @@ import torch
 
 from osrt.config import OSRTConfig
 from osrt.model import OSRTForCausalLM
-from osrt.presets import OSRT_605M_A288M, OSRT_V7
+from osrt.presets import OSRT_V7, OSRT_V7
 
 # Map a parameter name to a budget category. Ordered: first match wins.
 _CATEGORIES = [
@@ -164,7 +164,7 @@ def main() -> None:
     # Start from the REAL canonical preset, not loose defaults. This is the
     # config that trains; reporting anything else silently misleads (the
     # old CLI fell back to MHA + no-MTP defaults and over-reported by ~6M).
-    preset = dict(OSRT_V7 if args.preset == "v7" else OSRT_605M_A288M)
+    preset = dict(OSRT_V7 if args.preset == "v7" else OSRT_V7)
     for kv in args.override:
         k, _, v = kv.partition("=")
         # int-ify where possible, else leave as string/bool

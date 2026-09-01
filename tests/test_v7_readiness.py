@@ -34,7 +34,10 @@ def test_v7_preset_matches_committed_shape_and_budget():
 
     with torch.device("meta"):
         model = OSRTForCausalLM(cfg)
-    assert sum(p.numel() for p in model.parameters()) == 993_437_571
+    # 968,468,355 after gate G2 resolved the tokenizer to the OSRT-Ostinato
+    # vocabulary (roadmap §16). The 25M delta against the pre-G2 993,437,571
+    # is exactly the 65,536 -> 49,280 embedding change.
+    assert sum(p.numel() for p in model.parameters()) == 968_468_355
 
 
 def test_v7_wsd_schedule_boundaries():
@@ -67,14 +70,19 @@ def test_wsd_respects_per_group_peak_and_floor():
 
 
 def test_verified_tokenizer_satisfies_contract():
-    tokenizer = AutoTokenizer.from_pretrained("v6_tokenizer_export")
+    """tokenizer/ is now the OSRT-Ostinato vocabulary (gate G2, roadmap §16),
+    not the v6 65,536 BPE. The contract pins its real size and structural
+    token IDs so a swapped or half-built tokenizer fails before training."""
+    tokenizer = AutoTokenizer.from_pretrained("tokenizer")
     validate_tokenizer_contract(tokenizer)
 
 
-def test_stale_32k_tokenizer_is_rejected():
+def test_wrong_vocab_is_rejected():
+    """Fail-closed is the point: a checkpoint trained at one vocab cannot load
+    at another, and the v6 tokenizer is exactly the wrong one to reach for."""
     tokenizer = AutoTokenizer.from_pretrained("tokenizer")
-    with pytest.raises(ValueError, match="vocab size is 32768"):
-        validate_tokenizer_contract(tokenizer)
+    with pytest.raises(ValueError, match="vocab size is 49184, expected 65536"):
+        validate_tokenizer_contract(tokenizer, expected_vocab_size=65_536)
 
 
 def test_v7_resume_fails_closed_on_optimizer_mismatch(tmp_path):
