@@ -10,6 +10,7 @@ the license off the dataset card.
 Run: HF_TOKEN=... python scripts/probe_sft_datasets.py
 Network-only, no GPU, ~1-2 min. Bounded by --n samples per dataset.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,10 +41,26 @@ CANDIDATES = [
 ]
 
 # likely response/output field names to look for, in priority order
-_RESP_FIELDS = ("response", "output", "answer", "completion", "assistant",
-                "messages", "conversations", "chosen", "target")
-_PROMPT_FIELDS = ("prompt", "instruction", "input", "question", "context",
-                  "messages", "conversations")
+_RESP_FIELDS = (
+    "response",
+    "output",
+    "answer",
+    "completion",
+    "assistant",
+    "messages",
+    "conversations",
+    "chosen",
+    "target",
+)
+_PROMPT_FIELDS = (
+    "prompt",
+    "instruction",
+    "input",
+    "question",
+    "context",
+    "messages",
+    "conversations",
+)
 
 
 def _text_of(v) -> str:
@@ -72,10 +89,14 @@ def _resp_len_chars(ex: dict) -> int | None:
 
 def probe_one(key, repo, cfg, split, n) -> None:
     from datasets import load_dataset
-    print(f"\n{'='*70}\n{key}: {repo}" + (f" [{cfg}]" if cfg else ""))
+
+    print(f"\n{'=' * 70}\n{key}: {repo}" + (f" [{cfg}]" if cfg else ""))
     try:
-        ds = (load_dataset(repo, cfg, split=split, streaming=True) if cfg
-              else load_dataset(repo, split=split, streaming=True))
+        ds = (
+            load_dataset(repo, cfg, split=split, streaming=True)
+            if cfg
+            else load_dataset(repo, split=split, streaming=True)
+        )
     except Exception as e:
         print(f"  STREAM FAILED: {type(e).__name__}: {str(e)[:160]}")
         return
@@ -101,21 +122,32 @@ def probe_one(key, repo, cfg, split, n) -> None:
         lens.sort()
         med = statistics.median(lens)
         p90 = lens[int(0.9 * (len(lens) - 1))]
-        print(f"  response chars: median={med:.0f} (~{med/4:.0f} tok)  "
-              f"p90={p90} (~{p90/4:.0f} tok)  max={max(lens)} (~{max(lens)/4:.0f} tok)")
+        maximum = max(lens)
+        print(
+            f"  response chars: median={med:.0f} (~{med / 4:.0f} tok)  "
+            f"p90={p90} (~{p90 / 4:.0f} tok)  "
+            f"max={maximum} (~{maximum / 4:.0f} tok)"
+        )
         # 601M capacity-fit verdict
         med_tok = med / 4
-        verdict = ("SHORT — good fit for 601M" if med_tok < 400
-                   else "MEDIUM — usable, watch p90" if med_tok < 1200
-                   else "LONG-CoT — likely too long for 601M, filter/subsample")
+        verdict = (
+            "SHORT — good fit for 601M"
+            if med_tok < 400
+            else "MEDIUM — usable, watch p90"
+            if med_tok < 1200
+            else "LONG-CoT — likely too long for 601M, filter/subsample"
+        )
         print(f"  601M fit: {verdict}")
     else:
-        print("  (could not locate a response field for length estimate — "
-              "inspect FIELDS above; may be messages-only)")
+        print(
+            "  (could not locate a response field for length estimate — "
+            "inspect FIELDS above; may be messages-only)"
+        )
     # show one short sample
     ex0 = rows[0]
-    sample = {k: (str(v)[:120] + "...") if len(str(v)) > 120 else v
-              for k, v in ex0.items()}
+    sample = {
+        k: (str(v)[:120] + "...") if len(str(v)) > 120 else v for k, v in ex0.items()
+    }
     print(f"  sample[0]: {sample}")
 
 
@@ -125,8 +157,11 @@ def main() -> int:
     args = ap.parse_args()
 
     def _boom(*_a):
-        print("\nTIMEOUT 180s"); raise SystemExit(2)
-    signal.signal(signal.SIGALRM, _boom); signal.alarm(180)
+        print("\nTIMEOUT 180s")
+        raise SystemExit(2)
+
+    signal.signal(signal.SIGALRM, _boom)
+    signal.alarm(180)
 
     if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
         print("WARN: no HF_TOKEN — gated nvidia repos may 403", flush=True)
@@ -134,8 +169,10 @@ def main() -> int:
     for key, repo, cfg, split in CANDIDATES:
         probe_one(key, repo, cfg, split, args.n)
 
-    print(f"\n{'='*70}\nNOTE: license is on each dataset's HF card "
-          "(check CC-BY-4.0 vs NVIDIA Open License before training).")
+    print(
+        f"\n{'=' * 70}\nNOTE: license is on each dataset's HF card "
+        "(check CC-BY-4.0 vs NVIDIA Open License before training)."
+    )
     return 0
 
 

@@ -8,6 +8,7 @@ calls run_reasoning_eval.
 Run: HF_TOKEN=... PYTHONPATH=src python scripts/local_sft_eval.py \
         --ckpt checkpoints/v5/osrt_v5_sft_v1_final.pt --n 100
 """
+
 from __future__ import annotations
 
 import argparse
@@ -35,8 +36,9 @@ def main() -> int:
 
     import torch
     from transformers import AutoTokenizer
-    from osrt.presets import build_config
+
     from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
     from osrt.sft_eval import run_reasoning_eval
 
     if torch.backends.mps.is_available():
@@ -49,9 +51,12 @@ def main() -> int:
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     model = OSRTForCausalLM(cfg)
 
@@ -59,8 +64,9 @@ def main() -> int:
     sd = ck["model_state_dict"] if "model_state_dict" in ck else ck
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing or unexpected:
-        print(f"  load: {len(missing)} missing, {len(unexpected)} unexpected",
-              flush=True)
+        print(
+            f"  load: {len(missing)} missing, {len(unexpected)} unexpected", flush=True
+        )
         if missing:
             print("   missing[:5]:", missing[:5], flush=True)
         if unexpected:
@@ -71,12 +77,18 @@ def main() -> int:
     if args.dtype == "bf16":
         model = model.to(torch.bfloat16)
     model = model.to(device).eval()
-    print(f"loaded {args.ckpt}  (stage={ck.get('training_stage')}, "
-          f"steps={ck.get('total_steps')})", flush=True)
+    print(
+        f"loaded {args.ckpt}  (stage={ck.get('training_stage')}, "
+        f"steps={ck.get('total_steps')})",
+        flush=True,
+    )
 
     res = run_reasoning_eval(
-        model, tok, device,
-        n_problems=args.n, max_new_tokens=args.max_new_tokens,
+        model,
+        tok,
+        device,
+        n_problems=args.n,
+        max_new_tokens=args.max_new_tokens,
     )
     print("\n=== reasoning eval ===", flush=True)
     for k, v in res.items():

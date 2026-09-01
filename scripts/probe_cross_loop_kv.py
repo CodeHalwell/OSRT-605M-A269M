@@ -49,6 +49,7 @@ Run (real checkpoint, on the box that has it):
 Smoke test (no checkpoint needed, proves the plumbing):
   PYTHONPATH=src python scripts/probe_cross_loop_kv.py --random-init --tiny
 """
+
 from __future__ import annotations
 
 import argparse
@@ -151,17 +152,27 @@ def main() -> int:
     ap.add_argument("--ckpt", default="checkpoints/v5/osrt_v5_midtrain_final.pt")
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
     ap.add_argument("--text-file", default=None, help="One probe example per line.")
-    ap.add_argument("--texts", choices=["math", "general", "mixed"], default="math",
-                    help="Built-in probe set (ignored if --text-file is given). "
-                         "Use 'general' for the robustness re-run.")
+    ap.add_argument(
+        "--texts",
+        choices=["math", "general", "mixed"],
+        default="math",
+        help="Built-in probe set (ignored if --text-file is given). "
+        "Use 'general' for the robustness re-run.",
+    )
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
     ap.add_argument("--device", default=None)
-    ap.add_argument("--random-init", action="store_true",
-                    help="Skip checkpoint load (smoke test only — not science).")
-    ap.add_argument("--tiny", action="store_true",
-                    help="Use a tiny config for a fast plumbing smoke test.")
+    ap.add_argument(
+        "--random-init",
+        action="store_true",
+        help="Skip checkpoint load (smoke test only — not science).",
+    )
+    ap.add_argument(
+        "--tiny",
+        action="store_true",
+        help="Use a tiny config for a fast plumbing smoke test.",
+    )
     ap.add_argument("--out", default=None, help="Write the full report as JSON here.")
     args = ap.parse_args()
 
@@ -180,8 +191,9 @@ def main() -> int:
 
     # ---- tokenizer + input batch ------------------------------------------
     if args.text_file:
-        texts = [ln for ln in Path(args.text_file).read_text().splitlines()
-                 if ln.strip()]
+        texts = [
+            ln for ln in Path(args.text_file).read_text().splitlines() if ln.strip()
+        ]
     elif args.texts == "general":
         texts = GENERAL_PROBE_TEXTS
     elif args.texts == "mixed":
@@ -193,6 +205,7 @@ def main() -> int:
     if not args.tiny:
         try:
             from transformers import AutoTokenizer
+
             tok = AutoTokenizer.from_pretrained(args.tokenizer)
             if tok.pad_token is None:
                 # Some tokenizers (LLaMA/GPT-2) ship no pad token; padding
@@ -201,41 +214,64 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             # Fall back to a tiny random model: the full checkpoint cannot load
             # into a tiny config (shape mismatch), so force random-init too.
-            print(f"tokenizer load failed ({e}); falling back to --tiny synthetic "
-                  f"ids + random init", flush=True)
+            print(
+                f"tokenizer load failed ({e}); falling back to --tiny synthetic "
+                f"ids + random init",
+                flush=True,
+            )
             args.tiny = True
             args.random_init = True
 
     if args.tiny:
         # Synthetic ids — plumbing smoke test, no real tokenizer/checkpoint.
         cfg = build_config(
-            dim=128, heads=4, head_dim=32, num_kv_heads=2, vocab_size=512,
-            real_vocab_size=512, num_blocks=2, recursive_loops=3,
-            num_routed_experts=8, top_k_experts=2, expert_hidden=64,
-            shared_expert_hidden=128, max_position_embeddings=args.seq_len,
+            dim=128,
+            heads=4,
+            head_dim=32,
+            num_kv_heads=2,
+            vocab_size=512,
+            real_vocab_size=512,
+            num_blocks=2,
+            recursive_loops=3,
+            num_routed_experts=8,
+            top_k_experts=2,
+            expert_hidden=64,
+            shared_expert_hidden=128,
+            max_position_embeddings=args.seq_len,
         )
         g = torch.Generator().manual_seed(0)
         input_ids = torch.randint(0, 512, (args.batch, args.seq_len), generator=g)
         attn = torch.ones_like(input_ids)
     else:
         cfg = build_config(
-            vocab_size=len(tok), real_vocab_size=len(tok),
-            bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+            vocab_size=len(tok),
+            real_vocab_size=len(tok),
+            bos_token_id=tok.bos_token_id,
+            eos_token_id=tok.eos_token_id,
             pad_token_id=tok.pad_token_id,
         )
         batch_texts = (texts * ((args.batch // len(texts)) + 1))[: args.batch]
-        enc = tok(batch_texts, return_tensors="pt", padding="max_length",
-                  truncation=True, max_length=args.seq_len)
+        enc = tok(
+            batch_texts,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=args.seq_len,
+        )
         input_ids, attn = enc["input_ids"], enc["attention_mask"]
 
     from osrt.model import OSRTForCausalLM
+
     model = OSRTForCausalLM(cfg)
 
     if not args.random_init:
         ckpt_path = Path(args.ckpt)
         if not ckpt_path.exists():
-            print(f"ERROR: checkpoint {ckpt_path} not found. Use --random-init for a "
-                  f"smoke test, or point --ckpt at the real file.", flush=True)
+            print(
+                f"ERROR: checkpoint {ckpt_path} not found. Use --random-init for a "
+                f"smoke test, or point --ckpt at the real file.",
+                flush=True,
+            )
             return 2
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         sd = ck.get("model_state_dict", ck)
@@ -243,10 +279,12 @@ def main() -> int:
         # stale/mismatched checkpoint that leaves params randomly initialised must
         # not masquerade as a real probe. Same contract as the training loader.
         from osrt.train import load_model_state_or_raise
+
         load_model_state_or_raise(model, sd, context=f"probe load {ckpt_path}")
     else:
-        print("random-init: results are a PLUMBING CHECK ONLY, not evidence.",
-              flush=True)
+        print(
+            "random-init: results are a PLUMBING CHECK ONLY, not evidence.", flush=True
+        )
 
     model = model.to(device=device, dtype=dtype).eval()
     input_ids, attn = input_ids.to(device), attn.to(device)
@@ -262,7 +300,8 @@ def main() -> int:
     latents = out.past_key_values  # list of (B, S, kv_dim), len = blocks*loops
     n_blocks, n_loops = cfg.num_blocks, cfg.recursive_loops
     assert len(latents) == n_blocks * n_loops, (
-        f"expected {n_blocks * n_loops} latents, got {len(latents)}")
+        f"expected {n_blocks * n_loops} latents, got {len(latents)}"
+    )
 
     # Telemetry from the same forward. update_norm is indexed per effective layer
     # (idx = loop*n_blocks + block_idx, like the latents); routing entropy lives
@@ -288,10 +327,14 @@ def main() -> int:
 
     # ---- metrics -----------------------------------------------------------
     report: dict = {
-        "config": {"num_blocks": n_blocks, "num_loops": n_loops,
-                   "kv_dim": int(latents[0].shape[-1]),
-                   "valid_tokens": valid_tokens,
-                   "random_init": bool(args.random_init), "tiny": bool(args.tiny)},
+        "config": {
+            "num_blocks": n_blocks,
+            "num_loops": n_loops,
+            "kv_dim": int(latents[0].shape[-1]),
+            "valid_tokens": valid_tokens,
+            "random_init": bool(args.random_init),
+            "tiny": bool(args.tiny),
+        },
         "blocks": [],
     }
 
@@ -300,8 +343,10 @@ def main() -> int:
     print("=" * 72)
     for b in range(n_blocks):
         loops = per_block[b]
-        cka = [[round(linear_cka(loops[i], loops[j]), 4) for j in range(n_loops)]
-               for i in range(n_loops)]
+        cka = [
+            [round(linear_cka(loops[i], loops[j]), 4) for j in range(n_loops)]
+            for i in range(n_loops)
+        ]
         cos0 = [round(mean_cosine(loops[k], loops[0]), 4) for k in range(n_loops)]
 
         # Scheme 1: first-loop share — every loop reuses loop 0.
@@ -312,10 +357,9 @@ def main() -> int:
         # loops [h..L) reuse loop h (caches 2 of L; == "recompute every L/2
         # loops", i.e. g=3 only in the default L=6 case).
         h = n_loops // 2
-        grouped_err = (
-            [rel_l2(loops[k], loops[0]) for k in range(1, h)]
-            + [rel_l2(loops[k], loops[h]) for k in range(h + 1, n_loops)]
-        )
+        grouped_err = [rel_l2(loops[k], loops[0]) for k in range(1, h)] + [
+            rel_l2(loops[k], loops[h]) for k in range(h + 1, n_loops)
+        ]
         grouped_mean = round(sum(grouped_err) / max(len(grouped_err), 1), 4)
 
         # Contraction series: adjacent-loop CKA(k, k+1) and the per-step KV move
@@ -327,58 +371,76 @@ def main() -> int:
         # Triangulation signals from the SAME forward, regrouped per loop:
         #  - residual update |dx|/|x| at this (block, loop) effective layer
         #  - per-loop routing entropy (marginal = balance, per-token = sharpness)
-        upd = [round(float(upd_norm[loop * n_blocks + b]), 4)
-               for loop in range(n_loops)]
+        upd = [
+            round(float(upd_norm[loop * n_blocks + b]), 4) for loop in range(n_loops)
+        ]
         route_marg = _moe_stat(b, "last_marginal_entropy")
         route_tok = _moe_stat(b, "last_per_token_entropy")
 
         block_report = {
-            "block": b, "cka_matrix": cka, "cosine_vs_loop0": cos0,
-            "first_share_rel_l2": first_err, "first_share_rel_l2_mean": first_mean,
+            "block": b,
+            "cka_matrix": cka,
+            "cosine_vs_loop0": cos0,
+            "first_share_rel_l2": first_err,
+            "first_share_rel_l2_mean": first_mean,
             "two_group_split_rel_l2_mean": grouped_mean,
-            "adjacent_cka": adj_cka, "kv_move_size": kv_move,
-            "loop_update_norm": upd, "route_marginal_entropy": route_marg,
+            "adjacent_cka": adj_cka,
+            "kv_move_size": kv_move,
+            "loop_update_norm": upd,
+            "route_marginal_entropy": route_marg,
             "route_per_token_entropy": route_tok,
         }
         report["blocks"].append(block_report)
 
         print(f"\n-- physical block {b} --")
         print(f"  cosine(loop_k, loop_0): {cos0}")
-        print(f"  CKA(loop_k, loop_0):    "
-              f"{[cka[0][k] for k in range(n_loops)]}")
+        print(f"  CKA(loop_k, loop_0):    {[cka[0][k] for k in range(n_loops)]}")
         print(f"  contraction — KV move 1-CKA(k,k+1): {kv_move}")
         print(f"  triangulate — update |dx|/|x|/loop: {upd}")
         print(f"  triangulate — route entropy (marg): {route_marg}")
-        print(f"  injected rel-L2 if FIRST-LOOP SHARE (caches 1 of {n_loops} "
-              f"= {n_loops}x): per-loop {first_err} => mean {first_mean}")
-        print(f"  injected rel-L2 if 2-GROUP SPLIT (caches 2 of {n_loops} "
-              f"= {n_loops / 2:.1f}x): mean {grouped_mean}")
+        print(
+            f"  injected rel-L2 if FIRST-LOOP SHARE (caches 1 of {n_loops} "
+            f"= {n_loops}x): per-loop {first_err} => mean {first_mean}"
+        )
+        print(
+            f"  injected rel-L2 if 2-GROUP SPLIT (caches 2 of {n_loops} "
+            f"= {n_loops / 2:.1f}x): mean {grouped_mean}"
+        )
 
     # ---- decision hint -----------------------------------------------------
     # Average CKA(loop_k, loop_0) over k=1..L-1 ONLY — excluding the self term
     # CKA(loop_0, loop_0)=1.0, which would otherwise inflate the gate (e.g. five
     # real 0.66s would report as (1+5*0.66)/6=0.72 and trip the >0.70 hint).
     denom = max(n_loops - 1, 1)
-    mean_cka0 = sum(
-        sum(blk["cka_matrix"][0][1:]) / denom for blk in report["blocks"]
-    ) / n_blocks
+    mean_cka0 = (
+        sum(sum(blk["cka_matrix"][0][1:]) / denom for blk in report["blocks"])
+        / n_blocks
+    )
     mean_first = sum(b["first_share_rel_l2_mean"] for b in report["blocks"]) / n_blocks
-    report["summary"] = {"mean_cka_vs_loop0": round(mean_cka0, 4),
-                         "mean_first_share_rel_l2": round(mean_first, 4)}
+    report["summary"] = {
+        "mean_cka_vs_loop0": round(mean_cka0, 4),
+        "mean_first_share_rel_l2": round(mean_first, 4),
+    }
 
     print("\n" + "=" * 72)
-    print(f"SUMMARY  mean CKA(*,loop0)={mean_cka0:.3f}  "
-          f"mean first-share rel-L2={mean_first:.3f}")
+    print(
+        f"SUMMARY  mean CKA(*,loop0)={mean_cka0:.3f}  "
+        f"mean first-share rel-L2={mean_first:.3f}"
+    )
     if args.random_init:
         print("  (random-init: ignore the numbers; this only proves the probe runs.)")
     elif mean_cka0 > 0.90 and mean_first < 0.10:
         print("  HINT: loops are near-collinear -> first-loop share (6x) looks cheap.")
     elif mean_cka0 > 0.70:
-        print("  HINT: partial overlap -> grouped g=L/2 (~3x) is the safe middle; "
-              "re-check at the reasoning-on>off gate.")
+        print(
+            "  HINT: partial overlap -> grouped g=L/2 (~3x) is the safe middle; "
+            "re-check at the reasoning-on>off gate."
+        )
     else:
-        print("  HINT: loops carry distinct KV (recursion is refining) -> prefer "
-              "low-rank per-loop delta; do NOT full-share.")
+        print(
+            "  HINT: loops carry distinct KV (recursion is refining) -> prefer "
+            "low-rank per-loop delta; do NOT full-share."
+        )
     print("=" * 72)
 
     if args.out:

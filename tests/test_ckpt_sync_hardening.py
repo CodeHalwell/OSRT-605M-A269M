@@ -4,6 +4,7 @@ See docs/specs/2026-07-26-ckpt-sync-and-data-builder-findings.md:
   §1 — atomic save (no truncated file ever visible at the final name)
   §2 — rescue/final checkpoints are reachable by the sync glob + resume selection
 """
+
 import glob
 import os
 import re
@@ -37,6 +38,7 @@ def test_save_checkpoint_is_atomic(tmp_path):
     ck = torch.load(path, map_location="cpu", weights_only=True)
     assert ck["step"] == 100
     assert "model_state_dict" in ck and "optimizer_state_dict" in ck
+    assert "model_config" in ck
 
 
 # ── §2: sync/resume coverage for _step_, _rescue_step_ and _final aliases ──

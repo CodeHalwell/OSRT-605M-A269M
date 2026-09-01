@@ -10,6 +10,7 @@ The loop telemetry is gated on telemetry_enabled (like the MoE telemetry) so
 it never runs on normal (compiled, fullgraph) steps — verified separately by
 the graph-break probe.
 """
+
 import os
 import sys
 

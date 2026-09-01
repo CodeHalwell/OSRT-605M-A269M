@@ -3,17 +3,28 @@
 import torch
 
 from osrt.config import OSRTConfig
-from osrt.model import OSRTForCausalLM
 from osrt.mhc import ManifoldHyperConnection, sinkhorn_doubly_stochastic
+from osrt.model import OSRTForCausalLM
 
 
 def _mhc_config(**over):
     base = dict(
-        dim=128, heads=4, head_dim=32, num_kv_heads=2,
-        vocab_size=256, real_vocab_size=256, num_blocks=2, recursive_loops=3,
-        num_routed_experts=8, top_k_experts=2, expert_hidden=64,
-        shared_expert_hidden=64, max_position_embeddings=64,
-        aux_loop_loss_weight=0.05, use_mhc=True, n_hc=4,
+        dim=128,
+        heads=4,
+        head_dim=32,
+        num_kv_heads=2,
+        vocab_size=256,
+        real_vocab_size=256,
+        num_blocks=2,
+        recursive_loops=3,
+        num_routed_experts=8,
+        top_k_experts=2,
+        expert_hidden=64,
+        shared_expert_hidden=64,
+        max_position_embeddings=64,
+        aux_loop_loss_weight=0.05,
+        use_mhc=True,
+        n_hc=4,
     )
     base.update(over)
     return OSRTConfig(**base)
@@ -45,8 +56,8 @@ def test_mhc_shapes_input_view_and_update():
     a, b, c = mhc.generate(X)
     assert a.shape == (2, 5, 4) and c.shape == (2, 5, 4)
     assert b.shape == (2, 5, 4, 4)
-    assert (a >= 0).all() and (a <= 1).all()          # sigmoid-bounded
-    assert (c >= 0).all() and (c <= 2).all()          # 2*sigmoid-bounded
+    assert (a >= 0).all() and (a <= 1).all()  # sigmoid-bounded
+    assert (c >= 0).all() and (c <= 2).all()  # 2*sigmoid-bounded
     x_in = mhc.input_view(X, a)
     assert x_in.shape == (2, 5, 16)
     X2 = mhc.update(X, b, c, x_in)
@@ -68,7 +79,9 @@ def test_mhc_cached_decode_matches_full_forward():
     full = torch.randint(0, 256, (1, 6))
     pre = model(full[:, :5], use_cache=True)
     step = model(
-        full[:, 5:6], past_key_values=pre.past_key_values, use_cache=True,
+        full[:, 5:6],
+        past_key_values=pre.past_key_values,
+        use_cache=True,
     )
     ref = model(full, use_cache=False)
     assert torch.allclose(step.logits[:, -1], ref.logits[:, -1], atol=1e-4)

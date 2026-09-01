@@ -9,11 +9,17 @@ from osrt.monitoring import loop_depth_probe, moe_health, summarize
 
 def _tiny_model(**over):
     cfg = OSRTConfig(
-        dim=128, heads=4, head_dim=32,
-        vocab_size=256, real_vocab_size=256,
-        num_blocks=2, recursive_loops=3,
-        num_routed_experts=8, top_k_experts=2,
-        expert_hidden=64, shared_expert_hidden=64,
+        dim=128,
+        heads=4,
+        head_dim=32,
+        vocab_size=256,
+        real_vocab_size=256,
+        num_blocks=2,
+        recursive_loops=3,
+        num_routed_experts=8,
+        top_k_experts=2,
+        expert_hidden=64,
+        shared_expert_hidden=64,
         max_position_embeddings=64,
         aux_loop_loss_weight=0.05,
         **over,

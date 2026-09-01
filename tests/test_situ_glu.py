@@ -8,6 +8,7 @@ Guards the three properties that make it a safe A/B toggle:
   3. It adds NO parameters, so eager/grouped paths stay in parity and a
      situ=False checkpoint loads into a situ=True model unchanged.
 """
+
 import os
 import sys
 
@@ -72,7 +73,7 @@ def test_situ_gradients_flow_past_the_cap():
     # zeros them. (Deep saturation z >> b still vanishes — tanh saturates — but
     # the band is wide, not a cliff.)
     bg, bu = 4.0, 25.0
-    g = torch.full((4,), 6.0, requires_grad=True)   # past a clamp of 3
+    g = torch.full((4,), 6.0, requires_grad=True)  # past a clamp of 3
     u = torch.full((4,), 6.0, requires_grad=True)
     _glu_combine(g, u, clamp=None, situ=True, b_gate=bg, b_up=bu).sum().backward()
     assert g.grad.abs().sum() > 0 and u.grad.abs().sum() > 0
@@ -93,8 +94,8 @@ def test_situ_adds_no_parameters():
 
 def test_situ_checkpoint_loads_into_either_flag():
     torch.manual_seed(0)
-    off = MoELayer(_cfg())                       # trained with SwiGLU
-    on = MoELayer(_cfg(situ_glu=True))           # A/B variant
+    off = MoELayer(_cfg())  # trained with SwiGLU
+    on = MoELayer(_cfg(situ_glu=True))  # A/B variant
     on.load_state_dict(off.state_dict(), strict=True)  # raises on any mismatch
     assert on.experts[0].situ is True and off.experts[0].situ is False
 

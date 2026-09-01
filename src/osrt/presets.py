@@ -23,17 +23,17 @@ OSRT_605M_A288M: dict = dict(
     dim=1536,
     heads=24,
     head_dim=64,
-    num_kv_heads=8,            # GQA 24/8 + MLA-style compressed-latent KV cache
+    num_kv_heads=8,  # GQA 24/8 + MLA-style compressed-latent KV cache
     vocab_size=65536,
     real_vocab_size=65536,
     num_blocks=3,
     recursive_loops=6,
-    num_routed_experts=8,       # less sparse than 12 → more capacity per token
-    top_k_experts=2,            # 2/8 = 25% routing density
-    expert_hidden=3840,         # solved via compute_budget.py to land 605M with rank=256
+    num_routed_experts=8,  # less sparse than 12 → more capacity per token
+    top_k_experts=2,  # 2/8 = 25% routing density
+    expert_hidden=3840,  # solved via compute_budget.py to land 605M with rank=256
     shared_expert_hidden=2816,  # trial-and-error to fit budget; revisit at GPU phase
-    adapter_rank=256,           # real HRA capacity (NOT LoRA-style 16)
-    adapter_alpha=256.0,        # match rank so scale = 1.0
+    adapter_rank=256,  # real HRA capacity (NOT LoRA-style 16)
+    adapter_alpha=256.0,  # match rank so scale = 1.0
     # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8): 4-channel
     # residual stream, Birkhoff/Sinkhorn doubly-stochastic mixing. Enabled for
     # GPU-phase testing — CPU pre-flight (scripts/ablate_features.py) showed
@@ -43,7 +43,7 @@ OSRT_605M_A288M: dict = dict(
     use_mhc=True,
     n_hc=4,
     mhc_sinkhorn_iters=20,
-    swiglu_clamp=10.0,         # DeepSeek-style SwiGLU stability clamp (§7.8)
+    swiglu_clamp=10.0,  # DeepSeek-style SwiGLU stability clamp (§7.8)
     # Attention sink DROPPED (was True). The manual sink path materialises a
     # (B,H,S,S) score matrix; at the seq-8192 instruction phase that is ~12GB
     # recomputed in the checkpointed backward — measured OOM (>85GB) at batch 2.
@@ -59,7 +59,7 @@ OSRT_605M_A288M: dict = dict(
     # identical to the loop path, so checkpoints load under either dispatch.
     moe_grouped_gemm=True,
     # lean-v6 training stack (all already supported by the v5 model code)
-    aux_loop_loss_weight=0.05,   # on from step 1 — anti loop-collapse
+    aux_loop_loss_weight=0.05,  # on from step 1 — anti loop-collapse
     # Multi-Token Prediction heads (§9.3, §11.4): 2 extra heads predicting +2/+3
     # from the final hidden state. Training-time only (droppable at deploy);
     # densifies the signal à la DeepSeek-V3/V4. beta = 0.3 per §11.4.
@@ -77,9 +77,38 @@ OSRT_605M_A288M: dict = dict(
 )
 
 
+# v7 architecture committed in docs/specs/2026-08-11-v7-roadmap.md §14.
+# The tokenizer and MTP gates remain open, so this intentionally retains the
+# verified v6 65K tokenizer contract and two MTP heads. It is launchable only
+# through the v7 sanity stage until those external gates are closed.
+#
+# Recorded assumption (§14.8): the compute-optimal token requirement tracks
+# active parameters, not total physical parameters. G3a falsifies this if
+# loss-per-token degrades as total parameters rise at fixed active compute;
+# the paid trunk must not launch before that result is recorded.
+OSRT_V7: dict = {
+    **OSRT_605M_A288M,
+    "num_routed_experts": 28,
+    "top_k_experts": 4,
+    "expert_hidden": 2112,
+    "shared_expert_hidden": 2816,
+    "use_mhc": False,
+    "situ_glu": True,
+    "swiglu_clamp": None,
+    "router_balance_method": "quantile",
+    "router_qb_histogram_bins": 2048,
+    "router_seq_balance_loss_coeff": 1e-4,
+}
+
+
 def build_config(preset: dict = OSRT_605M_A288M, **overrides) -> OSRTConfig:
     """Build a OSRTConfig from a preset, with optional overrides."""
     return OSRTConfig(**{**preset, **overrides})
+
+
+def build_v7_config(**overrides) -> OSRTConfig:
+    """Build the committed v7 shape without changing the v6 default preset."""
+    return build_config(OSRT_V7, **overrides)
 
 
 # Back-compat alias — old code (app.py, sft_train.py) imports OSRT_605M_A279M.

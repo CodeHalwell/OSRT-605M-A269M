@@ -10,6 +10,7 @@ meta device — non-persistent buffers materialise as uninitialised garbage,
 silently corrupting RoPE on every reloaded model (forward diverged by ~0.9
 with bit-identical weights before the fix).
 """
+
 import os
 import sys
 import tempfile
@@ -51,6 +52,7 @@ def test_from_pretrained_forward_parity():
 
 def test_automodel_roundtrip():
     from transformers import AutoModelForCausalLM
+
     torch.manual_seed(1)
     m = OSRTForCausalLM(tiny_config()).eval()
     x = torch.randint(0, 512, (1, 8))
@@ -77,6 +79,7 @@ def test_auto_map_written():
     """save_pretrained writes auto_map + copies the modeling/config files
     (the trust_remote_code hook)."""
     import json
+
     m = OSRTForCausalLM(tiny_config())
     d = _roundtrip(m)
     cfg = json.load(open(os.path.join(d, "config.json")))

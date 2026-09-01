@@ -14,10 +14,10 @@ Use:
   from osrt.system_prompts import SYSTEM_PROMPTS, sample_system_prompt
   sys = sample_system_prompt(rng)  # uniform random
 """
+
 from __future__ import annotations
 
 import random
-
 
 # ── The pool ──
 # Each entry is a (name, prompt_text) tuple. Name is for logging.
@@ -90,7 +90,8 @@ REASONING_ON: list[tuple[str, str]] = [
         "Assistant: <|think|>25 - 9 = 16.<|/think|><|answer|>16<|/answer|>\n\n"
         "Example 2:\n"
         "User: Half of 50 is what?\n"
-        "Assistant: <|think|>Half of 50 means divide by 2. 50 / 2 = 25.<|/think|><|answer|>25<|/answer|>",
+        "Assistant: <|think|>Half of 50 means divide by 2. "
+        "50 / 2 = 25.<|/think|><|answer|>25<|/answer|>",
     ),
     (
         "code_python_1shot",
@@ -157,8 +158,11 @@ REASONING_ON: list[tuple[str, str]] = [
     ("word_problem_verify_0shot", _VERIFY_INSTRUCTIONS),
     (
         "word_problem_verify_1shot",
-        _VERIFY_INSTRUCTIONS + "\n\nExample:\n" + _VERIFY_EXEMPLAR
-        + "\n\n" + _VERIFY_NO_REPEAT,
+        _VERIFY_INSTRUCTIONS
+        + "\n\nExample:\n"
+        + _VERIFY_EXEMPLAR
+        + "\n\n"
+        + _VERIFY_NO_REPEAT,
     ),
     (
         "general_default",
@@ -228,7 +232,8 @@ _POOLS = {"on": REASONING_ON, "off": REASONING_OFF}
 
 
 def sample_system_prompt(
-    rng: random.Random | None = None, mode: str = "on",
+    rng: random.Random | None = None,
+    mode: str = "on",
 ) -> tuple[str, str]:
     """Uniform-random sample from the reasoning-`mode` pool. Returns (name, text).
 
@@ -252,6 +257,7 @@ def get_by_name(name: str) -> str:
             if n == name:
                 return t
     raise KeyError(f"unknown system prompt: {name}")
+
 
 # ── pinned evaluation personas ────────────────────────────────────────
 # The historical default was `Random(0).choice(pool)`, which resolves to these

@@ -69,7 +69,8 @@ def _hadamard_matrix(n: int, device, dtype) -> Tensor:
     h = torch.ones((1, 1), device=device, dtype=dtype)
     while h.shape[0] < n:
         h = torch.cat(
-            [torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0,
+            [torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)],
+            dim=0,
         )
     return h / math.sqrt(n)
 
@@ -80,9 +81,17 @@ def _cached_rotation_cpu(dim: int, seed: int) -> Tensor:
     gen = torch.Generator(device="cpu").manual_seed(seed)
     if _is_pow2(dim):
         h = _hadamard_matrix(dim, device="cpu", dtype=torch.float32)
-        signs = torch.randint(
-            0, 2, (dim,), generator=gen, dtype=torch.float32,
-        ) * 2.0 - 1.0  # ±1
+        signs = (
+            torch.randint(
+                0,
+                2,
+                (dim,),
+                generator=gen,
+                dtype=torch.float32,
+            )
+            * 2.0
+            - 1.0
+        )  # ±1
         r = h * signs.view(1, -1)
     else:
         a = torch.randn((dim, dim), generator=gen, dtype=torch.float32)
@@ -115,9 +124,7 @@ def pack_int4(codes: Tensor) -> Tensor:
     Values are stored two's-complement in [-7, 7] mapped to nibbles [0, 15].
     """
     if codes.shape[-1] % 2 != 0:
-        raise ValueError(
-            f"pack_int4 needs an even last dim, got {codes.shape[-1]}"
-        )
+        raise ValueError(f"pack_int4 needs an even last dim, got {codes.shape[-1]}")
     nib = (codes.to(torch.int16) & 0x0F).to(torch.uint8)  # 4-bit two's complement
     low = nib[..., 0::2]
     high = nib[..., 1::2]
@@ -190,9 +197,7 @@ def quantize_kv_latent(
     orig_dim = x.shape[-1]
     bs = orig_dim if block_size is None else block_size
     if orig_dim % bs != 0:
-        raise ValueError(
-            f"last dim {orig_dim} must be divisible by block_size {bs}"
-        )
+        raise ValueError(f"last dim {orig_dim} must be divisible by block_size {bs}")
 
     work = x.float()
     if rotate:
@@ -232,7 +237,10 @@ def dequantize_kv_latent(q: QuantizedKV) -> Tensor:
     work = q.codes.float() * q.scale  # (..., n_blocks, block_size)
     if q.rotated:
         r = make_rotation(
-            q.block_size, seed=q.seed, device=work.device, dtype=torch.float32,
+            q.block_size,
+            seed=q.seed,
+            device=work.device,
+            dtype=torch.float32,
         )
         work = work @ r.T  # un-rotate (R orthogonal ⇒ R^{-1} == R^T)
     lead = work.shape[:-2]

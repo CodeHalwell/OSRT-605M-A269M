@@ -113,14 +113,18 @@ class PretrainConfig:
     # correct. To train a longer base, raise this BEFORE the first chunk and
     # keep it fixed across resumes (changing it mid-run reshapes the cosine).
     total_steps: int = 3_500
-    warmup_steps: int = 400          # ~11% — spins up Muon + the MoE balance bias
+    warmup_steps: int = 400  # ~11% — spins up Muon + the MoE balance bias
+    # v6 uses cosine. v7 opts into warmup-stable-decay (WSD), with the final
+    # `wsd_decay_steps` forming a cosine decay window after the stable plateau.
+    lr_schedule: str = "cosine"
+    wsd_decay_steps: int = 0
     peak_lr: float = 6e-4
     min_lr: float = 6e-5
     weight_decay: float = 0.3
     grad_clip: float = 1.0
     log_interval: int = 50
     eval_interval: int = 1_000
-    eval_steps: int = 20           # number of batches per eval
+    eval_steps: int = 20  # number of batches per eval
     # Frequent ckpts protect against budget-driven Modal kills: with a
     # capped credit pool, the function dies hard (no clean shutdown,
     # no rescue ckpt) when the wallet hits zero. 500-step intervals
@@ -130,6 +134,13 @@ class PretrainConfig:
     # this True; sanity/mem/compile checks set it False so they don't clobber
     # a real run's final checkpoint on the shared volume with throwaway weights.
     save_final_checkpoint: bool = True
+    # Checkpoint identity is configurable so a v7 smoke/run can never resume
+    # or overwrite a v5/v6 lineage in the same directory.
+    checkpoint_prefix: str = "osrt_v5"
+    training_stage: str = "pretrain_v5"
+    # Legacy lineages allow a fresh optimizer after a recipe migration. New
+    # v7 runs fail closed because losing Muon momentum invalidates a resume.
+    strict_optimizer_resume: bool = False
     # Default optimizer is Muon hybrid (Muon for 2D matrix weights,
     # AdamW for embeddings/norms/scalars/router/loop_embeddings). The
     # 1200-step ablation (A/B/C to completion; D stopped at step 600)
@@ -156,6 +167,13 @@ class PretrainConfig:
     # no single head dominates the shared update. Adds no params and the update
     # magnitude is held constant, so it's a clean A/B toggle. Default off.
     per_head_muon: bool = False
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
+    muon_ns_stable_steps: int = 0
+    muon_update_rms: float | None = None
+    adamw_beta1: float = 0.9
+    adamw_beta2: float = 0.95
+    adamw_eps: float = 1e-8
 
     # Weights & Biases
     wandb_log: bool = True
@@ -172,10 +190,10 @@ class PretrainConfig:
     # high while per-token entropy also stayed high). All four must hold by
     # step `early_stop_check_step` or training is considered failed.
     early_stop_check_step: int = 5_000
-    min_per_token_entropy_drop: float = 0.55   # init 2.08 → 1.53 (ln 8 = 2.08)
-    min_raw_max_prob: float = 0.30             # well above uniform 1/8 = 0.125
-    min_top_margin: float = 0.10               # clear gap between rank 0 and 1
-    min_marginal_entropy: float = 1.80         # balanced across experts
+    min_per_token_entropy_drop: float = 0.55  # init 2.08 → 1.53 (ln 8 = 2.08)
+    min_raw_max_prob: float = 0.30  # well above uniform 1/8 = 0.125
+    min_top_margin: float = 0.10  # clear gap between rank 0 and 1
+    min_marginal_entropy: float = 1.80  # balanced across experts
     # The four checks above use clean deployed routing (router + balance bias).
     # These guardrails make sure the learned pre-bias router is not secretly
     # collapsed while the non-gradient bias controller hides it.
@@ -336,6 +354,67 @@ class PretrainConfig:
     # Any early stopping still leaves a usable model for SFT.
 
 
+class V7SanityConfig(PretrainConfig):
+    """Launch-gate smoke for the committed v7 architecture and optimizer.
+
+    This deliberately does not define the paid trunk budget. The v7 roadmap's
+    tokenizer, token-yardstick, and kernel gates must close before that budget
+    can be chosen without silently changing the experiment.
+    """
+
+    total_steps: int = 30
+    warmup_steps: int = 5
+    lr_schedule: str = "wsd"
+    wsd_decay_steps: int = 10
+    peak_lr: float = 6e-4
+    min_lr: float = 6e-5
+    weight_decay: float = 0.1
+
+    optimizer_name: str = "muon"
+    muon_lr: float = 6e-4
+    muon_min_lr: float = 6e-5
+    per_head_muon: bool = True
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 8
+    muon_ns_stable_steps: int = 2
+    muon_update_rms: float | None = 0.18
+    adamw_beta1: float = 0.9
+    adamw_beta2: float = 0.95
+    adamw_eps: float = 1e-20
+
+    router_gumbel_tau_init: float = 0.0
+    router_gumbel_tau_final: float = 0.0
+    router_gumbel_anneal_steps: int = 1
+    early_stop_check_step: int = 9_999_999
+    eval_interval: int = 9_999_999
+    # One mid-run checkpoint enables a second invocation to exercise strict
+    # optimizer/config resume and cross-session first-batch fingerprinting.
+    ckpt_interval: int = 15
+    save_final_checkpoint: bool = True
+    checkpoint_prefix: str = "osrt_v7_sanity"
+    training_stage: str = "pretrain_v7_sanity"
+    strict_optimizer_resume: bool = True
+    gradient_checkpointing: bool = True
+    wandb_run_name: str = "osrt-v7-sanity"
+
+    phases: dict = {  # noqa: RUF012
+        "foundation": {
+            "start": 0,
+            "end": 30,
+            "seq_len": 2048,
+            "batch_size": 8,
+            "grad_accum_steps": 8,
+            "datasets": [
+                {
+                    "name": "fineweb-edu",
+                    "hf_id": "HuggingFaceFW/fineweb-edu",
+                    "weight": 1.0,
+                },
+            ],
+        },
+    }
+
+
 class PretrainExtendConfig(PretrainConfig):
     """Continued pre-training ("mid-training") on top of an SFT checkpoint.
 
@@ -392,16 +471,16 @@ class PretrainExtendConfig(PretrainConfig):
     # transition is a tiny upward LR bump (0.5 %), then cosine cools
     # more gently over the longer horizon.
     total_steps: int = 2_800
-    warmup_steps: int = 50          # 3 % of original — kept fixed (re-warmup
-                                    # already done in steps 0-50)
-    peak_lr: float = 1.5e-5         # 2.5 % of original 6e-4
-    min_lr: float = 1.5e-6          # cosine to 10 % of peak
-    weight_decay: float = 0.1       # softer wd than pretrain (0.3)
+    warmup_steps: int = 50  # 3 % of original — kept fixed (re-warmup
+    # already done in steps 0-50)
+    peak_lr: float = 1.5e-5  # 2.5 % of original 6e-4
+    min_lr: float = 1.5e-6  # cosine to 10 % of peak
+    weight_decay: float = 0.1  # softer wd than pretrain (0.3)
     grad_clip: float = 1.0
     log_interval: int = 25
     eval_interval: int = 9_999_999  # skip in-run eval (heartbeat risk; see extend2)
     eval_steps: int = 20
-    ckpt_interval: int = 200        # ~14 ckpts over the 2,800-step run
+    ckpt_interval: int = 200  # ~14 ckpts over the 2,800-step run
 
     # Optimizer reuses the Muon hybrid from pretrain. The lower
     # peak_lr also propagates down to Muon via the same _peak_lr
@@ -409,7 +488,7 @@ class PretrainExtendConfig(PretrainConfig):
     # explicitly so we don't reuse the pretrain-tuned 0.02 (which
     # would shock SFT-flavored weights at this stage).
     optimizer_name: str = "muon"
-    muon_lr: float = 5e-3           # 25 % of pretrain's 0.02
+    muon_lr: float = 5e-3  # 25 % of pretrain's 0.02
     muon_min_lr: float = 5e-4
 
     # ── Routing exploration ─────────────────────────────────────────
@@ -418,7 +497,7 @@ class PretrainExtendConfig(PretrainConfig):
     # noise would hurt rather than help.
     router_gumbel_tau_init: float = 0.0
     router_gumbel_tau_final: float = 0.0
-    router_gumbel_anneal_steps: int = 1   # avoid div-by-zero
+    router_gumbel_anneal_steps: int = 1  # avoid div-by-zero
 
     # ── Early-stop gate ────────────────────────────────────────────
     # Push past the budget so the gate never trips — the four-metric
@@ -441,9 +520,7 @@ class PretrainExtendConfig(PretrainConfig):
     hra_scale: float = 1.0
     hra_before_load: bool = True
     hra_frozen: bool = True
-    pretrained_checkpoint: str = (
-        "/vol/checkpoints/v5/osrt_v5_sft_ultralong_final.pt"
-    )
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_ultralong_final.pt"
 
     # Distinct ckpt prefix so this stage's checkpoints
     # (osrt_v5_extend_step_N.pt) don't collide with base pretrain
@@ -619,10 +696,10 @@ class PretrainExtend2Config(PretrainExtendConfig):
     # exploration, deeper cool (min_lr 7e-7 vs 1e-6) for a tight
     # final state. ~2500 steps × ~1.5 sec compiled = ~62 min, ~$4.
     total_steps: int = 8_100
-    lr_anchor_step: int = 5_600     # resume point — phase 3 anchors here
-    warmup_steps: int = 60          # re-warm length over steps 5600-5660
-    peak_lr: float = 7e-6           # cooler peak for consolidation
-    min_lr: float = 7e-7            # 10% of peak — tight final cool
+    lr_anchor_step: int = 5_600  # resume point — phase 3 anchors here
+    warmup_steps: int = 60  # re-warm length over steps 5600-5660
+    peak_lr: float = 7e-6  # cooler peak for consolidation
+    min_lr: float = 7e-7  # 10% of peak — tight final cool
 
     # Muon hybrid mirrors extend1; lower peak_lr propagates via the
     # same _peak_lr tagging in train.py.
@@ -635,7 +712,7 @@ class PretrainExtend2Config(PretrainExtendConfig):
     # 25-step interval is sane for a 3000-step run (~120 step events
     # total instead of 3000), keeps wandb/console output manageable.
     log_interval: int = 25
-    ckpt_interval: int = 200        # ~15 ckpts over 3,000 steps
+    ckpt_interval: int = 200  # ~15 ckpts over 3,000 steps
     eval_interval: int = 9_999_999  # skip in-run eval (heartbeat risk)
     eval_steps: int = 20
 
@@ -1082,20 +1159,20 @@ class MidtrainConfig(PretrainConfig):
     # resume so the checkpoint is properly ANNEALED to min_lr at 5500
     # rather than dying mid-cool at a budget kill. ~1.49B tokens.
     total_steps: int = 5_500
-    warmup_steps: int = 150          # re-warm from the annealed base
-    lr_anchor_step: int = 0          # fresh cosine (foundation already cooled)
-    peak_lr: float = 2e-4            # ~33% of foundation's 6e-4
-    min_lr: float = 2e-5             # cosine floor at step 5500
-    weight_decay: float = 0.1        # softer than foundation's 0.3
+    warmup_steps: int = 150  # re-warm from the annealed base
+    lr_anchor_step: int = 0  # fresh cosine (foundation already cooled)
+    peak_lr: float = 2e-4  # ~33% of foundation's 6e-4
+    min_lr: float = 2e-5  # cosine floor at step 5500
+    weight_decay: float = 0.1  # softer than foundation's 0.3
     grad_clip: float = 1.0
 
     optimizer_name: str = "muon"
-    muon_lr: float = 6.6e-3          # proportional: (2e-4/6e-4) * 0.02
+    muon_lr: float = 6.6e-3  # proportional: (2e-4/6e-4) * 0.02
     muon_min_lr: float = 6.6e-4
 
     log_interval: int = 50
-    ckpt_interval: int = 500         # 16 ckpts over 8000; bounds Modal-kill loss
-    eval_interval: int = 500         # held-out eval every 500 (16 evals)
+    ckpt_interval: int = 500  # 16 ckpts over 8000; bounds Modal-kill loss
+    eval_interval: int = 500  # held-out eval every 500 (16 evals)
     eval_steps: int = 20
 
     # ── Router exploration: off (router is well-formed) ──────────────
@@ -1110,8 +1187,8 @@ class MidtrainConfig(PretrainConfig):
     hra_enabled: bool = True
     hra_rank: int = 256
     hra_scale: float = 1.0
-    hra_native: bool = True          # skip inject_hra (run_pretrain_extend)
-    hra_frozen: bool = False         # trainable
+    hra_native: bool = True  # skip inject_hra (run_pretrain_extend)
+    hra_frozen: bool = False  # trainable
 
     # ── Resume / lineage ─────────────────────────────────────────────
     # Foundation final ckpt (run_training writes osrt_v5_final.pt; the
@@ -1143,31 +1220,50 @@ class MidtrainConfig(PretrainConfig):
             "start": 0,
             "end": 5_500,
             "seq_len": 4096,
-            "batch_size": 6,         # knowledge-phase sizing; sanity-gated
+            "batch_size": 6,  # knowledge-phase sizing; sanity-gated
             "grad_accum_steps": 11,
             "datasets": [
-                {"name": "nemotron-cc-math-4plus",
-                 "hf_id": "nvidia/Nemotron-CC-Math-v1",
-                 "hf_config": "4plus", "weight": 0.25},
-                {"name": "nemotron-stem",
-                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                 "hf_config": "Nemotron-Pretraining-STEM-SFT", "weight": 0.15},
-                {"name": "nemotron-math-textbooks",
-                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                 "hf_config": "Nemotron-Pretraining-Math-Textbooks",
-                 "weight": 0.15},
-                {"name": "nemotron-reasoning",
-                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                 "hf_config": "Nemotron-Pretraining-InfiniByte-Reasoning",
-                 "weight": 0.10},
-                {"name": "fineweb-edu",
-                 "hf_id": "HuggingFaceFW/fineweb-edu", "weight": 0.15},
-                {"name": "nemotron-code-syn-qa",
-                 "hf_id": "nvidia/Nemotron-Pretraining-Code-v2",
-                 "hf_config": "Synthetic-Question-Answering", "weight": 0.10},
-                {"name": "cosmopedia-openstax",
-                 "hf_id": "HuggingFaceTB/cosmopedia",
-                 "hf_config": "openstax", "weight": 0.10},
+                {
+                    "name": "nemotron-cc-math-4plus",
+                    "hf_id": "nvidia/Nemotron-CC-Math-v1",
+                    "hf_config": "4plus",
+                    "weight": 0.25,
+                },
+                {
+                    "name": "nemotron-stem",
+                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                    "hf_config": "Nemotron-Pretraining-STEM-SFT",
+                    "weight": 0.15,
+                },
+                {
+                    "name": "nemotron-math-textbooks",
+                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                    "hf_config": "Nemotron-Pretraining-Math-Textbooks",
+                    "weight": 0.15,
+                },
+                {
+                    "name": "nemotron-reasoning",
+                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                    "hf_config": "Nemotron-Pretraining-InfiniByte-Reasoning",
+                    "weight": 0.10,
+                },
+                {
+                    "name": "fineweb-edu",
+                    "hf_id": "HuggingFaceFW/fineweb-edu",
+                    "weight": 0.15,
+                },
+                {
+                    "name": "nemotron-code-syn-qa",
+                    "hf_id": "nvidia/Nemotron-Pretraining-Code-v2",
+                    "hf_config": "Synthetic-Question-Answering",
+                    "weight": 0.10,
+                },
+                {
+                    "name": "cosmopedia-openstax",
+                    "hf_id": "HuggingFaceTB/cosmopedia",
+                    "hf_config": "openstax",
+                    "weight": 0.10,
+                },
             ],
         },
     }
@@ -1217,7 +1313,7 @@ class SFTConfig:
     log_interval: int = 25
     ckpt_interval: int = 500
     optimizer_name: str = "adamw"
-    seq_len: int = 2048              # short seq_len + packing (see v4_sft_data)
+    seq_len: int = 2048  # short seq_len + packing (see v4_sft_data)
 
     # HRA
     hra_enabled: bool = True
@@ -1361,17 +1457,17 @@ class MidtrainExtendConfig(MidtrainConfig):
     # --total-steps on the Lightning entry overrides this for other runs.
     total_steps: int = 2_000
     warmup_steps: int = 50
-    lr_anchor_step: int = 0           # fresh re-warm cosine over the full run
-    peak_lr: float = 3e-5             # GENTLE re-warm — the 1e-4 was too hot for
-                                      # an annealed base (ppl rose 30→34, flat)
+    lr_anchor_step: int = 0  # fresh re-warm cosine over the full run
+    peak_lr: float = 3e-5  # GENTLE re-warm — the 1e-4 was too hot for
+    # an annealed base (ppl rose 30→34, flat)
     min_lr: float = 1e-5
-    muon_lr: float = 9.9e-4           # proportional to the AdamW peak (×33)
+    muon_lr: float = 9.9e-4  # proportional to the AdamW peak (×33)
     muon_min_lr: float = 3.3e-4
 
-    eval_interval: int = 250          # frequent verdict points on a capped run
-    ckpt_interval: int = 250          # a credit-death then loses ≤250 steps
+    eval_interval: int = 250  # frequent verdict points on a capped run
+    ckpt_interval: int = 250  # a credit-death then loses ≤250 steps
     log_interval: int = 50
-    dataloader_num_workers: int = 1   # avoid the cold-stream connection storm
+    dataloader_num_workers: int = 1  # avoid the cold-stream connection storm
 
     # Reasoning/instruction-heavy reweight (reasoning+STEM-SFT+math = 0.75,
     # was 0.65). Same sources/seq as midtrain — just emphasises the SFT-style
@@ -1382,28 +1478,47 @@ class MidtrainExtendConfig(MidtrainConfig):
             "batch_size": 6,
             "grad_accum_steps": 11,
             "datasets": [
-                {"name": "nemotron-cc-math-4plus",
-                 "hf_id": "nvidia/Nemotron-CC-Math-v1",
-                 "hf_config": "4plus", "weight": 0.20},
-                {"name": "nemotron-stem",
-                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                 "hf_config": "Nemotron-Pretraining-STEM-SFT", "weight": 0.20},
-                {"name": "nemotron-math-textbooks",
-                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                 "hf_config": "Nemotron-Pretraining-Math-Textbooks",
-                 "weight": 0.15},
-                {"name": "nemotron-reasoning",
-                 "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                 "hf_config": "Nemotron-Pretraining-InfiniByte-Reasoning",
-                 "weight": 0.20},
-                {"name": "fineweb-edu",
-                 "hf_id": "HuggingFaceFW/fineweb-edu", "weight": 0.10},
-                {"name": "nemotron-code-syn-qa",
-                 "hf_id": "nvidia/Nemotron-Pretraining-Code-v2",
-                 "hf_config": "Synthetic-Question-Answering", "weight": 0.075},
-                {"name": "cosmopedia-openstax",
-                 "hf_id": "HuggingFaceTB/cosmopedia",
-                 "hf_config": "openstax", "weight": 0.075},
+                {
+                    "name": "nemotron-cc-math-4plus",
+                    "hf_id": "nvidia/Nemotron-CC-Math-v1",
+                    "hf_config": "4plus",
+                    "weight": 0.20,
+                },
+                {
+                    "name": "nemotron-stem",
+                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                    "hf_config": "Nemotron-Pretraining-STEM-SFT",
+                    "weight": 0.20,
+                },
+                {
+                    "name": "nemotron-math-textbooks",
+                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                    "hf_config": "Nemotron-Pretraining-Math-Textbooks",
+                    "weight": 0.15,
+                },
+                {
+                    "name": "nemotron-reasoning",
+                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
+                    "hf_config": "Nemotron-Pretraining-InfiniByte-Reasoning",
+                    "weight": 0.20,
+                },
+                {
+                    "name": "fineweb-edu",
+                    "hf_id": "HuggingFaceFW/fineweb-edu",
+                    "weight": 0.10,
+                },
+                {
+                    "name": "nemotron-code-syn-qa",
+                    "hf_id": "nvidia/Nemotron-Pretraining-Code-v2",
+                    "hf_config": "Synthetic-Question-Answering",
+                    "weight": 0.075,
+                },
+                {
+                    "name": "cosmopedia-openstax",
+                    "hf_id": "HuggingFaceTB/cosmopedia",
+                    "hf_config": "openstax",
+                    "weight": 0.075,
+                },
             ],
         },
     }
@@ -1456,17 +1571,15 @@ class MidtrainExtend3Config(MidtrainExtendConfig):
     midtrain2_step_1750 (the best intact midtrain2 artifact, ppl 28.2).
     """
 
-    pretrained_checkpoint: str = (
-        "/vol/checkpoints/v5/osrt_v5_midtrain2_step_1750.pt"
-    )
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain2_step_1750.pt"
     stage_prefix: str = "midtrain3"
     wandb_run_name: str = "osrt-v6-midtrain3"
 
-    total_steps: int = 12_600         # +3.4B tokens → ~1x Chinchilla (multi-month)
+    total_steps: int = 12_600  # +3.4B tokens → ~1x Chinchilla (multi-month)
     warmup_steps: int = 100
-    peak_lr: float = 5e-5             # sustained capability LR over a long run
+    peak_lr: float = 5e-5  # sustained capability LR over a long run
     min_lr: float = 1e-5
-    muon_lr: float = 1.65e-3          # ×33 of the AdamW peak
+    muon_lr: float = 1.65e-3  # ×33 of the AdamW peak
     muon_min_lr: float = 3.3e-4
 
     # In-loop eval DISABLED: the held-out skip=100M build stalls the GPU for
@@ -1519,15 +1632,15 @@ class SFTv1Config(SFTConfig):
     # the effective-64 batch as 4x16 so the per-step activation peak is halved.
     gradient_checkpointing: bool = True
     batch_size: int = 4
-    grad_accum_steps: int = 16        # eff batch 64 (unchanged), lower peak mem
-    total_steps: int = 2_000          # 4 x 16 x 2048 = 131K tok/step ≈ 260M tok
+    grad_accum_steps: int = 16  # eff batch 64 (unchanged), lower peak mem
+    total_steps: int = 2_000  # 4 x 16 x 2048 = 131K tok/step ≈ 260M tok
     # peak_lr 1.5e-5 → min 1.5e-6, warmup 250, AdamW — inherited from SFTConfig.
     eval_interval: int = 500
     ckpt_interval: int = 500
 
     # System turn + length floor (consumed by SFTStream/make_sft_loader).
     system_tag: str = "<|system|>"
-    min_response_tokens: int = 150    # "not too short"
+    min_response_tokens: int = 150  # "not too short"
 
     # HRA stays trainable but is NATIVE (built from config, already in the
     # midtrain ckpt) — set hra_native so run_sft skips inject_hra (the v5
@@ -1594,7 +1707,7 @@ class SFTv1SanityConfig(SFTv1Config):
     total_steps: int = 30
     warmup_steps: int = 5
     ckpt_interval: int = 9_999_999
-    eval_interval: int = 9_999_999     # skip the generation eval in the probe
+    eval_interval: int = 9_999_999  # skip the generation eval in the probe
     save_final_checkpoint: bool = False
     stage_prefix: str = "sft_v1-sanity"
     wandb_run_name: str = "osrt-v6-sft-v1-sanity"
@@ -1633,8 +1746,8 @@ class SFTv2Config(MidtrainConfig):
     # plateaued by ~1000). ckpt every 200 → the $40 wall can't lose progress.
     total_steps: int = 1_000
     warmup_steps: int = 100
-    lr_anchor_step: int = 0          # fresh cosine over the full run
-    peak_lr: float = 1e-5            # SFT-scale (cf. SFT v1 1.5e-5); NOT 2e-4
+    lr_anchor_step: int = 0  # fresh cosine over the full run
+    peak_lr: float = 1e-5  # SFT-scale (cf. SFT v1 1.5e-5); NOT 2e-4
     min_lr: float = 1e-6
     # Muon group proportional to the AdamW peak (midtrain ratio ~33×).
     muon_lr: float = 3.3e-4
@@ -1674,9 +1787,7 @@ class SFTv2Config(MidtrainConfig):
     # volume (truncated at 2.4/4.9GB, unloadable — verified by two
     # independent downloads). The lost 1750→2000 tail at lr ≤1.3e-5 was
     # worth ~0.1 ppl; SFT re-warms its own schedule anyway.
-    pretrained_checkpoint: str = (
-        "/vol/checkpoints/v5/osrt_v5_midtrain2_step_1750.pt"
-    )
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain2_step_1750.pt"
     stage_prefix: str = "sft_v2"
     wandb_run_name: str = "osrt-v6-sft-v2"
     wandb_run_id: str = ""
@@ -1722,9 +1833,7 @@ class SFTv3Config(SFTv2Config):
     # Base = midtrain3_final (step 12,600, ~1x Chinchilla; math ppl 2.97 /
     # fineweb 26.30). Pulled from HF by `--stage sft_v3_prep` on fresh
     # workspaces — the v6 line's ONLY intact post-midtrain3 base artifact.
-    pretrained_checkpoint: str = (
-        "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt"
-    )
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt"
     ckpt_interval: int = 200
     stage_prefix: str = "sft_v3"
     wandb_run_name: str = "osrt-v6-sft-v3"
@@ -1798,9 +1907,9 @@ class SFTv4Config(SFTv3Config):
     # Held-out SFT eval — the signal that says when to stop.
     rollout_eval_path: str = "/vol/rollouts/sft_v4_val.jsonl"
     rollout_eval_interval: int = 100
-    rollout_eval_steps: int = 32     # 32 x batch 4 = 128 held-out examples
+    rollout_eval_steps: int = 32  # 32 x batch 4 = 128 held-out examples
 
-    ckpt_interval: int = 200         # 6 checkpoints; pick the best by eval
+    ckpt_interval: int = 200  # 6 checkpoints; pick the best by eval
     stage_prefix: str = "sft_v4"
     wandb_run_name: str = "osrt-v6-sft-v4"
 
@@ -1811,7 +1920,7 @@ class SFTv4SanityConfig(SFTv4Config):
 
     total_steps: int = 30
     warmup_steps: int = 5
-    rollout_eval_interval: int = 10   # exercise the eval path in the probe
+    rollout_eval_interval: int = 10  # exercise the eval path in the probe
     rollout_eval_steps: int = 4
     ckpt_interval: int = 9_999_999
     save_final_checkpoint: bool = False
@@ -1887,8 +1996,8 @@ class SFTLongConfig(SFTConfig):
     total_steps: int = 1_000
     warmup_steps: int = 50
     seq_len: int = 4096
-    batch_size: int = 4               # halved from 8 to fit longer ctx
-    grad_accum_steps: int = 16        # doubled to keep effective batch 64
+    batch_size: int = 4  # halved from 8 to fit longer ctx
+    grad_accum_steps: int = 16  # doubled to keep effective batch 64
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
     log_interval: int = 25
@@ -2085,22 +2194,22 @@ class SFTRefreshConfig(SFTConfig):
     # exposure, not deep content; 200 steps × ~6 sec/step ≈ 20 min ≈
     # $1.30, well within remaining $2.70 budget.
     total_steps: int = 200
-    warmup_steps: int = 10            # 5 % of new total
+    warmup_steps: int = 10  # 5 % of new total
     seq_len: int = 2048
     batch_size: int = 8
     grad_accum_steps: int = 8
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
-    log_interval: int = 10            # tighter logs for the short run
+    log_interval: int = 10  # tighter logs for the short run
     ckpt_interval: int = 50
 
     # HRA: keep trainable so adapters re-tune to the new base.
     hra_enabled: bool = True
     hra_rank: int = 256
     hra_scale: float = 1.0
-    hra_lr: float = 2.5e-5            # 33 % of base SFT hra_lr (7.5e-5)
+    hra_lr: float = 2.5e-5  # 33 % of base SFT hra_lr (7.5e-5)
     hra_freeze_pretrained: bool = False
-    hra_before_load: bool = True      # extend ckpt has HRA params
+    hra_before_load: bool = True  # extend ckpt has HRA params
 
     # Resume from the post-extend checkpoint.
     pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_extend_final.pt"
@@ -2231,11 +2340,11 @@ class SFTMathConfig(SFTRefreshConfig):
     """
 
     total_steps: int = 1_000
-    warmup_steps: int = 50          # 5 % of total
-    peak_lr: float = 3e-6           # lower than refresh's 5e-6
+    warmup_steps: int = 50  # 5 % of total
+    peak_lr: float = 3e-6  # lower than refresh's 5e-6
     min_lr: float = 3e-7
     log_interval: int = 25
-    ckpt_interval: int = 200        # 5 ckpts over 1,000 steps
+    ckpt_interval: int = 200  # 5 ckpts over 1,000 steps
 
     # HRA inherited as trainable. Resume from the freshly-format-
     # anchored ckpt (sft_refresh_final.pt has HRA params in its
@@ -2314,7 +2423,7 @@ class GRPOConfig:
     # 0.20 because the policy has drifted further from the SFT
     # reference over 700 steps.
     total_steps: int = 800
-    warmup_steps: int = 20          # short re-warm over steps 700-720
+    warmup_steps: int = 20  # short re-warm over steps 700-720
     # Steps elapsed before this LR phase. The warmup/cosine schedule
     # uses `step - lr_anchor_step` so re-warming after a resume
     # gives real gradient instead of the near-zero LR a continued
@@ -2332,7 +2441,7 @@ class GRPOConfig:
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     log_interval: int = 10
-    ckpt_interval: int = 100        # 5 ckpts over 500 steps (was 250)
+    ckpt_interval: int = 100  # 5 ckpts over 500 steps (was 250)
     seq_len: int = 8192
 
     # GRPO-specific
@@ -2636,8 +2745,7 @@ class MultiEnvGRPOConfig(GRPOConfig):
         ("How many seconds are in 3 minutes?", "180"),
         ("Convert 100 centimeters to meters.", "1"),
         ("What is half of 50?", "25"),
-        ("If a train travels 60 mph for 2 hours, how far does it go?",
-         "120"),
+        ("If a train travels 60 mph for 2 hours, how far does it go?", "120"),
         ("Round 3.7 to the nearest integer.", "4"),
         ("What is the square root of 64?", "8"),
         ("Count: how many letters are in 'banana'?", "6"),
@@ -2699,21 +2807,21 @@ class GRPOv6Config(GRPOConfig):
     pretrained_checkpoint: str = (
         "/vol/checkpoints/v5/osrt_v5_sft_v4_soup_1200_1400_1600_1800.pt"
     )
-    hra_native: bool = True          # v6: never inject_hra
-    hra_enabled: bool = True         # adapters exist and stay trainable
+    hra_native: bool = True  # v6: never inject_hra
+    hra_enabled: bool = True  # adapters exist and stay trainable
 
     # ── measured rollout settings ────────────────────────────────────
     temperature: float = 0.4
     group_size: int = 16
-    grad_accum_steps: int = 32       # prompts per optimiser step
-    max_gen_len: int = 512           # responses measure ~357-430 tok
+    grad_accum_steps: int = 32  # prompts per optimiser step
+    max_gen_len: int = 512  # responses measure ~357-430 tok
 
     # ── schedule sized for step count ────────────────────────────────
     total_steps: int = 900
     warmup_steps: int = 30
-    lr_anchor_step: int = 0          # fresh cosine, not a resume
-    ckpt_interval: int = 50          # 18 ckpts -> sweep accuracy, don't trust
-                                     # the last one (the SFT-v4 lesson)
+    lr_anchor_step: int = 0  # fresh cosine, not a resume
+    ckpt_interval: int = 50  # 18 ckpts -> sweep accuracy, don't trust
+    # the last one (the SFT-v4 lesson)
 
     # ── screened prompt set ──────────────────────────────────────────
     prompt_dataset: str = "json"
@@ -2779,8 +2887,8 @@ class GRPOv6Config(GRPOConfig):
     # extract_numeric_answer_strict() is never called. The "verified LOSSLESS"
     # note below was measured on the SFT soup; the policy has drifted since, so
     # re-probe rather than assume before relying on it.
-    strict_answer_extraction: bool = True   # verified LOSSLESS: strict==loose
-                                            # at 18.0%, 0.0% ambiguous
+    strict_answer_extraction: bool = True  # verified LOSSLESS: strict==loose
+    # at 18.0%, 0.0% ambiguous
     # ── SYSTEM PROMPT — load-bearing, not cosmetic ───────────────────
     # The v5 loop builds "<|user|>{q}<|assistant|>" with NO system block. The
     # SFT model was trained with one, and the system prompt is what carries the
@@ -2802,7 +2910,7 @@ class GRPOv6Config(GRPOConfig):
     # persona-consistent, which needs per-prompt persona metadata that
     # generate_rollouts does not yet carry.
     system_persona: str = "minimal_format"
-                                             # every eval/probe used
+    # every eval/probe used
 
     # ── in-flight visibility ─────────────────────────────────────────
     # Print real rollouts periodically: scalars cannot show that the text has
@@ -2834,7 +2942,7 @@ class GRPOv6SanityConfig(GRPOv6Config):
 
     total_steps: int = 30
     warmup_steps: int = 5
-    grad_accum_steps: int = 8        # smaller wave so 30 steps is quick
+    grad_accum_steps: int = 8  # smaller wave so 30 steps is quick
     ckpt_interval: int = 9_999_999
     stage_prefix: str = "grpo_v6-sanity"
     wandb_run_name: str = "osrt-v6-grpo-sanity"

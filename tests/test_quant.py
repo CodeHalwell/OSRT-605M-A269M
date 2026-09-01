@@ -103,8 +103,7 @@ def test_rotation_improves_heavy_tailed_quantization():
     )
     # And the win should be substantial, not marginal noise.
     assert err_rot < 0.7 * err_norot, (
-        f"rotation gain too small: rotated={err_rot:.4f} "
-        f"no-rotation={err_norot:.4f}"
+        f"rotation gain too small: rotated={err_rot:.4f} no-rotation={err_norot:.4f}"
     )
 
 
@@ -145,8 +144,11 @@ def test_quantized_dequantized_pipeline_via_packing():
     packed = pack_int4(q.codes)
     q2 = QuantizedKV(
         codes=unpack_int4(packed, q.block_size),
-        scale=q.scale, seed=q.seed, block_size=q.block_size,
-        orig_dim=q.orig_dim, rotated=q.rotated,
+        scale=q.scale,
+        seed=q.seed,
+        block_size=q.block_size,
+        orig_dim=q.orig_dim,
+        rotated=q.rotated,
     )
     via_pack = dequantize_kv_latent(q2)
     assert torch.equal(direct, via_pack)

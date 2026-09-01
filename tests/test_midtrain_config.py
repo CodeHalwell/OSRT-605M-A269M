@@ -1,23 +1,29 @@
 """Unit tests for the v6 midtrain stage: config + native-HRA load gate."""
 
 import pytest
-import torch
 
 from osrt.config import OSRTConfig
+from osrt.hra import inject_hra
 from osrt.model import OSRTForCausalLM
 from osrt.train import load_model_state_or_raise
-from osrt.hra import inject_hra
 
 
 def tiny_config(**overrides) -> OSRTConfig:
     """Small config for fast CPU tests (mirrors tests/test_model.py)."""
     defaults = dict(
-        dim=128, heads=4, head_dim=32,
-        vocab_size=512, real_vocab_size=512,
-        num_blocks=2, recursive_loops=2,
-        num_routed_experts=8, top_k_experts=2,
-        expert_hidden=64, shared_expert_hidden=128,
-        adapter_rank=16, adapter_alpha=16.0,
+        dim=128,
+        heads=4,
+        head_dim=32,
+        vocab_size=512,
+        real_vocab_size=512,
+        num_blocks=2,
+        recursive_loops=2,
+        num_routed_experts=8,
+        top_k_experts=2,
+        expert_hidden=64,
+        shared_expert_hidden=128,
+        adapter_rank=16,
+        adapter_alpha=16.0,
         max_position_embeddings=64,
     )
     defaults.update(overrides)
@@ -44,8 +50,7 @@ def test_inject_hra_on_native_model_breaks_load():
     native_state = OSRTForCausalLM(cfg).state_dict()
 
     injected = OSRTForCausalLM(cfg)
-    inject_hra(injected, rank=cfg.adapter_rank, scale=1.0,
-               freeze_pretrained=False)
+    inject_hra(injected, rank=cfg.adapter_rank, scale=1.0, freeze_pretrained=False)
 
     with pytest.raises(RuntimeError, match="key mismatch"):
         load_model_state_or_raise(
@@ -62,7 +67,7 @@ def test_midtrain_config_values():
     assert cfg.peak_lr == 2e-4
     assert cfg.min_lr == 2e-5
     assert cfg.warmup_steps == 150
-    assert cfg.eval_interval == 500          # eval every 500 (16 evals)
+    assert cfg.eval_interval == 500  # eval every 500 (16 evals)
     # cosine anneals over the full total_steps (lr_anchor_step=0)
     assert cfg.phases["extend"]["end"] == 5_500
     assert cfg.lr_anchor_step == 0
@@ -94,14 +99,18 @@ def test_midtrain_phase_is_seq4096_math_mix():
     assert phase["seq_len"] == 4096
     names = {d["name"] for d in phase["datasets"]}
     assert "nemotron-cc-math-4plus" in names
-    assert "fineweb-edu" in names           # general anchor retained
+    assert "fineweb-edu" in names  # general anchor retained
     assert "cosmopedia-openstax" in names
     # weights: math/STEM/reasoning should dominate (~0.65)
     math_sci = sum(
-        d["weight"] for d in phase["datasets"]
-        if d["name"] in {
-            "nemotron-cc-math-4plus", "nemotron-stem",
-            "nemotron-math-textbooks", "nemotron-reasoning",
+        d["weight"]
+        for d in phase["datasets"]
+        if d["name"]
+        in {
+            "nemotron-cc-math-4plus",
+            "nemotron-stem",
+            "nemotron-math-textbooks",
+            "nemotron-reasoning",
         }
     )
     assert 0.60 <= math_sci <= 0.70
@@ -129,26 +138,33 @@ def test_midtrain_sanity_writes_no_final():
 
 # ── SFT v1 tests (system-prompt instruction tuning) ──────────────────────
 
+
 def test_reasoning_pools_split():
     from osrt.system_prompts import (
-        REASONING_ON, REASONING_OFF, SYSTEM_PROMPTS, sample_system_prompt,
+        REASONING_OFF,
+        REASONING_ON,
+        SYSTEM_PROMPTS,
+        sample_system_prompt,
     )
+
     # A bare count is the wrong invariant — it fires on any addition while
     # missing the thing that actually breaks: `Random(0).choice(pool)` is the
     # historical eval default, and its result depends on POOL LENGTH. Growing a
     # pool can silently rebase every recorded number. The count is kept as a
     # tripwire, but the load-bearing assertion is that the pinned eval personas
     # do not move.
-    assert len(REASONING_ON) == 14   # +word_problem_verify_0shot/1shot (2026-08-10)
+    assert len(REASONING_ON) == 14  # +word_problem_verify_0shot/1shot (2026-08-10)
     assert len(REASONING_OFF) >= 6
     assert SYSTEM_PROMPTS is REASONING_ON  # back-compat
     import random
+
     r = random.Random(0)
     assert sample_system_prompt(r, "on") in REASONING_ON
     assert sample_system_prompt(r, "off") in REASONING_OFF
     # default mode is "on" (preserves old single-pool callers)
     assert sample_system_prompt(r) in REASONING_ON
     import pytest
+
     with pytest.raises(ValueError):
         sample_system_prompt(r, "bogus")
 
@@ -170,6 +186,7 @@ def test_pinned_eval_personas_do_not_drift():
         REASONING_ON,
         sample_system_prompt,
     )
+
     assert DEFAULT_EVAL_ON == "instruction_strict"
     assert DEFAULT_EVAL_OFF == "instruction_direct"
     names_on = {n for n, _ in REASONING_ON}
@@ -214,10 +231,11 @@ def test_few_shot_exemplars_cover_only_shot_personas():
 def test_verify_personas_are_matched_pairs():
     """0-shot and 1-shot must differ ONLY by the demonstration."""
     from osrt.system_prompts import (
-        VERIFY_EXEMPLAR_ANCHORS,
         FEW_SHOT_EXEMPLARS,
+        VERIFY_EXEMPLAR_ANCHORS,
         get_by_name,
     )
+
     zero = get_by_name("word_problem_verify_0shot")
     one = get_by_name("word_problem_verify_1shot")
     assert one.startswith(zero), (
@@ -239,17 +257,26 @@ def test_few_shot_echo_penalty_catches_copying_not_idiom():
     from osrt.system_prompts import FEW_SHOT_EXEMPLARS
 
     ex = FEW_SHOT_EXEMPLARS["word_problem_verify_1shot"]
-    kw = dict(think_open="<|think|>", think_close="<|/think|>",
-              answer_open="<|answer|>", answer_close="<|/answer|>",
-              max_tokens=768, completion_tokens=120)
+    kw = dict(
+        think_open="<|think|>",
+        think_close="<|/think|>",
+        answer_open="<|answer|>",
+        answer_close="<|/answer|>",
+        max_tokens=768,
+        completion_tokens=120,
+    )
 
-    copied = ("<|think|>Let C be the cost price. A 25% profit means the selling "
-              "price is 1.25C, so 1.25C = 625. Then C = 625 / 1.25 = 500. "
-              "Check: 500 x 1.25 = 625, which matches the selling price "
-              "given.<|/think|><|answer|>500<|/answer|>")
-    own = ("<|think|>Let P be the price. A 40% discount means 0.6P = 300, so "
-           "P = 300 / 0.6 = 500. Check: 500 x 0.6 = 300, matches.<|/think|>"
-           "<|answer|>500<|/answer|>")
+    copied = (
+        "<|think|>Let C be the cost price. A 25% profit means the selling "
+        "price is 1.25C, so 1.25C = 625. Then C = 625 / 1.25 = 500. "
+        "Check: 500 x 1.25 = 625, which matches the selling price "
+        "given.<|/think|><|answer|>500<|/answer|>"
+    )
+    own = (
+        "<|think|>Let P be the price. A 40% discount means 0.6P = 300, so "
+        "P = 300 / 0.6 = 500. Check: 500 x 0.6 = 300, matches.<|/think|>"
+        "<|answer|>500<|/answer|>"
+    )
 
     assert few_shot_echo_score(copied, ex)[0] > 0
     assert few_shot_echo_score(own, ex)[0] == 0, (
@@ -266,10 +293,14 @@ def test_few_shot_echo_penalty_catches_copying_not_idiom():
     assert r_own > r_copy, "copying must never outrank solving"
     # and copying while WRONG must be worse than failing honestly
     wrong_copy, _ = compute_reward(
-        copied.replace("<|answer|>500", "<|answer|>499"), "500",
-        few_shot_exemplar=ex, **kw)
+        copied.replace("<|answer|>500", "<|answer|>499"),
+        "500",
+        few_shot_exemplar=ex,
+        **kw,
+    )
     wrong_honest, _ = compute_reward(
-        own.replace("<|answer|>500", "<|answer|>499"), "500", **kw)
+        own.replace("<|answer|>500", "<|answer|>499"), "500", **kw
+    )
     assert wrong_copy < wrong_honest
 
     # special tags are stripped: they appear in BOTH sides by construction and
@@ -278,18 +309,25 @@ def test_few_shot_echo_penalty_catches_copying_not_idiom():
 
 
 def test_format_tulu_single_vs_multi_turn():
-    from osrt.sft_data import format_tulu, FORMAT_FN
+    from osrt.sft_data import FORMAT_FN, format_tulu
+
     assert "tulu" in FORMAT_FN
-    single = {"messages": [
-        {"role": "user", "content": "What is 2+2?"},
-        {"role": "assistant", "content": "4"},
-    ]}
+    single = {
+        "messages": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+        ]
+    }
     assert format_tulu(single) == ("What is 2+2?", "", "4")
     # multi-turn (>1 user turn) is skipped → empties → SFTStream drops it
-    multi = {"messages": [
-        {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
-        {"role": "user", "content": "c"}, {"role": "assistant", "content": "d"},
-    ]}
+    multi = {
+        "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "assistant", "content": "d"},
+        ]
+    }
     assert format_tulu(multi) == ("", "", "")
     # malformed
     assert format_tulu({"messages": []}) == ("", "", "")
@@ -297,10 +335,13 @@ def test_format_tulu_single_vs_multi_turn():
 
 def test_sft_system_turn_masking():
     """The <|system|> turn joins the MASKED prefix; the response is trained."""
+    import random
+
     from transformers import AutoTokenizer
+
     from osrt.sft_data import IGNORE_INDEX
     from osrt.system_prompts import sample_system_prompt
-    import random
+
     tok = AutoTokenizer.from_pretrained("v6_tokenizer_export")
     _, persona = sample_system_prompt(random.Random(0), "off")
     prompt = f"<|system|>{persona}<|user|>Q?<|assistant|>"
@@ -310,13 +351,14 @@ def test_sft_system_turn_masking():
     labels = [IGNORE_INDEX] * len(pids) + rids
     # system token (id 13) is in the masked prefix
     assert 13 in pids
-    assert all(x == IGNORE_INDEX for x in labels[:len(pids)])
-    assert all(x != IGNORE_INDEX for x in labels[len(pids):])
+    assert all(x == IGNORE_INDEX for x in labels[: len(pids)])
+    assert all(x != IGNORE_INDEX for x in labels[len(pids) :])
 
 
 def test_sftv1_config_values():
-    from osrt.train_config import SFTv1Config
     from osrt.sft_data import FORMAT_FN
+    from osrt.train_config import SFTv1Config
+
     c = SFTv1Config()
     assert c.pretrained_checkpoint.endswith("osrt_v5_midtrain_final.pt")
     assert c.seq_len == 2048
@@ -345,6 +387,7 @@ def test_sftv1_config_values():
 
 def test_sftv2_config_values():
     from osrt.train_config import SFTv2Config
+
     c = SFTv2Config()
     # base = midtrain2 step_1750 (ppl 28.2) — the best INTACT midtrain2
     # artifact; the step-2000 final save was truncated on the volume.
@@ -358,7 +401,7 @@ def test_sftv2_config_values():
     # gentle SFT schedule — NOT midtrain's continued-pretrain 2e-4
     assert c.peak_lr == 1e-5 and c.min_lr == 1e-6
     assert c.total_steps == 1_000 and c.warmup_steps == 100
-    assert c.lr_anchor_step == 0          # fresh cosine over the full run
+    assert c.lr_anchor_step == 0  # fresh cosine over the full run
     # recursive depth kept active during SFT
     assert c.aux_loop_loss_weight == 0.05 and c.loop_dropout_prob == 0.10
     # phase sizing the rollout path reads: seq 4096, eff batch 64
@@ -372,6 +415,7 @@ def test_sftv2_config_values():
 
 def test_midtrain_extend_config_values():
     from osrt.train_config import MidtrainExtendConfig
+
     c = MidtrainExtendConfig()
     # extended continued-pretrain from the clean midtrain base
     assert c.pretrained_checkpoint.endswith("osrt_v5_midtrain_final.pt")
@@ -388,10 +432,17 @@ def test_midtrain_extend_config_values():
     assert ph["seq_len"] == 4096
     assert abs(sum(d["weight"] for d in ph["datasets"]) - 1.0) < 1e-9
     # reasoning/instruction-heavy reweight: math+STEM-SFT+reasoning ≥ 0.70
-    heavy = sum(d["weight"] for d in ph["datasets"] if d["name"] in {
-        "nemotron-cc-math-4plus", "nemotron-stem",
-        "nemotron-math-textbooks", "nemotron-reasoning",
-    })
+    heavy = sum(
+        d["weight"]
+        for d in ph["datasets"]
+        if d["name"]
+        in {
+            "nemotron-cc-math-4plus",
+            "nemotron-stem",
+            "nemotron-math-textbooks",
+            "nemotron-reasoning",
+        }
+    )
     assert heavy >= 0.70
     # NOT a rollout/SFT run — full-sequence streaming pretrain
     assert getattr(c, "rollout_dataset_path", None) is None
@@ -399,6 +450,7 @@ def test_midtrain_extend_config_values():
 
 def test_midtrain_extend_sanity_writes_no_final():
     from osrt.train_config import MidtrainExtendSanityConfig
+
     c = MidtrainExtendSanityConfig()
     assert c.total_steps == 30
     assert c.save_final_checkpoint is False
@@ -409,6 +461,7 @@ def test_midtrain_extend_sanity_writes_no_final():
 
 def test_sftv2_sanity_writes_no_final():
     from osrt.train_config import SFTv2SanityConfig
+
     c = SFTv2SanityConfig()
     assert c.total_steps == 30
     assert c.save_final_checkpoint is False

@@ -14,10 +14,19 @@ from osrt.model import OSRTForCausalLM
 
 def _mtp_config(**over):
     base = dict(
-        dim=128, heads=4, head_dim=32, num_kv_heads=2,
-        vocab_size=256, real_vocab_size=256, num_blocks=2, recursive_loops=3,
-        num_routed_experts=8, top_k_experts=2, expert_hidden=64,
-        shared_expert_hidden=64, max_position_embeddings=64,
+        dim=128,
+        heads=4,
+        head_dim=32,
+        num_kv_heads=2,
+        vocab_size=256,
+        real_vocab_size=256,
+        num_blocks=2,
+        recursive_loops=3,
+        num_routed_experts=8,
+        top_k_experts=2,
+        expert_hidden=64,
+        shared_expert_hidden=64,
+        max_position_embeddings=64,
     )
     base.update(over)
     return OSRTConfig(**base)
@@ -64,8 +73,8 @@ def test_mtp_train_loss_includes_mtp_term():
     assert model.last_mtp_loss is not None
     assert torch.isfinite(model.last_mtp_loss).item()
     assert len(model.last_mtp_losses) == 2
-    for l in model.last_mtp_losses:
-        assert torch.isfinite(l).item()
+    for loss in model.last_mtp_losses:
+        assert torch.isfinite(loss).item()
 
     # The training loss must EXCEED pure task CE by (at least) the mtp term
     # (other aux coeffs default to non-negative too, but the mtp piece alone
@@ -73,7 +82,7 @@ def test_mtp_train_loss_includes_mtp_term():
     assert model.last_task_loss is not None
     assert out.loss.item() > model.last_task_loss.item()
     # weighted mtp sum should equal weight * sum(per-head raw CE).
-    expected = 0.3 * sum(l.item() for l in model.last_mtp_losses)
+    expected = 0.3 * sum(loss.item() for loss in model.last_mtp_losses)
     assert abs(model.last_mtp_loss.item() - expected) < 1e-4
 
 
@@ -114,7 +123,7 @@ def test_mtp_shifted_label_alignment():
 
     ids = torch.randint(0, 256, (2, 16))
     labels = ids.clone()
-    out = model(ids, labels=labels)
+    model(ids, labels=labels)
 
     # Recompute the main LM-head logits from the final hidden state.
     (hidden, *_rest) = model.model(ids)
@@ -122,7 +131,7 @@ def test_mtp_shifted_label_alignment():
 
     for k in range(2):
         offset = k + 2
-        ref_logits = logits[..., :-offset, :model.config.real_vocab_size]
+        ref_logits = logits[..., :-offset, : model.config.real_vocab_size]
         ref_logits = ref_logits.contiguous().float()
         ref_labels = labels[..., offset:].contiguous()
         ref_ce = F.cross_entropy(
@@ -130,9 +139,9 @@ def test_mtp_shifted_label_alignment():
             ref_labels.view(-1),
             ignore_index=-100,
         )
-        assert torch.allclose(
-            model.last_mtp_losses[k], ref_ce, atol=1e-4
-        ), f"head {k} CE must align with offset +{offset} targets"
+        assert torch.allclose(model.last_mtp_losses[k], ref_ce, atol=1e-4), (
+            f"head {k} CE must align with offset +{offset} targets"
+        )
 
 
 def test_mtp_trains_without_nan():
@@ -142,8 +151,12 @@ def test_mtp_trains_without_nan():
     torch.manual_seed(0)
     model = OSRTForCausalLM(
         _mtp_config(
-            dim=64, head_dim=32, heads=2, num_kv_heads=1,
-            mtp_heads=2, mtp_loss_weight=0.3,
+            dim=64,
+            head_dim=32,
+            heads=2,
+            num_kv_heads=1,
+            mtp_heads=2,
+            mtp_loss_weight=0.3,
         )
     )
     model.train()

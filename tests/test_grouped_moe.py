@@ -18,7 +18,7 @@ torch._grouped_mm's BACKWARD is CUDA-only (CPU kernel is broken in 2.10), so
 local gradient tests use the reference primitive; the kernel's own backward is
 covered by a CUDA-gated test + the Modal sanity run.
 """
-import math
+
 import os
 import sys
 
@@ -153,7 +153,9 @@ def test_grouped_dispatch_grad_matches_loop():
 
 
 # ── vendor kernel backward (GPU only) ───────────────────────────────────────
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel backward is CUDA-only")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="kernel backward is CUDA-only"
+)
 def test_grouped_kernel_backward_gpu():
     loop, grouped = _paired_layers(seed=2)
     loop, grouped = loop.cuda(), grouped.cuda()

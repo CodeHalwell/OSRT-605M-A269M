@@ -11,12 +11,11 @@ Usage (Lightning Studio, EC2, or local with a CUDA GPU):
 
     # Required env: WANDB_API_KEY, HF_TOKEN
     python -m osrt.train_main \\
-        --tokenizer-path ./tokenizer \\
-        --ckpt-dir ./checkpoints/v5
+        --tokenizer-path ./v6_tokenizer_export \\
+        --ckpt-dir ./checkpoints/v6
 
-Resumes automatically from the highest `osrt_v5_step_N.pt` /
-`osrt_v5_rescue_step_N.pt` in `--ckpt-dir`. To start fresh, point at
-an empty directory.
+The v7 architecture is intentionally exposed only through `--preset
+v7-sanity`; the paid trunk remains gated by the v7 roadmap.
 
 For a 1200-step Foundation-matched smoke test (~1h on H100, ~1.6h on
 A100 80GB), pass `--total-steps 1200` and a separate ckpt dir to keep
@@ -37,9 +36,11 @@ from osrt.train_config import PretrainConfig
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
+
 
 class _LocalVol:
     """Volume stub that satisfies `run_training`'s `vol.commit()` calls
@@ -56,25 +57,32 @@ class _LocalVol:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pretrain OSRT v5 outside Modal (Lightning, on-prem, etc.)",
+        description="Pretrain or launch-gate OSRT outside Modal",
+    )
+    p.add_argument(
+        "--preset",
+        choices=("v6", "v7-sanity"),
+        default="v6",
+        help="v7 is intentionally exposed only as its launch-gate sanity run.",
     )
     p.add_argument(
         "--tokenizer-path",
-        default=os.environ.get("OSRT_TOKENIZER_PATH", "./tokenizer"),
-        help="Local path to the HF tokenizer directory (default: ./tokenizer "
-             "or $OSRT_TOKENIZER_PATH).",
+        default=os.environ.get(
+            "OSRT_TOKENIZER_PATH",
+            "./v6_tokenizer_export",
+        ),
+        help="Local path to the verified 65K HF tokenizer directory.",
     )
     p.add_argument(
         "--ckpt-dir",
-        default=os.environ.get("OSRT_CKPT_DIR", "./checkpoints/v5"),
+        default=os.environ.get("OSRT_CKPT_DIR"),
         help="Directory for ckpts. Resumed from the highest step file here.",
     )
     p.add_argument(
         "--total-steps",
         type=int,
         default=None,
-        help="Override PretrainConfig.total_steps (default 300000). Useful "
-             "for sanity / partial-budget runs.",
+        help="Override v6 total steps. v7-sanity is fixed at 30 steps.",
     )
     p.add_argument(
         "--wandb-run-name",
@@ -85,7 +93,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--wandb-run-id",
         default=None,
         help="Resume an existing W&B run by id (e.g. when resuming after a "
-             "credit-driven kill so the dashboard stays one continuous run).",
+        "credit-driven kill so the dashboard stays one continuous run).",
     )
     p.add_argument(
         "--no-wandb",
@@ -95,7 +103,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _build_model_config(tokenizer_path: str) -> OSRTConfig:
+def _build_model_config(
+    tokenizer_path: str,
+    *,
+    preset: str = "v6",
+) -> OSRTConfig:
     """Load the tokenizer once to seed vocab/special-token IDs into the
     model config. Mirrors the same construction used by `app.py::pretrain`."""
     from transformers import AutoTokenizer
@@ -103,23 +115,20 @@ def _build_model_config(tokenizer_path: str) -> OSRTConfig:
     if not os.path.isdir(tokenizer_path):
         raise FileNotFoundError(
             f"Tokenizer directory not found at {tokenizer_path}. "
-            f"Either sync it from Modal "
-            f"(`modal volume get osrt-v4-tokenizer / ./tokenizer/`) or "
-            f"retrain via `scripts/train_tokenizer.py`.",
+            "Use the verified v6_tokenizer_export directory or sync the "
+            "osrt-v6-tokenizer Modal volume.",
         )
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}", flush=True)
 
-    expected_vocab = 65536
-    if len(tok) != expected_vocab:
-        print(
-            f"WARNING: expected vocab {expected_vocab} but got {len(tok)}. "
-            f"The model config will follow the tokenizer's actual vocab.",
-            flush=True,
-        )
+    from osrt.tokenizer_contract import validate_tokenizer_contract
 
-    from osrt.presets import build_config
-    return build_config(
+    validate_tokenizer_contract(tok)
+
+    from osrt.presets import build_config, build_v7_config
+
+    builder = build_v7_config if preset == "v7-sanity" else build_config
+    return builder(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -142,9 +151,19 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(2)
     print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
 
-    model_config = _build_model_config(args.tokenizer_path)
+    model_config = _build_model_config(args.tokenizer_path, preset=args.preset)
 
-    train_cfg = PretrainConfig()
+    if args.preset == "v7-sanity":
+        from osrt.train_config import V7SanityConfig
+
+        train_cfg = V7SanityConfig()
+        if args.total_steps is not None and args.total_steps != 30:
+            raise ValueError(
+                "v7-sanity is fixed at 30 steps; close the roadmap launch "
+                "gates before adding a paid v7 trunk configuration"
+            )
+    else:
+        train_cfg = PretrainConfig()
     if args.total_steps is not None:
         train_cfg.total_steps = args.total_steps
     if args.wandb_run_name is not None:
@@ -154,10 +173,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.no_wandb:
         train_cfg.wandb_log = False
 
-    os.makedirs(args.ckpt_dir, exist_ok=True)
+    ckpt_dir = args.ckpt_dir or (
+        "./checkpoints/v7-sanity" if args.preset == "v7-sanity" else "./checkpoints/v6"
+    )
+    os.makedirs(ckpt_dir, exist_ok=True)
     print(
         f"Pretrain (Muon hybrid + aux). Tokenizer={args.tokenizer_path}, "
-        f"ckpt_dir={args.ckpt_dir}, total_steps={train_cfg.total_steps}",
+        f"ckpt_dir={ckpt_dir}, total_steps={train_cfg.total_steps}",
         flush=True,
     )
 
@@ -166,7 +188,7 @@ def main(argv: list[str] | None = None) -> None:
         train_cfg=train_cfg,
         vol=_LocalVol(),
         tokenizer_name=args.tokenizer_path,
-        ckpt_dir=args.ckpt_dir,
+        ckpt_dir=ckpt_dir,
     )
 
 

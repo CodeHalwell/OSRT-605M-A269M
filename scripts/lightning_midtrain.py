@@ -28,6 +28,7 @@ Prereqs on the box:
 4500 anneals LR to min_lr (2e-5) exactly at 4500 (a properly-finished base),
 ~522 steps. Pass 5500 to ride the original full schedule.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -49,12 +50,19 @@ class _LocalVol:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt-dir", default="checkpoints/v5",
-                    help="dir holding osrt_v5_midtrain*_step_*.pt (resume scan)")
+    ap.add_argument(
+        "--ckpt-dir",
+        default="checkpoints/v5",
+        help="dir holding osrt_v5_midtrain*_step_*.pt (resume scan)",
+    )
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
-    ap.add_argument("--total-steps", type=int, default=4500,
-                    help="cosine target; 4500 anneals to min at 4500 from the "
-                         "3978 resume point (~522 steps). 5500 = full schedule.")
+    ap.add_argument(
+        "--total-steps",
+        type=int,
+        default=4500,
+        help="cosine target; 4500 anneals to min at 4500 from the "
+        "3978 resume point (~522 steps). 5500 = full schedule.",
+    )
     args = ap.parse_args()
 
     import torch
@@ -65,21 +73,29 @@ def main() -> int:
     from osrt.train_config import MidtrainConfig
 
     if not torch.cuda.is_available():
-        print("WARNING: CUDA not available — this is meant for a GPU box. "
-              "Aborting to avoid a multi-day CPU run.", flush=True)
+        print(
+            "WARNING: CUDA not available — this is meant for a GPU box. "
+            "Aborting to avoid a multi-day CPU run.",
+            flush=True,
+        )
         return 2
     print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
-    print(f"HF_HUB_OFFLINE={os.environ.get('HF_HUB_OFFLINE', '0')} "
-          f"HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE', '(default)')}",
-          flush=True)
+    print(
+        f"HF_HUB_OFFLINE={os.environ.get('HF_HUB_OFFLINE', '0')} "
+        f"HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE', '(default)')}",
+        flush=True,
+    )
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     print(f"tokenizer: vocab={len(tok)}", flush=True)
 
     model_config = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
 
     cfg = MidtrainConfig()
@@ -88,15 +104,20 @@ def main() -> int:
     # then loads the highest midtrain[_rescue] ckpt in ckpt_dir. Point the
     # existence-check at the rescue ckpt we're resuming from.
     cfg.pretrained_checkpoint = os.path.join(
-        args.ckpt_dir, "osrt_v5_midtrain_rescue_step_3978.pt")
+        args.ckpt_dir, "osrt_v5_midtrain_rescue_step_3978.pt"
+    )
     cfg.wandb_run_name = "osrt-v6-midtrain-lightning"
 
-    print(f"Resuming midtrain → total_steps={cfg.total_steps} "
-          f"(cosine anneals to {cfg.min_lr} at {cfg.total_steps}), "
-          f"ckpt_dir={args.ckpt_dir}", flush=True)
+    print(
+        f"Resuming midtrain → total_steps={cfg.total_steps} "
+        f"(cosine anneals to {cfg.min_lr} at {cfg.total_steps}), "
+        f"ckpt_dir={args.ckpt_dir}",
+        flush=True,
+    )
 
-    run_pretrain_extend(model_config, cfg, _LocalVol(), args.tokenizer,
-                        ckpt_dir=args.ckpt_dir)
+    run_pretrain_extend(
+        model_config, cfg, _LocalVol(), args.tokenizer, ckpt_dir=args.ckpt_dir
+    )
     return 0
 
 

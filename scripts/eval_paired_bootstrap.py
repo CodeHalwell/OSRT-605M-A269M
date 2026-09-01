@@ -21,6 +21,7 @@ Reads the per-checkpoint JSON written by app.py::sft_eval_sweep (which stores
 Usage:
   python scripts/eval_paired_bootstrap.py --items-dir ./items --reps 10000
 """
+
 from __future__ import annotations
 
 import argparse
@@ -48,19 +49,29 @@ def main() -> int:
     ap.add_argument("--items-dir", required=True)
     ap.add_argument("--reps", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--min-step", type=int, default=0,
-                    help="exclude checkpoints below this step. Use 1 to drop "
-                         "the pre-GRPO baseline, which is a LEVEL SHIFT rather "
-                         "than part of the trend and would otherwise turn a "
-                         "flat line into a spurious slope.")
+    ap.add_argument(
+        "--min-step",
+        type=int,
+        default=0,
+        help="exclude checkpoints below this step. Use 1 to drop "
+        "the pre-GRPO baseline, which is a LEVEL SHIFT rather "
+        "than part of the trend and would otherwise turn a "
+        "flat line into a spurious slope.",
+    )
     args = ap.parse_args()
 
     rows = []
     for p in sorted(glob.glob(os.path.join(args.items_dir, "*.json"))):
         d = json.load(open(p))
         step = _step_of(d["ckpt"])
-        rows.append({"step": step, "ckpt": d["ckpt"],
-                     "on": d["items"]["on"], "off": d["items"]["off"]})
+        rows.append(
+            {
+                "step": step,
+                "ckpt": d["ckpt"],
+                "on": d["items"]["on"],
+                "off": d["items"]["off"],
+            }
+        )
     baseline = [r for r in rows if r["step"] < 0]
     rows = [r for r in rows if r["step"] >= args.min_step and r["step"] >= 0]
     rows.sort(key=lambda r: r["step"])
@@ -68,14 +79,19 @@ def main() -> int:
         raise SystemExit(f"need >=3 checkpoints with a step, found {len(rows)}")
 
     n_items = len(rows[0]["on"])
-    assert all(len(r["on"]) == n_items and len(r["off"]) == n_items for r in rows), \
+    assert all(len(r["on"]) == n_items and len(r["off"]) == n_items for r in rows), (
         "checkpoints scored different numbers of items — not a paired panel"
+    )
     steps = [float(r["step"]) for r in rows]
-    print(f"panel: {len(rows)} checkpoints x {n_items} items  "
-          f"(steps {int(min(steps))}-{int(max(steps))})")
+    print(
+        f"panel: {len(rows)} checkpoints x {n_items} items  "
+        f"(steps {int(min(steps))}-{int(max(steps))})"
+    )
     for b in baseline:
-        print(f"  baseline (excluded from slope): {b['ckpt']} "
-              f"acc_on {100*st.mean(b['on']):.1f}%")
+        print(
+            f"  baseline (excluded from slope): {b['ckpt']} "
+            f"acc_on {100 * st.mean(b['on']):.1f}%"
+        )
 
     def series(idx: list[int], key: str) -> list[float]:
         return [100.0 * sum(r[key][i] for i in idx) / len(idx) for r in rows]
@@ -88,8 +104,10 @@ def main() -> int:
 
     print("\nobserved per-checkpoint accuracy")
     for r, a, b in zip(rows, on_s, off_s):
-        print(f"  step {r['step']:>4}  acc_on {a:5.1f}%  acc_off {b:5.1f}%  "
-              f"delta {a-b:+5.1f}pp")
+        print(
+            f"  step {r['step']:>4}  acc_on {a:5.1f}%  acc_off {b:5.1f}%  "
+            f"delta {a - b:+5.1f}pp"
+        )
 
     # ── paired item bootstrap ──────────────────────────────────────────
     rng = random.Random(args.seed)
@@ -101,8 +119,10 @@ def main() -> int:
         boot["off"].append(_slope(steps, f) * 100)
         boot["delta"].append(_slope(steps, [a - b for a, b in zip(o, f)]) * 100)
 
-    print(f"\npaired item bootstrap, {args.reps} reps "
-          f"(resampling QUESTIONS, trajectories preserved)")
+    print(
+        f"\npaired item bootstrap, {args.reps} reps "
+        f"(resampling QUESTIONS, trajectories preserved)"
+    )
     for k in ("on", "off", "delta"):
         v = sorted(boot[k])
         lo, hi = v[int(0.025 * len(v))], v[int(0.975 * len(v))]
@@ -120,8 +140,10 @@ def main() -> int:
         n_ge = sum(1 for x in v if x >= 0)
         pval = min(1.0, 2 * (min(n_le, n_ge) + 1) / (len(v) + 1))
         crosses = "crosses 0" if lo <= 0 <= hi else "EXCLUDES 0"
-        print(f"  {k:<6} slope {point[k]:+6.2f} pp/100 steps   "
-              f"95% CI [{lo:+.2f}, {hi:+.2f}]   p={pval:.3f}   {crosses}")
+        print(
+            f"  {k:<6} slope {point[k]:+6.2f} pp/100 steps   "
+            f"95% CI [{lo:+.2f}, {hi:+.2f}]   p={pval:.3f}   {crosses}"
+        )
 
     # ── paired differences against non-trend artefacts ─────────────────
     # The soup->step-100 discontinuity is a LEVEL SHIFT, not part of the
@@ -131,11 +153,13 @@ def main() -> int:
     # count, rather than being fitted into the regression.
     if baseline and rows:
         last = rows[-1]
-        print("\npaired differences on the same items "
-              f"({args.reps} reps; discordant counts are McNemar's view)")
+        print(
+            "\npaired differences on the same items "
+            f"({args.reps} reps; discordant counts are McNemar's view)"
+        )
         comparisons = [(b, last) for b in baseline]
         for i, b1 in enumerate(baseline):
-            for b2 in baseline[i + 1:]:
+            for b2 in baseline[i + 1 :]:
                 comparisons.append((b1, b2))
         for a, b in comparisons:
             for key in ("on", "off"):
@@ -155,9 +179,11 @@ def main() -> int:
                 pv = min(1.0, 2 * (min(n_le, n_ge) + 1) / (len(reps) + 1))
                 an = a["ckpt"].replace(".pt", "")[:34]
                 bn = b["ckpt"].replace(".pt", "")[:26]
-                print(f"  acc_{key:<3} {an:<34} - {bn:<26} "
-                      f"{d_obs:+6.2f}pp  CI [{lo:+.2f}, {hi:+.2f}]  p={pv:.3f}  "
-                      f"discordant {a_only}/{b_only}")
+                print(
+                    f"  acc_{key:<3} {an:<34} - {bn:<26} "
+                    f"{d_obs:+6.2f}pp  CI [{lo:+.2f}, {hi:+.2f}]  p={pv:.3f}  "
+                    f"discordant {a_only}/{b_only}"
+                )
 
     # ── leave-one-checkpoint-out ───────────────────────────────────────
     print("\nleave-one-checkpoint-out slopes (pp/100 steps)")
@@ -168,8 +194,10 @@ def main() -> int:
         o2 = [on_s[i] for i in keep]
         f2 = [off_s[i] for i in keep]
         d2 = [o2[i] - f2[i] for i in range(len(keep))]
-        print(f"  {rows[j]['step']:>8}  {_slope(s2, o2)*100:+8.2f} "
-              f"{_slope(s2, f2)*100:+8.2f} {_slope(s2, d2)*100:+8.2f}")
+        print(
+            f"  {rows[j]['step']:>8}  {_slope(s2, o2) * 100:+8.2f} "
+            f"{_slope(s2, f2) * 100:+8.2f} {_slope(s2, d2) * 100:+8.2f}"
+        )
     return 0
 
 

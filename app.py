@@ -26,32 +26,34 @@ app = modal.App("osrt")
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "build-essential")
-    .env({
-        "TORCH_LOGS": "perf_hints",
-        "PYTHONUNBUFFERED": "1",
-        # Disable HF tokenizers-rs thread pool before fork. Otherwise
-        # DataLoader(num_workers=2) deadlocks when the child inherits a
-        # locked mutex whose owning thread no longer exists. Confirmed
-        # failure mode: sanity run stuck at "Fetching first batch..."
-        # for 45 min with no output until manually stopped.
-        "TOKENIZERS_PARALLELISM": "false",
-        # CUDA allocator: expandable segments prevent fragmentation OOMs.
-        # The recursive + checkpointed + chunked-CE training churns the
-        # allocator with variable-size tensors (per-step attention scores,
-        # checkpoint recompute, fused-CE chunks); over many steps the default
-        # caching allocator fragments and can fail to find a contiguous block
-        # even with ~15GB free (observed: OOM at step ~27 with only 60/79GB
-        # actually allocated). expandable_segments grows segments in place
-        # instead of fragmenting. PyTorch's own OOM message recommends this.
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        # Persistent HF datasets cache. Volume mounted by SFT/eval/GRPO
-        # functions; pretrain doesn't mount it, but HF datasets handles
-        # a non-existent path gracefully under streaming=True (the
-        # iterable doesn't touch the cache; only metadata downloads do,
-        # and those mkdir the path on demand within the container's
-        # writable layer if no volume is mounted there).
-        "HF_DATASETS_CACHE": "/vol/hf_cache",
-    })
+    .env(
+        {
+            "TORCH_LOGS": "perf_hints",
+            "PYTHONUNBUFFERED": "1",
+            # Disable HF tokenizers-rs thread pool before fork. Otherwise
+            # DataLoader(num_workers=2) deadlocks when the child inherits a
+            # locked mutex whose owning thread no longer exists. Confirmed
+            # failure mode: sanity run stuck at "Fetching first batch..."
+            # for 45 min with no output until manually stopped.
+            "TOKENIZERS_PARALLELISM": "false",
+            # CUDA allocator: expandable segments prevent fragmentation OOMs.
+            # The recursive + checkpointed + chunked-CE training churns the
+            # allocator with variable-size tensors (per-step attention scores,
+            # checkpoint recompute, fused-CE chunks); over many steps the default
+            # caching allocator fragments and can fail to find a contiguous block
+            # even with ~15GB free (observed: OOM at step ~27 with only 60/79GB
+            # actually allocated). expandable_segments grows segments in place
+            # instead of fragmenting. PyTorch's own OOM message recommends this.
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            # Persistent HF datasets cache. Volume mounted by SFT/eval/GRPO
+            # functions; pretrain doesn't mount it, but HF datasets handles
+            # a non-existent path gracefully under streaming=True (the
+            # iterable doesn't touch the cache; only metadata downloads do,
+            # and those mkdir the path on demand within the container's
+            # writable layer if no volume is mounted there).
+            "HF_DATASETS_CACHE": "/vol/hf_cache",
+        }
+    )
     .pip_install(
         "torch==2.10.0+cu128",
         extra_options="--index-url https://download.pytorch.org/whl/cu128",
@@ -92,7 +94,8 @@ image = (
 # Tokenizer volume is shared with v4 (same 32K BPE).
 vol = modal.Volume.from_name("osrt-checkpoints", create_if_missing=True)
 tokenizer_vol = modal.Volume.from_name(
-    "osrt-v4-tokenizer", create_if_missing=True,
+    "osrt-v4-tokenizer",
+    create_if_missing=True,
 )
 # Persistent HF datasets cache. First run downloads dataset shards from
 # the Hub into this volume; subsequent runs read from local volume
@@ -107,7 +110,8 @@ tokenizer_vol = modal.Volume.from_name(
 # functions mount this volume; pretrain skips the mount and HF falls
 # back gracefully under streaming=True.
 hf_cache_vol = modal.Volume.from_name(
-    "osrt-hf-cache", create_if_missing=True,
+    "osrt-hf-cache",
+    create_if_missing=True,
 )
 
 # MOPD rollout volume — holds Gemini teacher-rollout JSONL collected
@@ -115,7 +119,8 @@ hf_cache_vol = modal.Volume.from_name(
 # the mopd stage. Per-workspace; create_if_missing so first launch on a
 # fresh workspace works without manual setup.
 rollouts_vol = modal.Volume.from_name(
-    "osrt-rollouts", create_if_missing=True,
+    "osrt-rollouts",
+    create_if_missing=True,
 )
 
 # v6 tokenizer volume — the 65K / 21-token contract tokenizer. Kept
@@ -123,7 +128,8 @@ rollouts_vol = modal.Volume.from_name(
 # doesn't clobber the archived v4/v5 artifact. Pretrain switches to this
 # once the tokenizer is verified.
 v6_tokenizer_vol = modal.Volume.from_name(
-    "osrt-v6-tokenizer", create_if_missing=True,
+    "osrt-v6-tokenizer",
+    create_if_missing=True,
 )
 
 
@@ -219,7 +225,10 @@ def run_flash_experiment():
       • fits, not faster     → MoE .nonzero() graph break is the ceiling → B4
     Compare vram + steady tok/s against the sink+ckpt compile-check (~68.7GB)."""
     call = pretrain_sanity.spawn(
-        compile_on=True, steps=40, attention_sink=False, grad_ckpt=False,
+        compile_on=True,
+        steps=40,
+        attention_sink=False,
+        grad_ckpt=False,
     )
     print(f"Spawned FLASH experiment — call_id={call.object_id}")
     print("Monitor: modal app logs <app-id>")
@@ -252,7 +261,11 @@ def run_seq8192_check():
     to long context → phase 3 needs attention_sink=False (flash SDPA, which
     never materialises scores). If 8192 fits, seq 4096 (smaller) is safe too."""
     call = pretrain_sanity.spawn(
-        compile_on=False, steps=12, grouped=True, seq_len=8192, batch=2,
+        compile_on=False,
+        steps=12,
+        grouped=True,
+        seq_len=8192,
+        batch=2,
     )
     print(f"Spawned seq-8192 mem-check — call_id={call.object_id}")
     print("Monitor: modal app logs <app-id>")
@@ -265,7 +278,11 @@ def run_seq8192_flash_check():
     materialises scores, so this confirms whether dropping the sink fixes the
     long-context fit. If it does, the preset goes attention_sink=False."""
     call = pretrain_sanity.spawn(
-        compile_on=False, steps=12, grouped=True, seq_len=8192, batch=2,
+        compile_on=False,
+        steps=12,
+        grouped=True,
+        seq_len=8192,
+        batch=2,
         attention_sink=False,
     )
     print(f"Spawned seq-8192 FLASH mem-check — call_id={call.object_id}")
@@ -297,11 +314,31 @@ def smoke_new_datasets():
     candidates = [
         ("nvidia/Nemotron-CC-Math-v1", "4plus", "text"),
         ("nvidia/Nemotron-CC-Math-v1", "4plus_MIND", "text"),
-        ("nvidia/Nemotron-Pretraining-Code-v2", "Synthetic-Question-Answering", "content"),
-        ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-STEM-SFT", "text"),
-        ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-Math-Textbooks", "text"),
-        ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-InfiniByte-Reasoning", "text"),
-        ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-RQA", "text"),
+        (
+            "nvidia/Nemotron-Pretraining-Code-v2",
+            "Synthetic-Question-Answering",
+            "content",
+        ),
+        (
+            "nvidia/Nemotron-Pretraining-Specialized-v1",
+            "Nemotron-Pretraining-STEM-SFT",
+            "text",
+        ),
+        (
+            "nvidia/Nemotron-Pretraining-Specialized-v1",
+            "Nemotron-Pretraining-Math-Textbooks",
+            "text",
+        ),
+        (
+            "nvidia/Nemotron-Pretraining-Specialized-v1",
+            "Nemotron-Pretraining-InfiniByte-Reasoning",
+            "text",
+        ),
+        (
+            "nvidia/Nemotron-Pretraining-Specialized-v1",
+            "Nemotron-Pretraining-RQA",
+            "text",
+        ),
         ("HuggingFaceTB/cosmopedia", "web_samples_v2", "text"),
         ("HuggingFaceTB/cosmopedia", "openstax", "text"),
     ]
@@ -387,7 +424,6 @@ def pretrain():
     import modal as _modal
     from transformers import AutoTokenizer
 
-    from osrt.config import OSRTConfig
     from osrt.train import run_training
     from osrt.train_config import PretrainConfig
 
@@ -401,16 +437,16 @@ def pretrain():
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
-    expected_vocab = 65536
-    if len(tok) != expected_vocab:
-        print(f"WARNING: Expected {expected_vocab} vocab but got {len(tok)}!")
-        print("  Retrain tokenizer: modal run app_v4.py --stage tokenizer")
+    from osrt.tokenizer_contract import validate_tokenizer_contract
+
+    validate_tokenizer_contract(tok)
 
     # Build from the canonical OSRT-605M-A279M preset (GQA, attention sink,
     # MTP, sqrt-softplus routing, the 4032/2816 expert widths, etc.) and only
     # override the tokenizer-specific fields. A bare OSRTConfig() here would
     # silently fall back to the old v5 363M shape for the expensive run.
     from osrt.presets import build_config
+
     model_config = build_config(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
@@ -501,6 +537,7 @@ def pretrain_sanity(
     # had to shrink to batch 1 / seq 1024 to dodge the OOM — if this survives
     # 30 steps at full batch/seq, blocker #2 is cleared.
     from osrt.presets import build_config
+
     model_config = build_config(
         vocab_size=len(tok),
         real_vocab_size=len(tok),
@@ -525,8 +562,8 @@ def pretrain_sanity(
         total_steps = steps
         warmup_steps = 5
         grad_accum_steps = 2  # fewer micro-batches → quicker steps; peak mem
-                              # is per-micro-batch so this doesn't change the
-                              # memory test (still batch_size=8 at seq 2048)
+        # is per-micro-batch so this doesn't change the
+        # memory test (still batch_size=8 at seq 2048)
         log_interval = 2
         ckpt_interval = 999_999
         eval_interval = 999_999
@@ -565,11 +602,69 @@ def pretrain_sanity(
         f"({'flash SDPA' if not attention_sink else 'manual (B,H,S,S) sink'}) | "
         f"gradient_checkpointing={grad_ckpt} | "
         f"moe={'grouped-GEMM (fullgraph)' if grouped else 'loop dispatch'}. "
-        + ("Confirming compile works + measuring tok/s speedup vs eager (~4.5k)."
-           if compile_on else
-           "Verifying the real footprint fits an 80GB H100 and trains.")
+        + (
+            "Confirming compile works + measuring tok/s speedup vs eager (~4.5k)."
+            if compile_on
+            else "Verifying the real footprint fits an 80GB H100 and trains."
+        )
     )
     run_training(model_config, sanity_cfg, vol, tokenizer_name)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=7200,
+)
+def v7_sanity():
+    """Run the only currently authorised v7 stage: its 30-step launch gate."""
+    import os
+
+    import modal as _modal
+    from transformers import AutoTokenizer
+
+    from osrt.presets import build_v7_config
+    from osrt.tokenizer_contract import validate_tokenizer_contract
+    from osrt.train import run_training
+    from osrt.train_config import V7SanityConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v6-tokenizer")
+    _tok_vol.reload()
+
+    tokenizer_path = "/vol/tokenizer"
+    print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    validate_tokenizer_contract(tok)
+
+    model_config = build_v7_config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
+    )
+    train_cfg = V7SanityConfig()
+    print(
+        "v7 launch gate: 30 steps, 28 routed experts/top-4, quantile "
+        "balancing, SiTU-GLU, WSD, and V4 per-head Muon."
+    )
+    run_training(
+        model_config,
+        train_cfg,
+        vol,
+        tokenizer_path,
+        ckpt_dir="/vol/checkpoints/v7-sanity",
+    )
 
 
 # =============================================================================
@@ -705,6 +800,7 @@ def midtrain():
     """v6 mid-training: continued pretraining from the foundation base,
     seq 4096, math-heavy mix, ~9k steps. See MidtrainConfig."""
     from osrt.train_config import MidtrainConfig
+
     _run_midtrain(MidtrainConfig)
 
 
@@ -726,6 +822,7 @@ def midtrain_sanity():
     """30-step VRAM/throughput probe at real seq 4096 / batch 6 before
     the $150 launch. See MidtrainSanityConfig."""
     from osrt.train_config import MidtrainSanityConfig
+
     _run_midtrain(MidtrainSanityConfig)
 
 
@@ -826,6 +923,7 @@ def sft_v2():
     """v6 SFT v2: reasoning distillation from midtrain_final, seq 4096,
     ~1500 steps on the persona-tagged teacher CoT. See SFTv2Config."""
     from osrt.train_config import SFTv2Config
+
     _run_sft_v2(SFTv2Config)
 
 
@@ -848,6 +946,7 @@ def sft_v2_sanity():
     """30-step SFT-v2 probe: rollout loader builds the v6 seq, native-HRA
     loads clean from midtrain_final, VRAM fits at seq 4096. See SFTv2SanityConfig."""
     from osrt.train_config import SFTv2SanityConfig
+
     _run_sft_v2(SFTv2SanityConfig)
 
 
@@ -889,20 +988,23 @@ def sft_v3_prep():
     from huggingface_hub import hf_hub_download
 
     pulls = [
-        ("osrt_v5_midtrain3_final.pt",
-         "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt", vol),
+        (
+            "osrt_v5_midtrain3_final.pt",
+            "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt",
+            vol,
+        ),
         ("data/sft_v3.jsonl", "/vol/rollouts/sft_v3.jsonl", rollouts_vol),
     ]
     for hf_name, dest, volume in pulls:
         if os.path.exists(dest):
-            print(f"already present: {dest} ({os.path.getsize(dest)/2**20:.0f} MB)")
+            print(f"already present: {dest} ({os.path.getsize(dest) / 2**20:.0f} MB)")
             continue
         print(f"pulling {hf_name} from HallD/osrt-v6-ckpt...", flush=True)
         src = hf_hub_download("HallD/osrt-v6-ckpt", hf_name, repo_type="model")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copy2(src, dest)
         volume.commit()
-        print(f"  -> {dest} ({os.path.getsize(dest)/2**20:.0f} MB)")
+        print(f"  -> {dest} ({os.path.getsize(dest) / 2**20:.0f} MB)")
     print("sft_v3 prep complete.")
 
 
@@ -930,8 +1032,10 @@ def push_ckpt(ckpt_name: str, hf_repo: str = "HallD/osrt-v6-ckpt"):
     api = HfApi()
     api.create_repo(hf_repo, repo_type="model", private=True, exist_ok=True)
     api.upload_file(
-        path_or_fileobj=src, path_in_repo=ckpt_name,
-        repo_id=hf_repo, repo_type="model",
+        path_or_fileobj=src,
+        path_in_repo=ckpt_name,
+        repo_id=hf_repo,
+        repo_type="model",
         commit_message=f"add {ckpt_name}",
     )
     print(f"done: {hf_repo}/{ckpt_name}", flush=True)
@@ -962,6 +1066,7 @@ def sft_v3():
     """v6 SFT v3: distillation on midtrain3_final, seq 4096, 800 steps on the
     42K verified+Nemotron+smoltalk2 corpus. See SFTv3Config."""
     from osrt.train_config import SFTv3Config
+
     _run_sft_v2(SFTv3Config)
 
 
@@ -984,6 +1089,7 @@ def sft_v3_sanity():
     """30-step SFT-v3 probe: corpus parses, midtrain3_final loads clean,
     VRAM fits at seq 4096 — run on every fresh workspace before the paid run."""
     from osrt.train_config import SFTv3SanityConfig
+
     _run_sft_v2(SFTv3SanityConfig)
 
 
@@ -1021,16 +1127,17 @@ def sft_v4_prep():
     from huggingface_hub import hf_hub_download
 
     pulls = [
-        ("osrt_v5_midtrain3_final.pt",
-         "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt", vol),
+        (
+            "osrt_v5_midtrain3_final.pt",
+            "/vol/checkpoints/v5/osrt_v5_midtrain3_final.pt",
+            vol,
+        ),
         ("data/sft_v4.jsonl", "/vol/rollouts/sft_v4.jsonl", rollouts_vol),
-        ("data/sft_v4_val.jsonl", "/vol/rollouts/sft_v4_val.jsonl",
-         rollouts_vol),
+        ("data/sft_v4_val.jsonl", "/vol/rollouts/sft_v4_val.jsonl", rollouts_vol),
     ]
     for hf_name, dest, volume in pulls:
         if os.path.exists(dest):
-            print(f"already present: {dest} "
-                  f"({os.path.getsize(dest) / 2**20:.0f} MB)")
+            print(f"already present: {dest} ({os.path.getsize(dest) / 2**20:.0f} MB)")
             continue
         print(f"pulling {hf_name} from HallD/osrt-v6-ckpt...", flush=True)
         src = hf_hub_download("HallD/osrt-v6-ckpt", hf_name, repo_type="model")
@@ -1060,6 +1167,7 @@ def sft_v4():
     """v6 SFT v4: 1,200 steps (~1.7 epochs) on the length-matched corpus,
     held-out SFT loss logged every 100 steps. See SFTv4Config."""
     from osrt.train_config import SFTv4Config
+
     _run_sft_v2(SFTv4Config)
 
 
@@ -1082,6 +1190,7 @@ def sft_v4_sanity():
     """30-step SFT-v4 probe: corpus + val split parse, base loads clean,
     held-out eval path works, VRAM fits at seq 4096."""
     from osrt.train_config import SFTv4SanityConfig
+
     _run_sft_v2(SFTv4SanityConfig)
 
 
@@ -1103,6 +1212,7 @@ def sft_v4_sanity():
 def sft_v4_sanity_b16():
     """Paired batch-16 probe vs the batch-8 sanity: VRAM headroom + tok/s."""
     from osrt.train_config import SFTv4Batch16SanityConfig
+
     _run_sft_v2(SFTv4Batch16SanityConfig)
 
 
@@ -1161,25 +1271,32 @@ def sft_eval_sweep(
         # settings as the sweep so numbers stay comparable.
         names = [s.strip() for s in names_csv.split(",") if s.strip()]
     elif steps:
-        names = [f"{prefix}_step_{s.strip()}.pt" for s in steps.split(",")
-                 if s.strip()]
+        names = [f"{prefix}_step_{s.strip()}.pt" for s in steps.split(",") if s.strip()]
     else:
-        found = [f for f in os.listdir(d)
-                 if re.fullmatch(rf"{re.escape(prefix)}_step_\d+\.pt", f)]
+        found = [
+            f
+            for f in os.listdir(d)
+            if re.fullmatch(rf"{re.escape(prefix)}_step_\d+\.pt", f)
+        ]
         names = sorted(found, key=lambda f: int(re.search(r"_step_(\d+)", f).group(1)))
     if not names_csv and os.path.exists(f"{d}/{prefix}_final.pt"):
         names.append(f"{prefix}_final.pt")
     names = [f for f in names if os.path.exists(f"{d}/{f}")]
     if not names:
         raise FileNotFoundError(f"no checkpoints matching {prefix} in {d}")
-    print(f"sweeping {len(names)} checkpoints x {n} problems:\n  "
-          + "\n  ".join(names), flush=True)
+    print(
+        f"sweeping {len(names)} checkpoints x {n} problems:\n  " + "\n  ".join(names),
+        flush=True,
+    )
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device)
@@ -1212,14 +1329,19 @@ def sft_eval_sweep(
         model.eval()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             m = run_reasoning_eval(
-                model, tok, device, n_problems=n,
-                max_new_tokens=max_new_tokens, batch_size=32,
-                repetition_penalty=1.2,   # the locked decode hygiene
+                model,
+                tok,
+                device,
+                n_problems=n,
+                max_new_tokens=max_new_tokens,
+                batch_size=32,
+                repetition_penalty=1.2,  # the locked decode hygiene
                 # Empty = the historical default personas (instruction_strict /
                 # instruction_direct). Pass the persona a stage TRAINED on when
                 # scoring that stage, or the number measures cross-persona
                 # generalisation instead of the trained objective.
-                on_persona=on_persona, off_persona=off_persona,
+                on_persona=on_persona,
+                off_persona=off_persona,
                 return_items=True,
             )
         # Persist PER-ITEM outcomes. Checkpoint means over the same 200
@@ -1231,28 +1353,39 @@ def sft_eval_sweep(
         os.makedirs(item_dir, exist_ok=True)
         tag = f"{name.replace('.pt', '')}__n{n}__on-{m['sft_eval/persona_on']}"
         with open(f"{item_dir}/{tag}.json", "w") as fh:
-            json.dump({"ckpt": name, "n": n,
-                       "persona_on": m["sft_eval/persona_on"],
-                       "persona_off": m["sft_eval/persona_off"],
-                       "acc_on": m["sft_eval/acc_on"],
-                       "acc_off": m["sft_eval/acc_off"],
-                       "items": m.pop("items")}, fh)
+            json.dump(
+                {
+                    "ckpt": name,
+                    "n": n,
+                    "persona_on": m["sft_eval/persona_on"],
+                    "persona_off": m["sft_eval/persona_off"],
+                    "acc_on": m["sft_eval/acc_on"],
+                    "acc_off": m["sft_eval/acc_off"],
+                    "items": m.pop("items"),
+                },
+                fh,
+            )
         vol.commit()
         step = int(re.search(r"_step_(\d+)", name).group(1)) if "_step_" in name else -1
         m["ckpt"] = name
         m["step"] = step
         rows.append(m)
-        print(f"  {name:<42} acc_on {100*m['sft_eval/acc_on']:5.1f}%  "
-              f"acc_off {100*m['sft_eval/acc_off']:5.1f}%  "
-              f"delta {100*m['sft_eval/acc_delta_on_minus_off']:+5.1f}pp  "
-              f"fmt_on {100*m['sft_eval/format_ok_on']:5.1f}%  "
-              f"len_on {m['sft_eval/resp_len_on']:.0f}", flush=True)
+        print(
+            f"  {name:<42} acc_on {100 * m['sft_eval/acc_on']:5.1f}%  "
+            f"acc_off {100 * m['sft_eval/acc_off']:5.1f}%  "
+            f"delta {100 * m['sft_eval/acc_delta_on_minus_off']:+5.1f}pp  "
+            f"fmt_on {100 * m['sft_eval/format_ok_on']:5.1f}%  "
+            f"len_on {m['sft_eval/resp_len_on']:.0f}",
+            flush=True,
+        )
 
     best = max(rows, key=lambda r: r["sft_eval/acc_on"])
-    print(f"\n{'='*78}\nBEST BY acc_on: {best['ckpt']} at "
-          f"{100*best['sft_eval/acc_on']:.1f}% "
-          f"(off {100*best['sft_eval/acc_off']:.1f}%, "
-          f"delta {100*best['sft_eval/acc_delta_on_minus_off']:+.1f}pp)")
+    print(
+        f"\n{'=' * 78}\nBEST BY acc_on: {best['ckpt']} at "
+        f"{100 * best['sft_eval/acc_on']:.1f}% "
+        f"(off {100 * best['sft_eval/acc_off']:.1f}%, "
+        f"delta {100 * best['sft_eval/acc_delta_on_minus_off']:+.1f}pp)"
+    )
     print("GATE: >=~15% acc_on -> GRPO has signal. <10% -> stop and rethink.")
     return rows
 
@@ -1276,9 +1409,11 @@ def pull_artifacts(names_csv: str, hf_repo: str = "HallD/osrt-v6-ckpt") -> None:
         name = raw.strip()
         if not name:
             continue
-        dest = (f"/vol/rollouts/{os.path.basename(name)}"
-                if name.startswith("data/")
-                else f"/vol/checkpoints/v5/{name}")
+        dest = (
+            f"/vol/rollouts/{os.path.basename(name)}"
+            if name.startswith("data/")
+            else f"/vol/checkpoints/v5/{name}"
+        )
         volume = rollouts_vol if name.startswith("data/") else vol
         if os.path.exists(dest):
             print(f"already present: {dest}", flush=True)
@@ -1349,10 +1484,11 @@ def grpo_diag_batch(
         from datasets import load_dataset
 
         from osrt.rewards import extract_numeric_answer
-        print("building prompt file (orca-math, skip 60k, target 6k)...",
-              flush=True)
-        ds = load_dataset("microsoft/orca-math-word-problems-200k",
-                          split="train", streaming=True).skip(60_000)
+
+        print("building prompt file (orca-math, skip 60k, target 6k)...", flush=True)
+        ds = load_dataset(
+            "microsoft/orca-math-word-problems-200k", split="train", streaming=True
+        ).skip(60_000)
         kept = []
         for row in ds:
             if len(kept) >= 6000:
@@ -1368,29 +1504,39 @@ def grpo_diag_batch(
         print(f"wrote {len(kept)} prompts", flush=True)
 
     prompts_all = [json.loads(line) for line in open(prompts_path)]
-    bad = [i for i, p in enumerate(prompts_all)
-           if not str(p.get("answer", "")).strip()
-           or not str(p.get("question", "")).strip()]
+    bad = [
+        i
+        for i, p in enumerate(prompts_all)
+        if not str(p.get("answer", "")).strip()
+        or not str(p.get("question", "")).strip()
+    ]
     if bad:
-        raise ValueError(f"{len(bad)}/{len(prompts_all)} prompts have empty "
-                         f"question or gold (lines {[i + 1 for i in bad[:5]]})")
+        raise ValueError(
+            f"{len(bad)}/{len(prompts_all)} prompts have empty "
+            f"question or gold (lines {[i + 1 for i in bad[:5]]})"
+        )
     print(f"{len(prompts_all)} prompts, gold validated", flush=True)
 
     from transformers import AutoTokenizer
+
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
-    mc = build_config(vocab_size=len(tok), real_vocab_size=len(tok),
-                      bos_token_id=tok.bos_token_id,
-                      eos_token_id=tok.eos_token_id,
-                      pad_token_id=tok.pad_token_id,
-                      fused_cross_entropy_chunks=8)
+    mc = build_config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
+    )
     device = torch.device("cuda")
 
     from osrt.model import OSRTForCausalLM
+
     model = OSRTForCausalLM(mc).to(device)
-    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
-                    weights_only=True)
-    miss, unexp = model.load_state_dict(ck.get("model_state_dict", ck),
-                                        strict=False)
+    ck = torch.load(
+        f"/vol/checkpoints/v5/{ckpt_name}", map_location=device, weights_only=True
+    )
+    miss, unexp = model.load_state_dict(ck.get("model_state_dict", ck), strict=False)
     assert not miss and not unexp, f"{ckpt_name}: {miss[:3]} {unexp[:3]}"
     del ck
     model.eval()
@@ -1400,29 +1546,43 @@ def grpo_diag_batch(
     rng = random.Random(seed)
     picks = rng.sample(prompts_all, min(num_prompts, len(prompts_all)))
     sys_text = get_by_name(cfg.system_persona) if cfg.system_persona else ""
-    batch = [(f"{cfg.system_tag}{sys_text}{cfg.user_tag}{p['question']}"
-              f"{cfg.assistant_tag}" if sys_text else
-              f"{cfg.user_tag}{p['question']}{cfg.assistant_tag}",
-              str(p["answer"])) for p in picks]
+    batch = [
+        (
+            f"{cfg.system_tag}{sys_text}{cfg.user_tag}{p['question']}"
+            f"{cfg.assistant_tag}"
+            if sys_text
+            else f"{cfg.user_tag}{p['question']}{cfg.assistant_tag}",
+            str(p["answer"]),
+        )
+        for p in picks
+    ]
     end_ans = tok.encode(cfg.answer_close, add_special_tokens=False)[0]
 
-    torch.manual_seed(seed)          # reproducible sampling
+    torch.manual_seed(seed)  # reproducible sampling
     groups = generate_rollouts(model, tok, batch, cfg, device, [end_ans])
 
     out = out_name or f"diag_{ckpt_name.replace('.pt', '')}_seed{seed}.jsonl"
     path = f"/vol/rollouts/{out}"
     if os.path.exists(path):
         os.remove(path)
-    n = dump_rollouts(path, groups, ckpt=ckpt_name, step=-1, seed=seed,
-                      temperature=cfg.temperature,
-                      top_p=getattr(cfg, "top_p", 1.0))
+    n = dump_rollouts(
+        path,
+        groups,
+        ckpt=ckpt_name,
+        step=-1,
+        seed=seed,
+        temperature=cfg.temperature,
+        top_p=getattr(cfg, "top_p", 1.0),
+    )
     rollouts_vol.commit()
     n_ok = sum(1 for g in groups for r in g if r.correct)
     live = sum(1 for g in groups for r in g if abs(r.advantage) > 1e-8)
     print(f"dumped {n} rollouts -> {path}", flush=True)
-    print(f"  correct {n_ok}/{n} ({n_ok / n:.1%})   live {live}/{n} "
-          f"({live / n:.1%})   T={cfg.temperature} top_p={getattr(cfg, 'top_p', 1.0)}",
-          flush=True)
+    print(
+        f"  correct {n_ok}/{n} ({n_ok / n:.1%})   live {live}/{n} "
+        f"({live / n:.1%})   T={cfg.temperature} top_p={getattr(cfg, 'top_p', 1.0)}",
+        flush=True,
+    )
     return path
 
 
@@ -1436,10 +1596,15 @@ def grpo_diag_batch(
     },
     timeout=5400,
 )
-def grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8,
-                   temperature: float = 0.0, kl_coeff: float = -1.0,
-                   alt_temperature: float = 0.0,
-                   alt_kl_coeff: float = -1.0) -> int:
+def grpo_grad_diag(
+    ckpt_name: str,
+    dump_name: str,
+    micro_batch: int = 8,
+    temperature: float = 0.0,
+    kl_coeff: float = -1.0,
+    alt_temperature: float = 0.0,
+    alt_kl_coeff: float = -1.0,
+) -> int:
     """Run scripts/grpo_grad_diag.py on a cached batch. No optimizer step.
 
     temperature/kl_coeff override the SCORING config, so the same cached batch
@@ -1449,19 +1614,31 @@ def grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8,
     configuration that was never trained.
     """
     import subprocess
-    return subprocess.call([
-        "python", "/root/scripts/grpo_grad_diag.py",
-        "--ckpt", f"/vol/checkpoints/v5/{ckpt_name}",
-        "--dump", f"/vol/rollouts/{dump_name}",
-        "--tokenizer", "/vol/tokenizer",
-        "--base-ckpt",
-        "/vol/checkpoints/v5/osrt_v5_sft_v4_soup_1200_1400_1600_1800.pt",
-        "--micro-batch", str(micro_batch),
-        "--temperature", str(temperature),
-        "--kl-coeff", str(kl_coeff),
-        "--alt-temperature", str(alt_temperature),
-        "--alt-kl-coeff", str(alt_kl_coeff),
-    ])
+
+    return subprocess.call(
+        [
+            "python",
+            "/root/scripts/grpo_grad_diag.py",
+            "--ckpt",
+            f"/vol/checkpoints/v5/{ckpt_name}",
+            "--dump",
+            f"/vol/rollouts/{dump_name}",
+            "--tokenizer",
+            "/vol/tokenizer",
+            "--base-ckpt",
+            "/vol/checkpoints/v5/osrt_v5_sft_v4_soup_1200_1400_1600_1800.pt",
+            "--micro-batch",
+            str(micro_batch),
+            "--temperature",
+            str(temperature),
+            "--kl-coeff",
+            str(kl_coeff),
+            "--alt-temperature",
+            str(alt_temperature),
+            "--alt-kl-coeff",
+            str(alt_kl_coeff),
+        ]
+    )
 
 
 @app.function(
@@ -1502,14 +1679,19 @@ def debias_ema(ema_name: str, base_name: str, out_name: str = "") -> str:
     updates = int(eck.get("ema_updates", 0))
     if not updates:
         raise ValueError(f"{ema_name} records no ema_updates; cannot debias")
-    w0 = decay ** updates
+    w0 = decay**updates
     if w0 >= 0.999:
-        raise ValueError(f"residual base weight {w0:.4f} leaves nothing to "
-                         f"debias ({updates} updates at decay {decay})")
+        raise ValueError(
+            f"residual base weight {w0:.4f} leaves nothing to "
+            f"debias ({updates} updates at decay {decay})"
+        )
     es = eck.get("model_state_dict", eck)
     bs = bck.get("model_state_dict", bck)
-    print(f"decay {decay}  updates {updates}  residual base weight "
-          f"{w0:.4f}  divisor {1 - w0:.4f}", flush=True)
+    print(
+        f"decay {decay}  updates {updates}  residual base weight "
+        f"{w0:.4f}  divisor {1 - w0:.4f}",
+        flush=True,
+    )
 
     out = {}
     for k, v in es.items():
@@ -1517,13 +1699,20 @@ def debias_ema(ema_name: str, base_name: str, out_name: str = "") -> str:
             out[k] = v.clone()
             continue
         # (e - w0*theta_0) / (1 - w0), in fp32 then cast back
-        out[k] = (((v.float() - w0 * bs[k].float()) / (1.0 - w0))
-                  .to(v.dtype))
+        out[k] = ((v.float() - w0 * bs[k].float()) / (1.0 - w0)).to(v.dtype)
     name = out_name or ema_name.replace(".pt", "_debiased.pt")
-    torch.save({"step": eck.get("step"), "model_state_dict": out,
-                "ema_decay": decay, "ema_updates": updates,
-                "debiased_from": ema_name, "debias_base": base_name,
-                "residual_base_weight_removed": w0}, f"{d}/{name}")
+    torch.save(
+        {
+            "step": eck.get("step"),
+            "model_state_dict": out,
+            "ema_decay": decay,
+            "ema_updates": updates,
+            "debiased_from": ema_name,
+            "debias_base": base_name,
+            "residual_base_weight_removed": w0,
+        },
+        f"{d}/{name}",
+    )
     vol.commit()
     print(f"wrote {name}", flush=True)
     return name
@@ -1573,19 +1762,25 @@ def ckpt_drift(a: str, b: str) -> dict:
         fa, fb = va.float(), vb.float()
         dn = torch.linalg.vector_norm(fb - fa).item()
         an = torch.linalg.vector_norm(fa).item()
-        tot_d += dn ** 2
-        tot_a += an ** 2
+        tot_d += dn**2
+        tot_a += an**2
         if an > 0:
             groups.setdefault(bucket(k), []).append(dn / an)
             biggest.append((dn / an, k))
 
     print(f"drift {a} -> {b}", flush=True)
-    print(f"  OVERALL relative L2: {tot_d**0.5 / tot_a**0.5:.6f}"
-          f"  ({100 * tot_d**0.5 / tot_a**0.5:.4f}% of weight norm)", flush=True)
+    print(
+        f"  OVERALL relative L2: {tot_d**0.5 / tot_a**0.5:.6f}"
+        f"  ({100 * tot_d**0.5 / tot_a**0.5:.4f}% of weight norm)",
+        flush=True,
+    )
     for g, vals in sorted(groups.items()):
         vals.sort()
-        print(f"  {g:<16} n={len(vals):>4}  median {vals[len(vals)//2]:.6f}"
-              f"  max {vals[-1]:.6f}", flush=True)
+        print(
+            f"  {g:<16} n={len(vals):>4}  median {vals[len(vals) // 2]:.6f}"
+            f"  max {vals[-1]:.6f}",
+            flush=True,
+        )
     biggest.sort(reverse=True)
     print("  most-moved tensors:", flush=True)
     for r, k in biggest[:5]:
@@ -1630,7 +1825,9 @@ def make_soup(
     missing = [n for n in names if not os.path.exists(f"{d}/{n}")]
     if missing:
         raise FileNotFoundError(f"missing: {missing}")
-    out_name = out_name or f"{prefix}_soup_{'_'.join(s.strip() for s in steps.split(','))}.pt"
+    out_name = (
+        out_name or f"{prefix}_soup_{'_'.join(s.strip() for s in steps.split(','))}.pt"
+    )
 
     acc: dict = {}
     n_ck = len(names)
@@ -1659,8 +1856,11 @@ def make_soup(
     dest = f"{d}/{out_name}"
     torch.save({"model_state_dict": acc}, dest)
     vol.commit()
-    print(f"soup of {n_ck} checkpoints -> {dest} "
-          f"({os.path.getsize(dest) / 2**20:.0f} MB)", flush=True)
+    print(
+        f"soup of {n_ck} checkpoints -> {dest} "
+        f"({os.path.getsize(dest) / 2**20:.0f} MB)",
+        flush=True,
+    )
     return out_name
 
 
@@ -1675,8 +1875,9 @@ def make_soup(
     secrets=[modal.Secret.from_name("hf-secret")],
     timeout=7200,
 )
-def strict_extraction_probe(ckpt_name: str, n: int = 200,
-                            max_new_tokens: int = 512) -> dict:
+def strict_extraction_probe(
+    ckpt_name: str, n: int = 200, max_new_tokens: int = 512
+) -> dict:
     """Score ON-mode completions with BOTH extractors on the same generations.
 
     Why this matters before GRPO: every accuracy number we have used the LOOSE
@@ -1710,14 +1911,18 @@ def strict_extraction_probe(ckpt_name: str, n: int = 200,
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device)
-    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
-                    weights_only=True)
+    ck = torch.load(
+        f"/vol/checkpoints/v5/{ckpt_name}", map_location=device, weights_only=True
+    )
     sd = ck.get("model_state_dict", ck)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not missing and not unexpected, f"{missing[:3]} {unexpected[:3]}"
@@ -1725,19 +1930,24 @@ def strict_extraction_probe(ckpt_name: str, n: int = 200,
     model.optimize_for_inference(compile_model=True)
 
     import random
+
     _, on_sys = sample_system_prompt(random.Random(0), "on")
     problems = _load_gsm8k_heldout(n)
-    prompts = [f"<|system|>{on_sys}<|user|>{q}<|assistant|>"
-               for q, _ in problems]
+    prompts = [f"<|system|>{on_sys}<|user|>{q}<|assistant|>" for q, _ in problems]
 
     completions: list[str] = []
     B = 32
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         for i in range(0, len(prompts), B):
-            completions += _gen_batch(model, tok, prompts[i:i + B], device,
-                                      max_new_tokens, repetition_penalty=1.2)
-            print(f"  generated {min(i + B, len(prompts))}/{len(prompts)}",
-                  flush=True)
+            completions += _gen_batch(
+                model,
+                tok,
+                prompts[i : i + B],
+                device,
+                max_new_tokens,
+                repetition_penalty=1.2,
+            )
+            print(f"  generated {min(i + B, len(prompts))}/{len(prompts)}", flush=True)
 
     loose_ok = strict_ok = 0
     labels: collections.Counter = collections.Counter()
@@ -1750,8 +1960,10 @@ def strict_extraction_probe(ckpt_name: str, n: int = 200,
             strict_ok += 1
 
     res = {
-        "ckpt": ckpt_name, "n": n,
-        "loose_acc": loose_ok / n, "strict_acc": strict_ok / n,
+        "ckpt": ckpt_name,
+        "n": n,
+        "loose_acc": loose_ok / n,
+        "strict_acc": strict_ok / n,
         "confidence": dict(labels),
     }
     print(f"\n{'=' * 72}\n{ckpt_name}  n={n}")
@@ -1761,8 +1973,10 @@ def strict_extraction_probe(ckpt_name: str, n: int = 200,
     for k, v in labels.most_common():
         print(f"    {k:<18}{v:>5}  ({100 * v / n:.1f}%)")
     amb = labels.get("ambiguous", 0)
-    print(f"\n  ambiguity rate {100 * amb / n:.1f}% -> those rollouts earn the "
-          f"-0.5 penalty instead of credit")
+    print(
+        f"\n  ambiguity rate {100 * amb / n:.1f}% -> those rollouts earn the "
+        f"-0.5 penalty instead of credit"
+    )
     return res
 
 
@@ -1810,7 +2024,6 @@ def grpo_signal_probe(
     _use_inductor_cache()
 
     import collections
-    import re
 
     import torch
     from datasets import load_dataset
@@ -1818,19 +2031,27 @@ def grpo_signal_probe(
 
     from osrt.model import OSRTForCausalLM
     from osrt.presets import build_config
-    from osrt.rewards import extract_numeric_answer, extract_numeric_answer_strict, numeric_match
+    from osrt.rewards import (
+        extract_numeric_answer,
+        extract_numeric_answer_strict,
+        numeric_match,
+    )
     from osrt.system_prompts import sample_system_prompt
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device)
-    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
-                    weights_only=True)
+    ck = torch.load(
+        f"/vol/checkpoints/v5/{ckpt_name}", map_location=device, weights_only=True
+    )
     sd = ck.get("model_state_dict", ck)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not missing and not unexpected, f"{missing[:3]} {unexpected[:3]}"
@@ -1839,8 +2060,9 @@ def grpo_signal_probe(
 
     # ── unseen prompts with reliable numeric gold ─────────────────────
     problems: list[tuple[str, str]] = []
-    ds = load_dataset("microsoft/orca-math-word-problems-200k", split="train",
-                      streaming=True).skip(skip)
+    ds = load_dataset(
+        "microsoft/orca-math-word-problems-200k", split="train", streaming=True
+    ).skip(skip)
     for row in ds:
         if len(problems) >= n_prompts:
             break
@@ -1848,10 +2070,10 @@ def grpo_signal_probe(
         gold = extract_numeric_answer(row.get("answer") or "")
         if q and gold is not None:
             problems.append((q, str(gold).strip()))
-    print(f"{len(problems)} unseen orca-math prompts (skipped {skip})",
-          flush=True)
+    print(f"{len(problems)} unseen orca-math prompts (skipped {skip})", flush=True)
 
     import random
+
     _, on_sys = sample_system_prompt(random.Random(0), "on")
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     END_ANS = tok.encode("<|/answer|>", add_special_tokens=False)[0]
@@ -1867,13 +2089,19 @@ def grpo_signal_probe(
         attn = torch.tensor(mask_rows, dtype=torch.long, device=device)
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model.generate(
-                input_ids, attention_mask=attn,
-                max_new_tokens=max_new_tokens, temperature=temperature,
-                top_p=1.0, top_k=0, eos_token_id=tok.eos_token_id,
+                input_ids,
+                attention_mask=attn,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=1.0,
+                top_k=0,
+                eos_token_id=tok.eos_token_id,
                 stop_token_ids=[END_ANS],
             )
-        return [tok.decode(out[i, width:], skip_special_tokens=False)
-                for i in range(out.shape[0])]
+        return [
+            tok.decode(out[i, width:], skip_special_tokens=False)
+            for i in range(out.shape[0])
+        ]
 
     results = {}
     B = 256
@@ -1905,31 +2133,44 @@ def grpo_signal_probe(
         grad = len(successes) - dead - sat
         hist = collections.Counter(successes)
         results[T] = {
-            "dead": dead, "saturated": sat, "gradient_bearing": grad,
+            "dead": dead,
+            "saturated": sat,
+            "gradient_bearing": grad,
             "per_rollout_acc": n_correct / max(1, n_roll),
             "pass_at_g": 1 - dead / len(successes),
             "hist": dict(sorted(hist.items())),
             "confidence": dict(labels),
         }
-        print(f"\n{'=' * 72}\nT={T}  (group_size={group_size}, "
-              f"{len(problems)} prompts)")
+        print(
+            f"\n{'=' * 72}\nT={T}  (group_size={group_size}, {len(problems)} prompts)"
+        )
         print(f"  per-rollout accuracy : {100 * n_correct / max(1, n_roll):.1f}%")
-        print(f"  pass@{group_size}             : "
-              f"{100 * (1 - dead / len(successes)):.1f}%")
-        print(f"  DEAD (0/{group_size})          : {dead} "
-              f"({100 * dead / len(successes):.0f}%)  <- zero gradient")
+        print(
+            f"  pass@{group_size}             : "
+            f"{100 * (1 - dead / len(successes)):.1f}%"
+        )
+        print(
+            f"  DEAD (0/{group_size})          : {dead} "
+            f"({100 * dead / len(successes):.0f}%)  <- zero gradient"
+        )
         print(f"  saturated ({group_size}/{group_size})     : {sat}")
-        print(f"  GRADIENT-BEARING     : {grad} "
-              f"({100 * grad / len(successes):.0f}%)  <- what GRPO learns from")
+        print(
+            f"  GRADIENT-BEARING     : {grad} "
+            f"({100 * grad / len(successes):.0f}%)  <- what GRPO learns from"
+        )
         print(f"  successes/prompt hist: {dict(sorted(hist.items()))}")
         amb = labels.get("ambiguous", 0)
-        print(f"  ambiguous rollouts   : {100 * amb / max(1, n_roll):.1f}% "
-              f"(these earn -0.5, not 0)")
+        print(
+            f"  ambiguous rollouts   : {100 * amb / max(1, n_roll):.1f}% "
+            f"(these earn -0.5, not 0)"
+        )
 
     best = max(results, key=lambda t: results[t]["gradient_bearing"])
-    print(f"\n{'=' * 72}\nBEST TEMPERATURE: {best} "
-          f"({results[best]['gradient_bearing']} of {len(problems)} prompts "
-          f"gradient-bearing)")
+    print(
+        f"\n{'=' * 72}\nBEST TEMPERATURE: {best} "
+        f"({results[best]['gradient_bearing']} of {len(problems)} prompts "
+        f"gradient-bearing)"
+    )
     return results
 
 
@@ -2006,16 +2247,20 @@ def build_grpo_prompts(
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = None
     if screen_group > 0:
         model = OSRTForCausalLM(cfg).to(device)
-        ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location=device,
-                        weights_only=True)
+        ck = torch.load(
+            f"/vol/checkpoints/v5/{ckpt_name}", map_location=device, weights_only=True
+        )
         sd = ck.get("model_state_dict", ck)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         assert not missing and not unexpected, f"{missing[:3]} {unexpected[:3]}"
@@ -2023,6 +2268,7 @@ def build_grpo_prompts(
         model.optimize_for_inference(compile_model=True)
 
     import random
+
     _, on_sys = sample_system_prompt(random.Random(0), "on")
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     END_ANS = tok.encode("<|/answer|>", add_special_tokens=False)[0]
@@ -2030,21 +2276,35 @@ def build_grpo_prompts(
     def gen(prompts: list[str]) -> list[str]:
         enc = [tok.encode(p, add_special_tokens=False) for p in prompts]
         width = max(len(e) for e in enc)
-        ids = torch.tensor([[pad_id] * (width - len(e)) + e for e in enc],
-                           dtype=torch.long, device=device)
-        attn = torch.tensor([[0] * (width - len(e)) + [1] * len(e) for e in enc],
-                            dtype=torch.long, device=device)
+        ids = torch.tensor(
+            [[pad_id] * (width - len(e)) + e for e in enc],
+            dtype=torch.long,
+            device=device,
+        )
+        attn = torch.tensor(
+            [[0] * (width - len(e)) + [1] * len(e) for e in enc],
+            dtype=torch.long,
+            device=device,
+        )
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model.generate(
-                ids, attention_mask=attn, max_new_tokens=max_new_tokens,
-                temperature=temperature, top_p=1.0, top_k=0,
-                eos_token_id=tok.eos_token_id, stop_token_ids=[END_ANS],
+                ids,
+                attention_mask=attn,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=1.0,
+                top_k=0,
+                eos_token_id=tok.eos_token_id,
+                stop_token_ids=[END_ANS],
             )
-        return [tok.decode(out[i, width:], skip_special_tokens=False)
-                for i in range(out.shape[0])]
+        return [
+            tok.decode(out[i, width:], skip_special_tokens=False)
+            for i in range(out.shape[0])
+        ]
 
-    ds = load_dataset("microsoft/orca-math-word-problems-200k", split="train",
-                      streaming=True).skip(skip)
+    ds = load_dataset(
+        "microsoft/orca-math-word-problems-200k", split="train", streaming=True
+    ).skip(skip)
     kept: list[dict] = []
     stats = {"scanned": 0, "no_gold": 0, "dead": 0, "saturated": 0}
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -2055,17 +2315,20 @@ def build_grpo_prompts(
     # `chunk` prompts x screen_group rollouts puts us in the efficient region —
     # worth ~30x, i.e. hours instead of a day.
     chunk = max(1, 256 // screen_group) if screen_group > 0 else 1
-    pending: list[tuple[str, str]] = []          # (question, gold)
+    pending: list[tuple[str, str]] = []  # (question, gold)
 
     def flush(pending_batch: list[tuple[str, str]]) -> None:
         if not pending_batch:
             return
-        prompts = [f"<|system|>{on_sys}<|user|>{q}<|assistant|>"
-                   for q, _ in pending_batch for _ in range(screen_group)]
+        prompts = [
+            f"<|system|>{on_sys}<|user|>{q}<|assistant|>"
+            for q, _ in pending_batch
+            for _ in range(screen_group)
+        ]
         texts = gen(prompts)
         for pi, (q, gold) in enumerate(pending_batch):
             got = 0
-            for text in texts[pi * screen_group:(pi + 1) * screen_group]:
+            for text in texts[pi * screen_group : (pi + 1) * screen_group]:
                 guess, _ = extract_numeric_answer_strict(text)
                 if guess is not None and numeric_match(guess, gold):
                     got += 1
@@ -2074,8 +2337,7 @@ def build_grpo_prompts(
             elif got == screen_group:
                 stats["saturated"] += 1
             else:
-                kept.append({"question": q, "answer": gold,
-                             "screen_successes": got})
+                kept.append({"question": q, "answer": gold, "screen_successes": got})
 
     for row in ds:
         if len(kept) >= target or stats["scanned"] >= max_scan:
@@ -2087,8 +2349,9 @@ def build_grpo_prompts(
             continue
         stats["scanned"] += 1
         if screen_group == 0:
-            kept.append({"question": q, "answer": str(gold).strip(),
-                         "screen_successes": -1})
+            kept.append(
+                {"question": q, "answer": str(gold).strip(), "screen_successes": -1}
+            )
             if len(kept) % 500 == 0:
                 print(f"  collected {len(kept)} unscreened prompts", flush=True)
             continue
@@ -2096,9 +2359,11 @@ def build_grpo_prompts(
         if len(pending) >= chunk:
             flush(pending)
             pending = []
-            print(f"  scanned {stats['scanned']}: kept {len(kept)} "
-                  f"(dead {stats['dead']}, saturated {stats['saturated']})",
-                  flush=True)
+            print(
+                f"  scanned {stats['scanned']}: kept {len(kept)} "
+                f"(dead {stats['dead']}, saturated {stats['saturated']})",
+                flush=True,
+            )
     flush(pending)
 
     with open(out_path, "w") as f:
@@ -2107,31 +2372,39 @@ def build_grpo_prompts(
     rollouts_vol.commit()
 
     import collections
+
     hist = collections.Counter(r["screen_successes"] for r in kept)
     print(f"\n{'=' * 72}\nwrote {len(kept)} screened prompts -> {out_path}")
-    print(f"  scanned {stats['scanned']} | dead {stats['dead']} "
-          f"({100 * stats['dead'] / max(1, stats['scanned']):.0f}%) | "
-          f"saturated {stats['saturated']} | no-gold {stats['no_gold']}")
+    print(
+        f"  scanned {stats['scanned']} | dead {stats['dead']} "
+        f"({100 * stats['dead'] / max(1, stats['scanned']):.0f}%) | "
+        f"saturated {stats['saturated']} | no-gold {stats['no_gold']}"
+    )
     print(f"  keep rate {100 * len(kept) / max(1, stats['scanned']):.0f}%")
     print(f"  successes/{screen_group} histogram: {dict(sorted(hist.items()))}")
     return {"kept": len(kept), **stats}
 
 
 @app.local_entrypoint()
-def run_build_grpo_prompts(ckpt_name: str, target: int = 4000,
-                           screen_group: int = 8):
+def run_build_grpo_prompts(ckpt_name: str, target: int = 4000, screen_group: int = 8):
     """Build a GRPO prompt set from unseen orca-math.
     screen_group=0 skips difficulty screening (fast, CPU-only)."""
-    build_grpo_prompts.remote(ckpt_name=ckpt_name, target=target,
-                              screen_group=screen_group)
+    build_grpo_prompts.remote(
+        ckpt_name=ckpt_name, target=target, screen_group=screen_group
+    )
 
 
 @app.local_entrypoint()
-def run_grpo_signal_probe(ckpt_name: str, n_prompts: int = 100,
-                          group_size: int = 16, temps: str = "0.7,0.9,1.0"):
+def run_grpo_signal_probe(
+    ckpt_name: str,
+    n_prompts: int = 100,
+    group_size: int = 16,
+    temps: str = "0.7,0.9,1.0",
+):
     """Measure GRPO gradient signal + pick the rollout temperature."""
-    grpo_signal_probe.remote(ckpt_name=ckpt_name, n_prompts=n_prompts,
-                             group_size=group_size, temps=temps)
+    grpo_signal_probe.remote(
+        ckpt_name=ckpt_name, n_prompts=n_prompts, group_size=group_size, temps=temps
+    )
 
 
 @app.local_entrypoint()
@@ -2141,8 +2414,7 @@ def run_strict_probe(ckpt_name: str, n: int = 200):
 
 
 @app.local_entrypoint()
-def run_make_soup(prefix: str = "osrt_v5_sft_v4",
-                  steps: str = "1200,1400,1600,1800"):
+def run_make_soup(prefix: str = "osrt_v5_sft_v4", steps: str = "1200,1400,1600,1800"):
     """Average checkpoints into a soup, then score it against the baseline."""
     name = make_soup.remote(prefix=prefix, steps=steps)
     print(f"created {name}")
@@ -2151,8 +2423,7 @@ def run_make_soup(prefix: str = "osrt_v5_sft_v4",
 @app.local_entrypoint()
 def run_debias_ema(ema_name: str, base_name: str, out_name: str = ""):
     """Strip the base's residual weight from an EMA to test averaging alone."""
-    print(debias_ema.remote(ema_name=ema_name, base_name=base_name,
-                            out_name=out_name))
+    print(debias_ema.remote(ema_name=ema_name, base_name=base_name, out_name=out_name))
 
 
 @app.local_entrypoint()
@@ -2167,8 +2438,9 @@ def run_ckpt_drift(a: str, b: str):
     secrets=[modal.Secret.from_name("hf-secret")],
     timeout=1800,
 )
-def push_prompts(name: str = "grpo_prompts.jsonl",
-                 hf_repo: str = "HallD/osrt-v6-ckpt") -> str:
+def push_prompts(
+    name: str = "grpo_prompts.jsonl", hf_repo: str = "HallD/osrt-v6-ckpt"
+) -> str:
     """Publish the gold-validated prompt file to HF as data/<name>.
 
     The prompt set must be VERSIONED, not rebuilt from a streaming dataset on
@@ -2185,15 +2457,24 @@ def push_prompts(name: str = "grpo_prompts.jsonl",
 
     path = f"/vol/rollouts/{name}"
     rows = [json.loads(line) for line in open(path)]
-    bad = [i for i, r in enumerate(rows)
-           if not str(r.get("answer", "")).strip()
-           or not str(r.get("question", "")).strip()]
+    bad = [
+        i
+        for i, r in enumerate(rows)
+        if not str(r.get("answer", "")).strip()
+        or not str(r.get("question", "")).strip()
+    ]
     if bad:
-        raise ValueError(f"refusing to publish: {len(bad)}/{len(rows)} rows have "
-                         f"empty question or gold (lines {[i + 1 for i in bad[:5]]})")
-    HfApi().upload_file(path_or_fileobj=path, path_in_repo=f"data/{name}",
-                        repo_id=hf_repo, repo_type="model",
-                        commit_message=f"gold-validated GRPO prompts ({len(rows)} rows)")
+        raise ValueError(
+            f"refusing to publish: {len(bad)}/{len(rows)} rows have "
+            f"empty question or gold (lines {[i + 1 for i in bad[:5]]})"
+        )
+    HfApi().upload_file(
+        path_or_fileobj=path,
+        path_in_repo=f"data/{name}",
+        repo_id=hf_repo,
+        repo_type="model",
+        commit_message=f"gold-validated GRPO prompts ({len(rows)} rows)",
+    )
     print(f"published {len(rows)} validated prompts -> {hf_repo}:data/{name}")
     return f"data/{name}"
 
@@ -2205,31 +2486,55 @@ def run_push_prompts(name: str = "grpo_prompts.jsonl"):
 
 
 @app.local_entrypoint()
-def run_grpo_diag_batch(ckpt_name: str = "grpo_v6_step_390.pt",
-                        num_prompts: int = 16, seed: int = 4242,
-                        max_gen_len: int = 768):
+def run_grpo_diag_batch(
+    ckpt_name: str = "grpo_v6_step_390.pt",
+    num_prompts: int = 16,
+    seed: int = 4242,
+    max_gen_len: int = 768,
+):
     """Cache ONE seeded rollout batch for the offline strict / clamp A/Bs."""
-    print(grpo_diag_batch.remote(ckpt_name=ckpt_name, num_prompts=num_prompts,
-                                 seed=seed, max_gen_len=max_gen_len))
+    print(
+        grpo_diag_batch.remote(
+            ckpt_name=ckpt_name,
+            num_prompts=num_prompts,
+            seed=seed,
+            max_gen_len=max_gen_len,
+        )
+    )
 
 
 @app.local_entrypoint()
-def run_grpo_grad_diag(ckpt_name: str, dump_name: str, micro_batch: int = 8,
-                       temperature: float = 0.0, kl_coeff: float = -1.0,
-                       alt_temperature: float = 0.0,
-                       alt_kl_coeff: float = -1.0):
+def run_grpo_grad_diag(
+    ckpt_name: str,
+    dump_name: str,
+    micro_batch: int = 8,
+    temperature: float = 0.0,
+    kl_coeff: float = -1.0,
+    alt_temperature: float = 0.0,
+    alt_kl_coeff: float = -1.0,
+):
     """Unclamped/clamped policy and KL gradient norms + cosines on a dump."""
-    grpo_grad_diag.remote(ckpt_name=ckpt_name, dump_name=dump_name,
-                          micro_batch=micro_batch, temperature=temperature,
-                          kl_coeff=kl_coeff, alt_temperature=alt_temperature,
-                          alt_kl_coeff=alt_kl_coeff)
+    grpo_grad_diag.remote(
+        ckpt_name=ckpt_name,
+        dump_name=dump_name,
+        micro_batch=micro_batch,
+        temperature=temperature,
+        kl_coeff=kl_coeff,
+        alt_temperature=alt_temperature,
+        alt_kl_coeff=alt_kl_coeff,
+    )
 
 
 @app.local_entrypoint()
-def run_sft_eval_sweep(prefix: str = "osrt_v5_sft_v4", steps: str = "",
-                       n: int = 200, names_csv: str = "",
-                       on_persona: str = "", off_persona: str = "",
-                       spawn: bool = False):
+def run_sft_eval_sweep(
+    prefix: str = "osrt_v5_sft_v4",
+    steps: str = "",
+    n: int = 200,
+    names_csv: str = "",
+    on_persona: str = "",
+    off_persona: str = "",
+    spawn: bool = False,
+):
     """Score checkpoints by GSM8K accuracy. names_csv overrides discovery.
 
     on_persona/off_persona pin the system prompt (e.g. minimal_format, the one
@@ -2243,13 +2548,23 @@ def run_sft_eval_sweep(prefix: str = "osrt_v5_sft_v4", steps: str = "",
     """
     if spawn:
         call = sft_eval_sweep.spawn(
-            prefix=prefix, steps=steps, n=n, names_csv=names_csv,
-            on_persona=on_persona, off_persona=off_persona)
+            prefix=prefix,
+            steps=steps,
+            n=n,
+            names_csv=names_csv,
+            on_persona=on_persona,
+            off_persona=off_persona,
+        )
         print(f"spawned sweep, call id {call.object_id}")
         return
-    sft_eval_sweep.remote(prefix=prefix, steps=steps, n=n,
-                          names_csv=names_csv, on_persona=on_persona,
-                          off_persona=off_persona)
+    sft_eval_sweep.remote(
+        prefix=prefix,
+        steps=steps,
+        n=n,
+        names_csv=names_csv,
+        on_persona=on_persona,
+        off_persona=off_persona,
+    )
 
 
 @app.local_entrypoint()
@@ -2296,9 +2611,12 @@ def sft_eval(ckpt_name: str, n: int = 100, max_new_tokens: int = 400) -> dict:
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     model = OSRTForCausalLM(cfg)
     path = f"/vol/checkpoints/v5/{ckpt_name}"
@@ -2306,14 +2624,20 @@ def sft_eval(ckpt_name: str, n: int = 100, max_new_tokens: int = 400) -> dict:
     sd = ck["model_state_dict"] if "model_state_dict" in ck else ck
     missing, unexpected = model.load_state_dict(sd, strict=False)
     model = model.to("cuda").to(torch.bfloat16).eval()
-    print(f"loaded {path} | missing={len(missing)} unexpected={len(unexpected)}",
-          flush=True)
+    print(
+        f"loaded {path} | missing={len(missing)} unexpected={len(unexpected)}",
+        flush=True,
+    )
 
     with torch.no_grad():
         res = run_reasoning_eval(
-            model, tok, torch.device("cuda"),
-            n_problems=n, max_new_tokens=max_new_tokens,
-            batch_size=32, repetition_penalty=1.2,
+            model,
+            tok,
+            torch.device("cuda"),
+            n_problems=n,
+            max_new_tokens=max_new_tokens,
+            batch_size=32,
+            repetition_penalty=1.2,
         )
     print("=== sft_eval ===", flush=True)
     for k, v in res.items():
@@ -2322,10 +2646,15 @@ def sft_eval(ckpt_name: str, n: int = 100, max_new_tokens: int = 400) -> dict:
 
 
 @app.function(
-    gpu="H100", image=image,
-    volumes={"/vol/checkpoints": vol, "/vol/tokenizer": v6_tokenizer_vol,
-             "/vol/hf_cache": hf_cache_vol},
-    secrets=[modal.Secret.from_name("hf-secret")], timeout=1800,
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[modal.Secret.from_name("hf-secret")],
+    timeout=1800,
 )
 def sft_sample(ckpt_name: str, n: int = 3, max_new_tokens: int = 768) -> None:
     """Print N full ON + OFF generations from an SFT checkpoint (GPU-side).
@@ -2334,6 +2663,8 @@ def sft_sample(ckpt_name: str, n: int = 3, max_new_tokens: int = 768) -> None:
     reinforce) or degenerate (GRPO can't)? Stops at <|/answer|> so we also see
     whether a decode-time stop fixes the no-EOS runaway.
     """
+    import random
+
     import torch
     from transformers import AutoTokenizer
 
@@ -2341,42 +2672,64 @@ def sft_sample(ckpt_name: str, n: int = 3, max_new_tokens: int = 768) -> None:
     from osrt.presets import build_config
     from osrt.sft_eval import _load_gsm8k_heldout
     from osrt.system_prompts import sample_system_prompt
-    import random
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
-    cfg = build_config(vocab_size=len(tok), real_vocab_size=len(tok),
-                       bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-                       pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8)
+    cfg = build_config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
+    )
     model = OSRTForCausalLM(cfg)
-    ck = torch.load(f"/vol/checkpoints/v5/{ckpt_name}", map_location="cpu",
-                    weights_only=True)
+    ck = torch.load(
+        f"/vol/checkpoints/v5/{ckpt_name}", map_location="cpu", weights_only=True
+    )
     model.load_state_dict(ck.get("model_state_dict", ck), strict=False)
     model = model.to("cuda").to(torch.bfloat16).eval()
     _, on_sys = sample_system_prompt(random.Random(0), "on")
     _, off_sys = sample_system_prompt(random.Random(0), "off")
 
     for i, (q, gold) in enumerate(_load_gsm8k_heldout(n), 1):
-        print(f"\n{'='*70}\n[Q{i}] {q}\nGOLD: {gold}", flush=True)
+        print(f"\n{'=' * 70}\n[Q{i}] {q}\nGOLD: {gold}", flush=True)
         for side, sysp in (("ON", on_sys), ("OFF", off_sys)):
-            ids = torch.tensor([tok.encode(f"<|system|>{sysp}<|user|>{q}<|assistant|>",
-                                add_special_tokens=False)], device="cuda")
+            ids = torch.tensor(
+                [
+                    tok.encode(
+                        f"<|system|>{sysp}<|user|>{q}<|assistant|>",
+                        add_special_tokens=False,
+                    )
+                ],
+                device="cuda",
+            )
             with torch.no_grad():
-                out = model.generate(ids, max_new_tokens=max_new_tokens,
-                                     temperature=0.0, repetition_penalty=1.2,
-                                     eos_token_id=tok.eos_token_id)
-            txt = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=False)
+                out = model.generate(
+                    ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    repetition_penalty=1.2,
+                    eos_token_id=tok.eos_token_id,
+                )
+            txt = tok.decode(out[0, ids.shape[1] :], skip_special_tokens=False)
             # trim at first <|/answer|> to show the intended stop point
             cut = txt.find("<|/answer|>")
-            shown = txt[:cut + len("<|/answer|>")] if cut != -1 else txt
-            print(f"\n--- {side} ({len(txt)} chars raw, "
-                  f"{'closed' if cut!=-1 else 'NO CLOSE'}) ---\n{shown}", flush=True)
+            shown = txt[: cut + len("<|/answer|>")] if cut != -1 else txt
+            print(
+                f"\n--- {side} ({len(txt)} chars raw, "
+                f"{'closed' if cut != -1 else 'NO CLOSE'}) ---\n{shown}",
+                flush=True,
+            )
 
 
 @app.local_entrypoint()
 def run_sft_sample(step: str = "final", n: int = 3):
     """Print full generations from an SFT-v2 checkpoint (qualitative read)."""
-    name = ("osrt_v5_sft_v2_final.pt" if step == "final"
-            else f"osrt_v5_sft_v2_step_{step}.pt")
+    name = (
+        "osrt_v5_sft_v2_final.pt"
+        if step == "final"
+        else f"osrt_v5_sft_v2_step_{step}.pt"
+    )
     sft_sample.remote(name, n)
 
 
@@ -2424,8 +2777,9 @@ def ppl_eval(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
     if step == "latest":
         name = max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
     else:
@@ -2441,9 +2795,12 @@ def ppl_eval(
 
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device)  # eager; autocast bf16 in forward
@@ -2481,8 +2838,11 @@ def ppl_eval(
 
     loader = make_loader(
         dataset_configs=[ds_cfg],
-        seq_len=4096, tokenizer_name="/root/v6_tokenizer_export",
-        batch_size=batch, step_num=999999, num_workers=0,
+        seq_len=4096,
+        tokenizer_name="/root/v6_tokenizer_export",
+        batch_size=batch,
+        step_num=999999,
+        num_workers=0,
     )
     it = iter(loader)
     total_loss = total_tok = 0
@@ -2497,8 +2857,13 @@ def ppl_eval(
             total_tok += n
     mean_loss = total_loss / max(total_tok, 1)
     ppl = math.exp(min(mean_loss, 20.0))
-    res = {"step": resolved, "dataset": dataset, "loss": mean_loss,
-           "ppl": ppl, "tokens": total_tok}
+    res = {
+        "step": resolved,
+        "dataset": dataset,
+        "loss": mean_loss,
+        "ppl": ppl,
+        "tokens": total_tok,
+    }
     print(f"\n== held-out {label} ppl ==\n{res}", flush=True)
     return res
 
@@ -2520,8 +2885,7 @@ def run_ppl_eval(
     Re-run at a later step to read the trend (ppl should DROP as pretraining helps).
     """
     print(f"Evaluating step={step} dataset={dataset} (held-out ppl) on A100...")
-    res = ppl_eval.remote(
-        step=step, dataset=dataset, eval_steps=eval_steps, skip=skip)
+    res = ppl_eval.remote(step=step, dataset=dataset, eval_steps=eval_steps, skip=skip)
     print("\n=== RESULT ===")
     print(f"  step:    {res['step']}")
     print(f"  dataset: {res['dataset']}")
@@ -2549,7 +2913,8 @@ def _use_inductor_cache() -> None:
     import os
 
     os.environ.setdefault(
-        "TORCHINDUCTOR_CACHE_DIR", "/vol/hf_cache/torchinductor_cache",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "/vol/hf_cache/torchinductor_cache",
     )
 
 
@@ -2595,8 +2960,9 @@ def sample_base(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
     if step == "latest":
         name = max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
     elif step == "final":
@@ -2608,9 +2974,12 @@ def sample_base(
 
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device)
@@ -2632,13 +3001,17 @@ def sample_base(
         t0 = time.perf_counter()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model.generate(
-                inp, max_new_tokens=max_new_tokens, temperature=temp,
-                top_p=top_p, top_k=top_k, repetition_penalty=rp,
+                inp,
+                max_new_tokens=max_new_tokens,
+                temperature=temp,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=rp,
                 eos_token_id=tok.eos_token_id,
             )
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
-        gen = out[0, len(ids):].tolist()
+        gen = out[0, len(ids) :].tolist()
         return tok.decode(gen, skip_special_tokens=True), len(gen), dt
 
     # Warmup so the first timed call isn't paying CUDA lazy-init / kernel compile.
@@ -2653,19 +3026,32 @@ def sample_base(
         sampled, sn, sdt = _gen(p, temp=temperature, rp=1.2)
         g_tps, s_tps = gn / gdt, sn / sdt
         tps_all += [g_tps, s_tps]
-        results.append({"prompt": p, "greedy": greedy, "sampled": sampled,
-                        "greedy_tok_per_sec": g_tps, "sampled_tok_per_sec": s_tps,
-                        "greedy_tokens": gn, "sampled_tokens": sn})
-        print(f"\n{'='*70}\nPROMPT: {p!r}\n"
-              f"--- greedy(rp={rep_penalty}) [{gn} tok, {g_tps:.1f} tok/s] ---\n"
-              f"{greedy}\n"
-              f"--- sampled(t={temperature},p={top_p}) "
-              f"[{sn} tok, {s_tps:.1f} tok/s] ---\n"
-              f"{sampled}", flush=True)
+        results.append(
+            {
+                "prompt": p,
+                "greedy": greedy,
+                "sampled": sampled,
+                "greedy_tok_per_sec": g_tps,
+                "sampled_tok_per_sec": s_tps,
+                "greedy_tokens": gn,
+                "sampled_tokens": sn,
+            }
+        )
+        print(
+            f"\n{'=' * 70}\nPROMPT: {p!r}\n"
+            f"--- greedy(rp={rep_penalty}) [{gn} tok, {g_tps:.1f} tok/s] ---\n"
+            f"{greedy}\n"
+            f"--- sampled(t={temperature},p={top_p}) "
+            f"[{sn} tok, {s_tps:.1f} tok/s] ---\n"
+            f"{sampled}",
+            flush=True,
+        )
     avg_tps = sum(tps_all) / len(tps_all)
-    print(f"\n{'='*70}\nTHROUGHPUT: mean {avg_tps:.1f} tok/s "
-          f"(batch=1, A100, {len(tps_all)} gens, max_new={max_new_tokens})",
-          flush=True)
+    print(
+        f"\n{'=' * 70}\nTHROUGHPUT: mean {avg_tps:.1f} tok/s "
+        f"(batch=1, A100, {len(tps_all)} gens, max_new={max_new_tokens})",
+        flush=True,
+    )
     return results
 
 
@@ -2717,18 +3103,24 @@ def profile_decode(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     print(f"pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -2761,8 +3153,10 @@ def profile_decode(
     for bs in batch_sizes:
         ms, tps = _run(bs)
         sweep[bs] = {"per_token_ms": ms, "aggregate_tok_per_sec": tps}
-        print(f"  batch={bs:>3}: {ms:7.1f} ms/token-step | {tps:8.1f} tok/s aggregate",
-              flush=True)
+        print(
+            f"  batch={bs:>3}: {ms:7.1f} ms/token-step | {tps:8.1f} tok/s aggregate",
+            flush=True,
+        )
 
     # torch.profiler on batch=1 decode
     print("\n=== profiler: batch=1, 8 decode steps ===", flush=True)
@@ -2774,26 +3168,34 @@ def profile_decode(
     ka = prof.key_averages()
 
     def _dev_us(e):  # torch renamed self_cuda_time_total -> self_device_time_total
-        return getattr(e, "self_device_time_total",
-                       getattr(e, "self_cuda_time_total", 0.0))
+        return getattr(
+            e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0.0)
+        )
 
     total_dev_us = sum(_dev_us(e) for e in ka)
     # Real kernel launches = the cudaLaunchKernel/cuLaunchKernel host events.
     # Summing every profiler row (the old bug) counted ATen bookkeeping
     # (as_strided/empty/slice...) as "launches" and overstated ~5x.
     kernel_launches = sum(
-        e.count for e in ka
-        if e.key in ("cudaLaunchKernel", "cuLaunchKernel")
+        e.count for e in ka if e.key in ("cudaLaunchKernel", "cuLaunchKernel")
     )
     total_rows = sum(e.count for e in ka)
-    print(f"  kernel launches (8 steps): {kernel_launches} "
-          f"(~{kernel_launches // 8}/token) | profiler rows incl. ATen "
-          f"bookkeeping: {total_rows}", flush=True)
-    print(f"  total self-device time: {total_dev_us / 1000:.1f} ms "
-          f"(~{total_dev_us / 8000:.1f} ms/token GPU-busy)", flush=True)
-    sort_key = ("self_device_time_total"
-                if hasattr(next(iter(ka)), "self_device_time_total")
-                else "self_cuda_time_total")
+    print(
+        f"  kernel launches (8 steps): {kernel_launches} "
+        f"(~{kernel_launches // 8}/token) | profiler rows incl. ATen "
+        f"bookkeeping: {total_rows}",
+        flush=True,
+    )
+    print(
+        f"  total self-device time: {total_dev_us / 1000:.1f} ms "
+        f"(~{total_dev_us / 8000:.1f} ms/token GPU-busy)",
+        flush=True,
+    )
+    sort_key = (
+        "self_device_time_total"
+        if hasattr(next(iter(ka)), "self_device_time_total")
+        else "self_cuda_time_total"
+    )
     print("  top ops by device time:", flush=True)
     print(ka.table(sort_by=sort_key, row_limit=12), flush=True)
     print("  top ops by launch count:", flush=True)
@@ -2803,7 +3205,9 @@ def profile_decode(
 
 @app.local_entrypoint()
 def run_profile_decode(
-    step: str = "latest", decode_steps: int = 32, compiled: bool = False,
+    step: str = "latest",
+    decode_steps: int = 32,
+    compiled: bool = False,
 ):
     """Diagnose decode throughput (batch sweep + profiler) on A100 (blocking).
 
@@ -2811,12 +3215,13 @@ def run_profile_decode(
     speedup idea by evidence.
     """
     print(f"Profiling decode for step={step} compiled={compiled} on A100...")
-    res = profile_decode.remote(
-        step=step, decode_steps=decode_steps, compiled=compiled)
+    res = profile_decode.remote(step=step, decode_steps=decode_steps, compiled=compiled)
     print("\n=== SWEEP SUMMARY ===")
     for bs, r in res["sweep"].items():
-        print(f"  batch={bs}: {r['per_token_ms']:.1f} ms/step, "
-              f"{r['aggregate_tok_per_sec']:.1f} tok/s aggregate")
+        print(
+            f"  batch={bs}: {r['per_token_ms']:.1f} ms/step, "
+            f"{r['aggregate_tok_per_sec']:.1f} tok/s aggregate"
+        )
     print(f"  kernel launches/token: {res['kernel_launches_per_token']}")
 
 
@@ -2855,18 +3260,24 @@ def ppl_sinkhorn_ab(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     print(f"pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -2874,18 +3285,27 @@ def ppl_sinkhorn_ab(
     model.load_state_dict(sd, strict=False)
 
     mhcs = [m for m in model.modules() if isinstance(m, ManifoldHyperConnection)]
-    print(f"{len(mhcs)} mHC modules; default sinkhorn_iters="
-          f"{mhcs[0].sinkhorn_iters}", flush=True)
+    print(
+        f"{len(mhcs)} mHC modules; default sinkhorn_iters={mhcs[0].sinkhorn_iters}",
+        flush=True,
+    )
 
     # Fix the SAME held-out batches for every setting (fair comparison).
     loader = make_loader(
-        dataset_configs=[{
-            "name": "nemotron-cc-math-heldout",
-            "hf_id": "nvidia/Nemotron-CC-Math-v1", "hf_config": "4plus",
-            "weight": 1.0, "skip": 2_000_000,
-        }],
-        seq_len=4096, tokenizer_name="/root/v6_tokenizer_export",
-        batch_size=batch, step_num=999999, num_workers=0,
+        dataset_configs=[
+            {
+                "name": "nemotron-cc-math-heldout",
+                "hf_id": "nvidia/Nemotron-CC-Math-v1",
+                "hf_config": "4plus",
+                "weight": 1.0,
+                "skip": 2_000_000,
+            }
+        ],
+        seq_len=4096,
+        tokenizer_name="/root/v6_tokenizer_export",
+        batch_size=batch,
+        step_num=999999,
+        num_workers=0,
     )
     it = iter(loader)
     batches = [next(it) for _ in range(eval_steps)]
@@ -2906,8 +3326,10 @@ def ppl_sinkhorn_ab(
         mean_loss = total_loss / max(total_tok, 1)
         ppl = math.exp(min(mean_loss, 20.0))
         results[iters] = {"loss": mean_loss, "ppl": ppl}
-        print(f"  sinkhorn_iters={iters:>2}: loss={mean_loss:.4f}  ppl={ppl:.3f}",
-              flush=True)
+        print(
+            f"  sinkhorn_iters={iters:>2}: loss={mean_loss:.4f}  ppl={ppl:.3f}",
+            flush=True,
+        )
     return {"tokens": total_tok, "by_iters": results}
 
 
@@ -2956,18 +3378,24 @@ def bench_compile(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     print(f"pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -3004,7 +3432,8 @@ def bench_compile(
         print(f"compile(default) setup failed: {e}", flush=True)
     try:
         variants["compile_reduce_overhead"] = torch.compile(
-            model, mode="reduce-overhead", fullgraph=False).forward
+            model, mode="reduce-overhead", fullgraph=False
+        ).forward
     except Exception as e:  # noqa: BLE001
         print(f"compile(reduce-overhead) setup failed: {e}", flush=True)
 
@@ -3015,11 +3444,15 @@ def bench_compile(
                 ms = _bench(fwd, bs)
                 tps = bs / ms * 1000
                 results[vname][bs] = {"ms_per_step": ms, "tok_per_sec": tps}
-                print(f"  {vname:>24} batch={bs:>3}: {ms:7.2f} ms/step | "
-                      f"{tps:8.1f} tok/s", flush=True)
+                print(
+                    f"  {vname:>24} batch={bs:>3}: {ms:7.2f} ms/step | "
+                    f"{tps:8.1f} tok/s",
+                    flush=True,
+                )
             except Exception as e:  # noqa: BLE001
-                print(f"  {vname} batch={bs}: FAILED {type(e).__name__}: {e}",
-                      flush=True)
+                print(
+                    f"  {vname} batch={bs}: FAILED {type(e).__name__}: {e}", flush=True
+                )
                 results[vname][bs] = {"error": f"{type(e).__name__}: {e}"}
     return results
 
@@ -3033,8 +3466,10 @@ def run_bench_compile(step: str = "latest", ctx_len: int = 64):
     for vname, by_bs in res.items():
         for bs, r in by_bs.items():
             if "tok_per_sec" in r:
-                print(f"  {vname} batch={bs}: {r['ms_per_step']:.2f} ms/step, "
-                      f"{r['tok_per_sec']:.1f} tok/s")
+                print(
+                    f"  {vname} batch={bs}: {r['ms_per_step']:.2f} ms/step, "
+                    f"{r['tok_per_sec']:.1f} tok/s"
+                )
             else:
                 print(f"  {vname} batch={bs}: {r.get('error')}")
 
@@ -3049,8 +3484,8 @@ def run_bench_compile(step: str = "latest", ctx_len: int = 64):
 def bench_generate(
     step: str = "latest",
     new_tokens: int = 64,
-    configs: str = "all",       # "all" | "compiled" (skip re-measuring eager)
-    batches: str = "1,32",      # comma-separated batch sizes
+    configs: str = "all",  # "all" | "compiled" (skip re-measuring eager)
+    batches: str = "1,32",  # comma-separated batch sizes
     hf_repo: str = "HallD/osrt-v6-ckpt",
 ) -> dict:
     """Authoritative end-to-end generate() bench + identity gate on the REAL
@@ -3077,27 +3512,33 @@ def bench_generate(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     print(f"pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
     sd = torch.load(path, map_location=device, weights_only=True)["model_state_dict"]
     model.load_state_dict(sd, strict=False)
 
-    prompt = ([tok.bos_token_id]
-              + tok.encode("The Industrial Revolution was a period of major",
-                           add_special_tokens=False))
+    prompt = [tok.bos_token_id] + tok.encode(
+        "The Industrial Revolution was a period of major", add_special_tokens=False
+    )
 
     def _gen(bs: int, warmups: int = 1) -> tuple[list[int], float, float]:
         inp = torch.tensor([prompt] * bs, device=device)
@@ -3113,7 +3554,7 @@ def bench_generate(
             out = model.generate(inp, max_new_tokens=new_tokens, temperature=0.0)
             torch.cuda.synchronize()
             t_full = time.perf_counter() - t0
-        ids = out[0, len(prompt):].tolist()
+        ids = out[0, len(prompt) :].tolist()
         decode_tps = bs * (new_tokens - 1) / max(t_full - t_prefill, 1e-6)
         return ids, t_prefill * 1000, decode_tps
 
@@ -3124,8 +3565,11 @@ def bench_generate(
         for bs in bs_list:
             ids, pf, tps = _gen(bs, warmups=warmups)
             out[f"b{bs}"] = {"prefill_ms": pf, "decode_tps": tps, "ids": ids}
-            print(f"  {label:>16} b{bs:<3}: prefill {pf:7.1f} ms | "
-                  f"decode {tps:7.1f} tok/s", flush=True)
+            print(
+                f"  {label:>16} b{bs:<3}: prefill {pf:7.1f} ms | "
+                f"decode {tps:7.1f} tok/s",
+                flush=True,
+            )
         return out
 
     res = {}
@@ -3166,18 +3610,23 @@ def run_bench_generate(
     --configs compiled --batches 1  -> fastest loop for iterating on the
     compiled path (skips the thrice-measured eager baselines + extra traces).
     """
-    print(f"Benchmarking generate() step={step} configs={configs} "
-          f"batches={batches} on A100...")
+    print(
+        f"Benchmarking generate() step={step} configs={configs} "
+        f"batches={batches} on A100..."
+    )
     res = bench_generate.remote(
-        step=step, new_tokens=new_tokens, configs=configs, batches=batches)
+        step=step, new_tokens=new_tokens, configs=configs, batches=batches
+    )
     print("\n=== REAL generate() PATH (20 Sinkhorn iters) ===")
     for k, cfg in res.items():
         if k == "identity":
             print(f"  identity: {cfg}")
             continue
         for b, r in cfg.items():
-            print(f"  {k} {b}: prefill {r['prefill_ms']:.1f}ms | "
-                  f"decode {r['decode_tps']:.1f} tok/s")
+            print(
+                f"  {k} {b}: prefill {r['prefill_ms']:.1f}ms | "
+                f"decode {r['decode_tps']:.1f} tok/s"
+            )
 
 
 @app.function(
@@ -3221,18 +3670,24 @@ def ab_prepack(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     print(f"pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -3251,8 +3706,7 @@ def ab_prepack(
     gen = torch.Generator(device="cpu").manual_seed(0)
 
     def _prompt(ctx: int, bs: int = 1) -> torch.Tensor:
-        ids = torch.randint(
-            0, cfg.real_vocab_size, (bs, ctx), generator=gen)
+        ids = torch.randint(0, cfg.real_vocab_size, (bs, ctx), generator=gen)
         return ids.to(device)
 
     def _timed_decode(inp: torch.Tensor) -> float:
@@ -3278,17 +3732,25 @@ def ab_prepack(
                 model.generate(inp, max_new_tokens=8, temperature=0.0)
         ka = prof.key_averages()
         dev_us = sum(
-            getattr(e, "self_device_time_total",
-                    getattr(e, "self_cuda_time_total", 0.0))
-            for e in ka)
-        launches = sum(e.count for e in ka
-                       if e.key in ("cudaLaunchKernel", "cuLaunchKernel"))
-        restack = sorted({
-            e.key for e in ka
-            if ("stack" in e.key.lower() or "_to_copy" in e.key.lower())
-            and getattr(e, "self_device_time_total",
-                        getattr(e, "self_cuda_time_total", 0.0)) > 0
-        })
+            getattr(
+                e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0.0)
+            )
+            for e in ka
+        )
+        launches = sum(
+            e.count for e in ka if e.key in ("cudaLaunchKernel", "cuLaunchKernel")
+        )
+        restack = sorted(
+            {
+                e.key
+                for e in ka
+                if ("stack" in e.key.lower() or "_to_copy" in e.key.lower())
+                and getattr(
+                    e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0.0)
+                )
+                > 0
+            }
+        )
         return {
             "gpu_busy_ms_per_tok": dev_us / 8000.0,
             "kernel_launches_per_tok": launches // 8,
@@ -3314,10 +3776,12 @@ def ab_prepack(
         "packed_all": packed_tps,
         "unpacked_all": unpacked_tps,
     }
-    print(f"A/B ctx=64 b1: packed median {ab['packed_median_tps']:.1f} tok/s "
-          f"{[f'{t:.1f}' for t in packed_tps]} | unpacked median "
-          f"{ab['unpacked_median_tps']:.1f} {[f'{t:.1f}' for t in unpacked_tps]}",
-          flush=True)
+    print(
+        f"A/B ctx=64 b1: packed median {ab['packed_median_tps']:.1f} tok/s "
+        f"{[f'{t:.1f}' for t in packed_tps]} | unpacked median "
+        f"{ab['unpacked_median_tps']:.1f} {[f'{t:.1f}' for t in unpacked_tps]}",
+        flush=True,
+    )
 
     # ── (2) profiler per variant ──
     profs = {}
@@ -3325,25 +3789,30 @@ def ab_prepack(
         _set_packed(on)
         profs[label] = _profile_variant(inp64)
         p = profs[label]
-        print(f"profile[{label}]: gpu_busy {p['gpu_busy_ms_per_tok']:.1f} "
-              f"ms/tok | {p['kernel_launches_per_tok']} launches/tok | "
-              f"restack kernels: {p['restack_kernels'] or 'NONE'}", flush=True)
+        print(
+            f"profile[{label}]: gpu_busy {p['gpu_busy_ms_per_tok']:.1f} "
+            f"ms/tok | {p['kernel_launches_per_tok']} launches/tok | "
+            f"restack kernels: {p['restack_kernels'] or 'NONE'}",
+            flush=True,
+        )
 
     # ── (3) context sweep, packed ──
     _set_packed(True)
     sweep = {}
     for ctx in (int(c) for c in ctx_sweep.split(",")):
         inp = _prompt(ctx)
-        tps = _timed_decode(inp)          # includes one settle implicitly? no:
-        tps = _timed_decode(inp)          # repeat once; keep 2nd (warm) figure
+        tps = _timed_decode(inp)  # includes one settle implicitly? no:
+        tps = _timed_decode(inp)  # repeat once; keep 2nd (warm) figure
         prof = _profile_variant(inp)
         sweep[ctx] = {
             "wall_ms_per_tok": 1000.0 / tps,
             "gpu_busy_ms_per_tok": prof["gpu_busy_ms_per_tok"],
         }
-        print(f"ctx={ctx:>4}: wall {sweep[ctx]['wall_ms_per_tok']:6.1f} ms/tok"
-              f" | gpu-busy {sweep[ctx]['gpu_busy_ms_per_tok']:6.1f} ms/tok",
-              flush=True)
+        print(
+            f"ctx={ctx:>4}: wall {sweep[ctx]['wall_ms_per_tok']:6.1f} ms/tok"
+            f" | gpu-busy {sweep[ctx]['gpu_busy_ms_per_tok']:6.1f} ms/tok",
+            flush=True,
+        )
     return {"ab": ab, "profiles": profs, "ctx_sweep": sweep}
 
 
@@ -3393,18 +3862,24 @@ def ab_static(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     print(f"pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -3412,22 +3887,22 @@ def ab_static(
     model.load_state_dict(sd, strict=False)
     model.optimize_for_inference()
 
-    prompt = ([tok.bos_token_id]
-              + tok.encode("The Industrial Revolution was a period of major",
-                           add_special_tokens=False))
+    prompt = [tok.bos_token_id] + tok.encode(
+        "The Industrial Revolution was a period of major", add_special_tokens=False
+    )
     inp = torch.tensor([prompt], device=device)
 
     def _timed(impl: str) -> float:
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            model.generate(inp, max_new_tokens=1, temperature=0.0,
-                           cache_impl=impl)
+            model.generate(inp, max_new_tokens=1, temperature=0.0, cache_impl=impl)
             torch.cuda.synchronize()
             t_pref = time.perf_counter() - t0
             t0 = time.perf_counter()
-            model.generate(inp, max_new_tokens=decode_steps, temperature=0.0,
-                           cache_impl=impl)
+            model.generate(
+                inp, max_new_tokens=decode_steps, temperature=0.0, cache_impl=impl
+            )
             torch.cuda.synchronize()
             t_full = time.perf_counter() - t0
         return (decode_steps - 1) / max(t_full - t_pref, 1e-6)
@@ -3439,35 +3914,41 @@ def ab_static(
     for _ in range(reps):
         lat.append(_timed("latent"))
         sta.append(_timed("static"))
-    print(f"A/B b1: latent median {statistics.median(lat):.1f} "
-          f"{[f'{t:.1f}' for t in lat]} | static median "
-          f"{statistics.median(sta):.1f} {[f'{t:.1f}' for t in sta]}",
-          flush=True)
+    print(
+        f"A/B b1: latent median {statistics.median(lat):.1f} "
+        f"{[f'{t:.1f}' for t in lat]} | static median "
+        f"{statistics.median(sta):.1f} {[f'{t:.1f}' for t in sta]}",
+        flush=True,
+    )
 
     # Quality gate (2a): first-decode-step logit diff against the same prefill.
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         pre = model._fwd(inp, use_cache=True)
         latents = pre.past_key_values
-        tok0 = pre.logits[:, -1, :cfg.real_vocab_size].argmax(-1, keepdim=True)
+        tok0 = pre.logits[:, -1, : cfg.real_vocab_size].argmax(-1, keepdim=True)
         # latent path step
         o_lat = model._fwd(tok0, past_key_values=latents, use_cache=True)
-        l_lat = o_lat.logits[:, -1, :cfg.real_vocab_size].float()
+        l_lat = o_lat.logits[:, -1, : cfg.real_vocab_size].float()
         # static path step (build cache from the same latents)
         from osrt.model import StaticKVCache
+
         B, L = inp.shape
         scache = StaticKVCache(
-            num_layers=len(latents), batch=B, kv_heads=cfg.num_kv_heads,
-            head_dim=cfg.head_dim, max_len=L + 8, device=device,
+            num_layers=len(latents),
+            batch=B,
+            kv_heads=cfg.num_kv_heads,
+            head_dim=cfg.head_dim,
+            max_len=L + 8,
+            device=device,
         )
-        cos = model.model.rope_cos[:, :L + 8].to(latents[0].dtype)
-        sin = model.model.rope_sin[:, :L + 8].to(latents[0].dtype)
+        cos = model.model.rope_cos[:, : L + 8].to(latents[0].dtype)
+        sin = model.model.rope_sin[:, : L + 8].to(latents[0].dtype)
         for idx, c_kv in enumerate(latents):
             blk = model.model.blocks[idx % cfg.num_blocks]
-            blk.write_latent_to_static(
-                c_kv, cos, sin, scache.k[idx], scache.v[idx])
+            blk.write_latent_to_static(c_kv, cos, sin, scache.k[idx], scache.v[idx])
         scache.cursor.fill_(L)
         o_sta = model._fwd(tok0, past_key_values=scache, use_cache=False)
-        l_sta = o_sta.logits[:, -1, :cfg.real_vocab_size].float()
+        l_sta = o_sta.logits[:, -1, : cfg.real_vocab_size].float()
     max_abs = (l_lat - l_sta).abs().max().item()
     top1 = bool((l_lat.argmax(-1) == l_sta.argmax(-1)).all().item())
 
@@ -3476,16 +3957,20 @@ def ab_static(
     for p in _SAMPLE_PROMPTS:
         ids = torch.tensor(
             [[tok.bos_token_id] + tok.encode(p, add_special_tokens=False)],
-            device=device)
+            device=device,
+        )
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            a = model.generate(ids, max_new_tokens=48, temperature=0.0,
-                               cache_impl="latent")[0, ids.shape[1]:].tolist()
-            b = model.generate(ids, max_new_tokens=48, temperature=0.0,
-                               cache_impl="static")[0, ids.shape[1]:].tolist()
-        divs[p[:32]] = next(
-            (i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
-    print(f"step-logit max|Δ|={max_abs:.4g} top1_match={top1} "
-          f"greedy first-div: {divs}", flush=True)
+            a = model.generate(
+                ids, max_new_tokens=48, temperature=0.0, cache_impl="latent"
+            )[0, ids.shape[1] :].tolist()
+            b = model.generate(
+                ids, max_new_tokens=48, temperature=0.0, cache_impl="static"
+            )[0, ids.shape[1] :].tolist()
+        divs[p[:32]] = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+    print(
+        f"step-logit max|Δ|={max_abs:.4g} top1_match={top1} greedy first-div: {divs}",
+        flush=True,
+    )
 
     # (3) CUDA-graph arm: recompile under reduce-overhead (per-shape
     # specialization; the static decode step is one fixed shape) and time the
@@ -3494,27 +3979,36 @@ def ab_static(
     ro_err = None
     try:
         import torch._dynamo as _dynamo
+
         _dynamo.reset()
         model.optimize_for_inference(reduce_overhead=True)
         _timed("static")  # trace + capture
         _timed("static")  # settle replay
         for _ in range(reps):
             ro.append(_timed("static"))
-        print(f"reduce-overhead static: median {statistics.median(ro):.1f} "
-              f"{[f'{t:.1f}' for t in ro]}", flush=True)
+        print(
+            f"reduce-overhead static: median {statistics.median(ro):.1f} "
+            f"{[f'{t:.1f}' for t in ro]}",
+            flush=True,
+        )
     except Exception as e:  # noqa: BLE001
         import traceback
+
         ro_err = f"{type(e).__name__}: {e}"
         print(f"reduce-overhead static FAILED: {ro_err}", flush=True)
         print("--- full traceback (names the faulting op) ---", flush=True)
         print(traceback.format_exc(), flush=True)
 
     return {
-        "latent_median_tps": statistics.median(lat), "latent_all": lat,
-        "static_median_tps": statistics.median(sta), "static_all": sta,
+        "latent_median_tps": statistics.median(lat),
+        "latent_all": lat,
+        "static_median_tps": statistics.median(sta),
+        "static_all": sta,
         "cudagraph_median_tps": statistics.median(ro) if ro else None,
-        "cudagraph_all": ro, "cudagraph_error": ro_err,
-        "step_logit_max_abs": max_abs, "step_top1_match": top1,
+        "cudagraph_all": ro,
+        "cudagraph_error": ro_err,
+        "step_logit_max_abs": max_abs,
+        "step_top1_match": top1,
         "greedy_first_divergence": divs,
     }
 
@@ -3553,18 +4047,24 @@ def gate_cudagraph(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     print(f"pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -3577,40 +4077,46 @@ def gate_cudagraph(
 
     results = {}
     for ctx in (int(c) for c in ctx_list.split(",")):
-        ids = torch.tensor(
-            [[tok.bos_token_id] + long_ids[: ctx - 1]], device=device)
+        ids = torch.tensor([[tok.bos_token_id] + long_ids[: ctx - 1]], device=device)
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             ref = model.generate(
-                ids, max_new_tokens=new_tokens, temperature=0.0,
+                ids,
+                max_new_tokens=new_tokens,
+                temperature=0.0,
                 cache_impl="latent",
-            )[0, ids.shape[1]:].tolist()
+            )[0, ids.shape[1] :].tolist()
             cg = model.generate(
-                ids, max_new_tokens=new_tokens, temperature=0.0,
+                ids,
+                max_new_tokens=new_tokens,
+                temperature=0.0,
                 cache_impl="static",
-            )[0, ids.shape[1]:].tolist()
+            )[0, ids.shape[1] :].tolist()
             # Min winning margin over the reference generation, teacher-forced
             # (positions ctx-1 .. ctx+new-2 predict the generated tokens).
             full = torch.tensor([ids[0].tolist() + ref], device=device)
-            logits = model._fwd(full).logits[
-                0, ids.shape[1] - 1: -1, :cfg.real_vocab_size
-            ].float()
+            logits = (
+                model._fwd(full)
+                .logits[0, ids.shape[1] - 1 : -1, : cfg.real_vocab_size]
+                .float()
+            )
             top2 = logits.topk(2, dim=-1).values
-            margins = (top2[:, 0] - top2[:, 1])
-        first_div = next(
-            (i for i, (a, b) in enumerate(zip(ref, cg)) if a != b), None)
+            margins = top2[:, 0] - top2[:, 1]
+        first_div = next((i for i, (a, b) in enumerate(zip(ref, cg)) if a != b), None)
         results[ctx] = {
             "first_divergence": first_div,
             "match_frac": (
-                (first_div if first_div is not None else new_tokens)
-                / new_tokens
+                (first_div if first_div is not None else new_tokens) / new_tokens
             ),
             "min_margin": margins.min().item(),
             "mean_margin": margins.mean().item(),
         }
         tag = "IDENTICAL" if first_div is None else f"div@{first_div}"
-        print(f"  ctx={ctx:>4}: [{tag}] match={results[ctx]['match_frac']:.2f} "
-              f"min_margin={results[ctx]['min_margin']:.4f} "
-              f"mean_margin={results[ctx]['mean_margin']:.3f}", flush=True)
+        print(
+            f"  ctx={ctx:>4}: [{tag}] match={results[ctx]['match_frac']:.2f} "
+            f"min_margin={results[ctx]['min_margin']:.4f} "
+            f"mean_margin={results[ctx]['mean_margin']:.3f}",
+            flush=True,
+        )
     return results
 
 
@@ -3642,19 +4148,25 @@ def _bench_graphs_impl(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     gpu_name = torch.cuda.get_device_name(0)
     print(f"GPU: {gpu_name} | pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -3662,31 +4174,29 @@ def _bench_graphs_impl(
     model.load_state_dict(sd, strict=False)
     model.optimize_for_inference(reduce_overhead=True)
 
-    prompt = ([tok.bos_token_id]
-              + tok.encode("The Industrial Revolution was a period of major",
-                           add_special_tokens=False))
+    prompt = [tok.bos_token_id] + tok.encode(
+        "The Industrial Revolution was a period of major", add_special_tokens=False
+    )
 
     def _timed(bs: int, impl: str, reps: int = 3) -> float:
         inp = torch.tensor([prompt] * bs, device=device)
         vals = []
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             # settle: traces/captures on first call for this shape
-            model.generate(inp, max_new_tokens=4, temperature=0.0,
-                           cache_impl=impl)
+            model.generate(inp, max_new_tokens=4, temperature=0.0, cache_impl=impl)
             for _ in range(reps):
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                model.generate(inp, max_new_tokens=1, temperature=0.0,
-                               cache_impl=impl)
+                model.generate(inp, max_new_tokens=1, temperature=0.0, cache_impl=impl)
                 torch.cuda.synchronize()
                 t_pref = time.perf_counter() - t0
                 t0 = time.perf_counter()
-                model.generate(inp, max_new_tokens=new_tokens,
-                               temperature=0.0, cache_impl=impl)
+                model.generate(
+                    inp, max_new_tokens=new_tokens, temperature=0.0, cache_impl=impl
+                )
                 torch.cuda.synchronize()
                 t_full = time.perf_counter() - t0
-                vals.append(
-                    bs * (new_tokens - 1) / max(t_full - t_pref, 1e-6))
+                vals.append(bs * (new_tokens - 1) / max(t_full - t_pref, 1e-6))
         return statistics.median(vals)
 
     results = {"gpu": gpu_name}
@@ -3694,9 +4204,12 @@ def _bench_graphs_impl(
         graphs = _timed(bs, "static")
         latent = _timed(bs, "latent")
         results[f"b{bs}"] = {"graphs_tps": graphs, "latent_tps": latent}
-        print(f"  b{bs:>3}: graphs {graphs:8.1f} tok/s | "
-              f"latent(compiled) {latent:8.1f} tok/s | "
-              f"x{graphs / max(latent, 1e-9):.1f}", flush=True)
+        print(
+            f"  b{bs:>3}: graphs {graphs:8.1f} tok/s | "
+            f"latent(compiled) {latent:8.1f} tok/s | "
+            f"x{graphs / max(latent, 1e-9):.1f}",
+            flush=True,
+        )
     return results
 
 
@@ -3709,23 +4222,32 @@ _BENCH_GRAPHS_ARGS = dict(
 
 
 @app.function(gpu="A100-80GB", **_BENCH_GRAPHS_ARGS)
-def bench_graphs_a100(step: str = "latest", batches: str = "1,8,32",
-                      new_tokens: int = 64,
-                      hf_repo: str = "HallD/osrt-v6-ckpt") -> dict:
+def bench_graphs_a100(
+    step: str = "latest",
+    batches: str = "1,8,32",
+    new_tokens: int = 64,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
     return _bench_graphs_impl(step, batches, new_tokens, hf_repo)
 
 
 @app.function(gpu="H100", **_BENCH_GRAPHS_ARGS)
-def bench_graphs_h100(step: str = "latest", batches: str = "1,8,32",
-                      new_tokens: int = 64,
-                      hf_repo: str = "HallD/osrt-v6-ckpt") -> dict:
+def bench_graphs_h100(
+    step: str = "latest",
+    batches: str = "1,8,32",
+    new_tokens: int = 64,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
     return _bench_graphs_impl(step, batches, new_tokens, hf_repo)
 
 
 @app.function(gpu="B200", **_BENCH_GRAPHS_ARGS)
-def bench_graphs_b200(step: str = "latest", batches: str = "1,8,32",
-                      new_tokens: int = 64,
-                      hf_repo: str = "HallD/osrt-v6-ckpt") -> dict:
+def bench_graphs_b200(
+    step: str = "latest",
+    batches: str = "1,8,32",
+    new_tokens: int = 64,
+    hf_repo: str = "HallD/osrt-v6-ckpt",
+) -> dict:
     return _bench_graphs_impl(step, batches, new_tokens, hf_repo)
 
 
@@ -3759,19 +4281,24 @@ def bench_batch_scaling(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
-    print(f"GPU: {torch.cuda.get_device_name(0)} | pulling {name}...",
-          flush=True)
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
+    print(f"GPU: {torch.cuda.get_device_name(0)} | pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -3779,10 +4306,11 @@ def bench_batch_scaling(
     model.load_state_dict(sd, strict=False)
     model.optimize_for_inference()  # dynamic compile; no graphs needed here
 
-    prompt = ([tok.bos_token_id]
-              + tok.encode("Problem: A shop sells pencils at 12p each and "
-                           "pens at 30p each. Tom buys 4 pencils and 2 pens.",
-                           add_special_tokens=False))
+    prompt = [tok.bos_token_id] + tok.encode(
+        "Problem: A shop sells pencils at 12p each and "
+        "pens at 30p each. Tom buys 4 pencils and 2 pens.",
+        add_special_tokens=False,
+    )
 
     results = {}
     for bs in (int(b) for b in batches.split(",")):
@@ -3797,17 +4325,19 @@ def bench_batch_scaling(
                 torch.cuda.synchronize()
                 t_pref = time.perf_counter() - t0
                 t0 = time.perf_counter()
-                model.generate(inp, max_new_tokens=new_tokens,
-                               temperature=temperature)
+                model.generate(inp, max_new_tokens=new_tokens, temperature=temperature)
                 torch.cuda.synchronize()
                 t_full = time.perf_counter() - t0
-                vals.append(
-                    bs * (new_tokens - 1) / max(t_full - t_pref, 1e-6))
+                vals.append(bs * (new_tokens - 1) / max(t_full - t_pref, 1e-6))
         med = statistics.median(vals)
-        results[bs] = {"agg_tok_per_sec": med,
-                       "vram_gb": torch.cuda.max_memory_allocated() / 1e9}
-        print(f"  b{bs:>4}: {med:8.1f} tok/s | peak VRAM "
-              f"{results[bs]['vram_gb']:.1f} GB", flush=True)
+        results[bs] = {
+            "agg_tok_per_sec": med,
+            "vram_gb": torch.cuda.max_memory_allocated() / 1e9,
+        }
+        print(
+            f"  b{bs:>4}: {med:8.1f} tok/s | peak VRAM {results[bs]['vram_gb']:.1f} GB",
+            flush=True,
+        )
     return results
 
 
@@ -3818,26 +4348,32 @@ def run_bench_batch_scaling(step: str = "latest", batches: str = "32,64,128,256"
     res = bench_batch_scaling.remote(step=step, batches=batches)
     print("\n=== ROLLOUT BATCH SCALING — H100, sampled, compiled-latent ===")
     for bs, r in res.items():
-        print(f"  b{bs}: {r['agg_tok_per_sec']:.1f} tok/s "
-              f"(VRAM {r['vram_gb']:.1f} GB)")
+        print(f"  b{bs}: {r['agg_tok_per_sec']:.1f} tok/s (VRAM {r['vram_gb']:.1f} GB)")
 
 
 @app.local_entrypoint()
 def run_bench_graphs(
-    gpu: str = "a100", step: str = "latest", batches: str = "1,8,32",
+    gpu: str = "a100",
+    step: str = "latest",
+    batches: str = "1,8,32",
 ):
     """Batched CUDA-graph throughput bench on a100|h100|b200 (blocking)."""
-    fn = {"a100": bench_graphs_a100, "h100": bench_graphs_h100,
-          "b200": bench_graphs_b200}[gpu.lower()]
+    fn = {
+        "a100": bench_graphs_a100,
+        "h100": bench_graphs_h100,
+        "b200": bench_graphs_b200,
+    }[gpu.lower()]
     print(f"Batched graphs bench on {gpu.upper()} (batches={batches})...")
     res = fn.remote(step=step, batches=batches)
     print(f"\n=== BATCHED GRAPHS THROUGHPUT — {res['gpu']} ===")
     for k, r in res.items():
         if k == "gpu":
             continue
-        print(f"  {k}: graphs {r['graphs_tps']:.1f} tok/s | "
-              f"latent {r['latent_tps']:.1f} | "
-              f"x{r['graphs_tps'] / max(r['latent_tps'], 1e-9):.1f}")
+        print(
+            f"  {k}: graphs {r['graphs_tps']:.1f} tok/s | "
+            f"latent {r['latent_tps']:.1f} | "
+            f"x{r['graphs_tps'] / max(r['latent_tps'], 1e-9):.1f}"
+        )
 
 
 @app.local_entrypoint()
@@ -3847,16 +4383,23 @@ def run_gate_cudagraph(step: str = "latest", new_tokens: int = 48):
     res = gate_cudagraph.remote(step=step, new_tokens=new_tokens)
     print("\n=== CUDA-GRAPH SEQUENCE-LEVEL QUALITY GATE ===")
     for ctx, r in res.items():
-        tag = ("IDENTICAL" if r["first_divergence"] is None
-               else f"diverges @ {r['first_divergence']}")
-        print(f"  ctx={ctx}: {tag} | match {r['match_frac']*100:.0f}% | "
-              f"min margin {r['min_margin']:.4f} | "
-              f"mean margin {r['mean_margin']:.3f}")
+        tag = (
+            "IDENTICAL"
+            if r["first_divergence"] is None
+            else f"diverges @ {r['first_divergence']}"
+        )
+        print(
+            f"  ctx={ctx}: {tag} | match {r['match_frac'] * 100:.0f}% | "
+            f"min margin {r['min_margin']:.4f} | "
+            f"mean margin {r['mean_margin']:.3f}"
+        )
 
 
 @app.local_entrypoint()
 def run_ab_static(
-    step: str = "latest", reps: int = 5, debug_capture: bool = False,
+    step: str = "latest",
+    reps: int = 5,
+    debug_capture: bool = False,
 ):
     """Paired latent-vs-static cache A/B + quality gate (blocking).
 
@@ -3868,12 +4411,16 @@ def run_ab_static(
     print(f"  latent: {res['latent_median_tps']:.1f} tok/s  {res['latent_all']}")
     print(f"  static: {res['static_median_tps']:.1f} tok/s  {res['static_all']}")
     if res.get("cudagraph_median_tps"):
-        print(f"  static+cudagraphs: {res['cudagraph_median_tps']:.1f} tok/s "
-              f"{res['cudagraph_all']}")
+        print(
+            f"  static+cudagraphs: {res['cudagraph_median_tps']:.1f} tok/s "
+            f"{res['cudagraph_all']}"
+        )
     else:
         print(f"  static+cudagraphs FAILED: {res.get('cudagraph_error')}")
-    print(f"  first-step logit max|Δ|: {res['step_logit_max_abs']:.4g} "
-          f"(top1 match: {res['step_top1_match']})")
+    print(
+        f"  first-step logit max|Δ|: {res['step_logit_max_abs']:.4g} "
+        f"(top1 match: {res['step_top1_match']})"
+    )
     print(f"  greedy first-divergence: {res['greedy_first_divergence']}")
 
 
@@ -3887,13 +4434,17 @@ def run_ab_prepack(step: str = "latest", reps: int = 5):
     print(f"  packed:   {ab['packed_median_tps']:.1f} tok/s  {ab['packed_all']}")
     print(f"  unpacked: {ab['unpacked_median_tps']:.1f} tok/s  {ab['unpacked_all']}")
     for k, p in profs.items():
-        print(f"  {k}: gpu_busy {p['gpu_busy_ms_per_tok']:.1f} ms/tok, "
-              f"{p['kernel_launches_per_tok']} launches/tok, "
-              f"restack={p['restack_kernels'] or 'NONE'}")
+        print(
+            f"  {k}: gpu_busy {p['gpu_busy_ms_per_tok']:.1f} ms/tok, "
+            f"{p['kernel_launches_per_tok']} launches/tok, "
+            f"restack={p['restack_kernels'] or 'NONE'}"
+        )
     print("  ctx sweep (packed):")
     for ctx, r in sweep.items():
-        print(f"    ctx={ctx}: wall {r['wall_ms_per_tok']:.1f} | "
-              f"gpu {r['gpu_busy_ms_per_tok']:.1f} ms/tok")
+        print(
+            f"    ctx={ctx}: wall {r['wall_ms_per_tok']:.1f} | "
+            f"gpu {r['gpu_busy_ms_per_tok']:.1f} ms/tok"
+        )
 
 
 @app.function(
@@ -3941,18 +4492,24 @@ def verify_compile_identity(
     from osrt.presets import build_config
 
     files = HfApi().list_repo_files(hf_repo, repo_type="model")
-    ckpts = [f for f in files
-             if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)]
-    name = (max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
-            if step == "latest"
-            else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f)))
+    ckpts = [
+        f for f in files if re.match(r"osrt_v5_midtrain3_(?:rescue_)?step_\d+\.pt$", f)
+    ]
+    name = (
+        max(ckpts, key=lambda f: int(re.search(r"step_(\d+)", f).group(1)))
+        if step == "latest"
+        else next(f for f in ckpts if re.search(rf"step_{step}\.pt$", f))
+    )
     print(f"pulling {name}...", flush=True)
     path = hf_hub_download(hf_repo, name, repo_type="model")
     tok = AutoTokenizer.from_pretrained("/root/v6_tokenizer_export")
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     device = torch.device("cuda")
     model = OSRTForCausalLM(cfg).to(device).eval()
@@ -3965,17 +4522,24 @@ def verify_compile_identity(
         inp = torch.tensor([ids], device=device)
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model.generate(inp, max_new_tokens=max_new_tokens, temperature=0.0)
-        return out[0, len(ids):].tolist()
+        return out[0, len(ids) :].tolist()
 
     # Fixed held-out math batches (same for eager + compiled) for the ppl gate.
     loader = make_loader(
-        dataset_configs=[{
-            "name": "nemotron-cc-math-heldout",
-            "hf_id": "nvidia/Nemotron-CC-Math-v1", "hf_config": "4plus",
-            "weight": 1.0, "skip": 2_000_000,
-        }],
-        seq_len=4096, tokenizer_name="/root/v6_tokenizer_export",
-        batch_size=4, step_num=999999, num_workers=0,
+        dataset_configs=[
+            {
+                "name": "nemotron-cc-math-heldout",
+                "hf_id": "nvidia/Nemotron-CC-Math-v1",
+                "hf_config": "4plus",
+                "weight": 1.0,
+                "skip": 2_000_000,
+            }
+        ],
+        seq_len=4096,
+        tokenizer_name="/root/v6_tokenizer_export",
+        batch_size=4,
+        step_num=999999,
+        num_workers=0,
     )
     it = iter(loader)
     ppl_batches = [next(it) for _ in range(12)]
@@ -3993,10 +4557,14 @@ def verify_compile_identity(
         return math.exp(min(tot_loss / max(tot_tok, 1), 20.0))
 
     fixed = torch.tensor(
-        [[tok.bos_token_id] + tok.encode(
-            "The Industrial Revolution was a period of major economic change "
-            "that began in Britain and spread across the world over decades.",
-            add_special_tokens=False)],
+        [
+            [tok.bos_token_id]
+            + tok.encode(
+                "The Industrial Revolution was a period of major economic change "
+                "that began in Britain and spread across the world over decades.",
+                add_special_tokens=False,
+            )
+        ],
         device=device,
     )
     # EAGER pass first (before compile is wired).
@@ -4033,9 +4601,12 @@ def verify_compile_identity(
         "compiled_ppl": comp_ppl,
         "greedy": gen_report,
     }
-    print(f"\n  forward: max|Δlogit|={max_abs:.4g}  top1_agree={top1_agree*100:.3f}%"
-          f"\n  ppl: eager={eager_ppl:.4f}  compiled={comp_ppl:.4f}  "
-          f"Δ={comp_ppl - eager_ppl:+.4f}", flush=True)
+    print(
+        f"\n  forward: max|Δlogit|={max_abs:.4g}  top1_agree={top1_agree * 100:.3f}%"
+        f"\n  ppl: eager={eager_ppl:.4f}  compiled={comp_ppl:.4f}  "
+        f"Δ={comp_ppl - eager_ppl:+.4f}",
+        flush=True,
+    )
     return res
 
 
@@ -4046,13 +4617,17 @@ def run_verify_compile(step: str = "latest", max_new_tokens: int = 64):
     res = verify_compile_identity.remote(step=step, max_new_tokens=max_new_tokens)
     print("\n=== COMPILE QUALITY GATE ===")
     print(f"  forward max|Δlogit|:   {res['forward_max_abs_logit_diff']:.4g}")
-    print(f"  forward top-1 agree:   {res['forward_top1_agreement']*100:.3f}%")
-    print(f"  held-out math ppl:     eager={res['eager_ppl']:.4f}  "
-          f"compiled={res['compiled_ppl']:.4f}  "
-          f"Δ={res['compiled_ppl'] - res['eager_ppl']:+.4f}")
+    print(f"  forward top-1 agree:   {res['forward_top1_agreement'] * 100:.3f}%")
+    print(
+        f"  held-out math ppl:     eager={res['eager_ppl']:.4f}  "
+        f"compiled={res['compiled_ppl']:.4f}  "
+        f"Δ={res['compiled_ppl'] - res['eager_ppl']:+.4f}"
+    )
     ident = sum(1 for r in res["greedy"].values() if r["first_divergence"] is None)
-    print(f"  greedy identical:      {ident}/{len(res['greedy'])} prompts "
-          f"(free-gen amplifies bf16 flips; not a quality metric)")
+    print(
+        f"  greedy identical:      {ident}/{len(res['greedy'])} prompts "
+        f"(free-gen amplifies bf16 flips; not a quality metric)"
+    )
 
 
 @app.local_entrypoint()
@@ -4064,15 +4639,24 @@ def run_sft_eval(step: str = "final", n: int = 100, max_new_tokens: int = 768):
     into <|answer|> (400 truncated it at step_200, reading format_ok=0).
     Compare acc_delta_on_minus_off vs SFT-v1's +0.02 (acc_on 0.06/off 0.04).
     """
-    name = ("osrt_v5_sft_v2_final.pt" if step == "final"
-            else f"osrt_v5_sft_v2_step_{step}.pt")
+    name = (
+        "osrt_v5_sft_v2_final.pt"
+        if step == "final"
+        else f"osrt_v5_sft_v2_step_{step}.pt"
+    )
     print(f"Evaluating {name} (n={n}, max_new={max_new_tokens}) on H100...")
     res = sft_eval.remote(name, n, max_new_tokens)
     print("\n=== RESULT ===")
-    for k in ("sft_eval/acc_on", "sft_eval/acc_off",
-              "sft_eval/acc_delta_on_minus_off", "sft_eval/format_ok_on",
-              "sft_eval/format_ok_off", "sft_eval/resp_len_on",
-              "sft_eval/resp_len_off", "sft_eval/n"):
+    for k in (
+        "sft_eval/acc_on",
+        "sft_eval/acc_off",
+        "sft_eval/acc_delta_on_minus_off",
+        "sft_eval/format_ok_on",
+        "sft_eval/format_ok_off",
+        "sft_eval/resp_len_on",
+        "sft_eval/resp_len_off",
+        "sft_eval/n",
+    ):
         print(f"  {k}: {res.get(k)}")
 
 
@@ -4101,6 +4685,7 @@ def midtrain2():
     """v6 midtrain phase 2: ~4000 more steps, reasoning-heavy mix, fresh
     re-warm cosine from midtrain_final. See MidtrainExtendConfig."""
     from osrt.train_config import MidtrainExtendConfig
+
     _run_midtrain(MidtrainExtendConfig)
 
 
@@ -4122,6 +4707,7 @@ def midtrain2_sanity():
     """30-step probe: native-HRA loads clean from midtrain_final, reweighted
     mix streams, VRAM fits at seq 4096. See MidtrainExtendSanityConfig."""
     from osrt.train_config import MidtrainExtendSanityConfig
+
     _run_midtrain(MidtrainExtendSanityConfig)
 
 
@@ -4142,11 +4728,17 @@ def run_midtrain2_sanity():
 
 
 @app.function(
-    gpu="H100", image=image,
-    volumes={"/vol/checkpoints": vol, "/vol/tokenizer": v6_tokenizer_vol,
-             "/vol/hf_cache": hf_cache_vol},
-    secrets=[modal.Secret.from_name("wandb-secret"),
-             modal.Secret.from_name("hf-secret")],
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def midtrain3():
@@ -4154,20 +4746,28 @@ def midtrain3():
     ~1x Chinchilla), chained across monthly workspaces. Resumes from the
     highest midtrain3 checkpoint each run. See MidtrainExtend3Config."""
     from osrt.train_config import MidtrainExtend3Config
+
     _run_midtrain(MidtrainExtend3Config)
 
 
 @app.function(
-    gpu="H100", image=image,
-    volumes={"/vol/checkpoints": vol, "/vol/tokenizer": v6_tokenizer_vol,
-             "/vol/hf_cache": hf_cache_vol},
-    secrets=[modal.Secret.from_name("wandb-secret"),
-             modal.Secret.from_name("hf-secret")],
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": v6_tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def midtrain3_sanity():
     """30-step midtrain3 probe: clean load of step_1750, mix streams."""
     from osrt.train_config import MidtrainExtend3SanityConfig
+
     _run_midtrain(MidtrainExtend3SanityConfig)
 
 
@@ -4343,9 +4943,9 @@ def loop_fix_sanity_inner():
     """Body of the 50-step sanity smoke test for loop_fix.
     Shared between the real sanity stage and any future ad-hoc test.
     """
-    import os
     import modal as _modal
     from transformers import AutoTokenizer
+
     from osrt.config import OSRTConfig
     from osrt.train import run_pretrain_extend
     from osrt.train_config import LoopFixConfig
@@ -4363,20 +4963,24 @@ def loop_fix_sanity_inner():
         ckpt_interval = 999_999
         eval_interval = 999_999
         wandb_log = False
-        compile_enabled = False      # fast first-step events
+        compile_enabled = False  # fast first-step events
 
     sanity_cfg = SanityLoopFix()
     sanity_cfg.phases["extend"]["end"] = 50
     sanity_cfg.phases["extend"]["batch_size"] = 4
     sanity_cfg.phases["extend"]["grad_accum_steps"] = 16
     model_config = OSRTConfig(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         aux_loop_loss_weight=sanity_cfg.aux_loop_loss_weight,
     )
-    print(f"loop_fix SANITY: 50 steps from extend2_final, "
-          f"aux_loop_loss_weight={sanity_cfg.aux_loop_loss_weight}.")
+    print(
+        f"loop_fix SANITY: 50 steps from extend2_final, "
+        f"aux_loop_loss_weight={sanity_cfg.aux_loop_loss_weight}."
+    )
     run_pretrain_extend(model_config, sanity_cfg, vol, "/vol/tokenizer")
 
 
@@ -4425,9 +5029,9 @@ def loop_fix_sanity():
 def loop_fix_v2():
     """Stacked architecture fixes (aux + dropout + curriculum +
     per-loop weights) from loop_fix's final ckpt."""
-    import os
     import modal as _modal
     from transformers import AutoTokenizer
+
     from osrt.config import OSRTConfig
     from osrt.train import run_pretrain_extend
     from osrt.train_config import LoopFixV2Config
@@ -4448,8 +5052,10 @@ def loop_fix_v2():
     cfg.pretrained_checkpoint = "/vol/checkpoints/v5/osrt_v5_loopfix_step_400.pt"
 
     model_config = OSRTConfig(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         # All three architecture-fix knobs go through the model config:
         aux_loop_loss_weight=cfg.aux_loop_loss_weight,
@@ -4486,9 +5092,9 @@ def loop_fix_v2():
 )
 def loop_fix_v2_sanity():
     """50-step sanity for loop_fix_v2 stacked-fix run."""
-    import os
     import modal as _modal
     from transformers import AutoTokenizer
+
     from osrt.config import OSRTConfig
     from osrt.train import run_pretrain_extend
     from osrt.train_config import LoopFixV2Config
@@ -4518,8 +5124,10 @@ def loop_fix_v2_sanity():
     cfg.phases["extend"]["batch_size"] = 4
     cfg.phases["extend"]["grad_accum_steps"] = 16
     model_config = OSRTConfig(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         aux_loop_loss_weight=cfg.aux_loop_loss_weight,
         per_loop_aux_weights=cfg.per_loop_aux_weights,
@@ -4567,9 +5175,9 @@ def pretrain_extend3():
     permanently in the loss path. Same 9-stream extend2 mix, softer
     fix knobs (aux=0.05, dropout=0.10), lower LR (peak 3e-6), 3000
     steps from loopfixv2_merged.pt."""
-    import os
     import modal as _modal
     from transformers import AutoTokenizer
+
     from osrt.config import OSRTConfig
     from osrt.train import run_pretrain_extend
     from osrt.train_config import PretrainExtend3Config
@@ -4584,8 +5192,10 @@ def pretrain_extend3():
     cfg.phases["extend"]["grad_accum_steps"] = 16
 
     model_config = OSRTConfig(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         aux_loop_loss_weight=cfg.aux_loop_loss_weight,
         per_loop_aux_weights=cfg.per_loop_aux_weights,
@@ -4621,9 +5231,9 @@ def pretrain_extend3():
 )
 def pretrain_extend3_sanity():
     """50-step sanity for pretrain_extend3."""
-    import os
     import modal as _modal
     from transformers import AutoTokenizer
+
     from osrt.config import OSRTConfig
     from osrt.train import run_pretrain_extend
     from osrt.train_config import PretrainExtend3Config
@@ -4649,8 +5259,10 @@ def pretrain_extend3_sanity():
     cfg.phases["extend"]["batch_size"] = 4
     cfg.phases["extend"]["grad_accum_steps"] = 16
     model_config = OSRTConfig(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         aux_loop_loss_weight=cfg.aux_loop_loss_weight,
         per_loop_aux_weights=cfg.per_loop_aux_weights,
@@ -4697,8 +5309,10 @@ def mopd():
     before launching). 1000 steps, peak_lr 1.5e-6, aux fix knobs at
     extend3 levels."""
     import os
+
     import modal as _modal
     from transformers import AutoTokenizer
+
     from osrt.config import OSRTConfig
     from osrt.train import run_pretrain_extend
     from osrt.train_config import MOPDConfig
@@ -4716,8 +5330,10 @@ def mopd():
     cfg.phases["extend"]["seq_len"] = 1024
 
     model_config = OSRTConfig(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         aux_loop_loss_weight=cfg.aux_loop_loss_weight,
         per_loop_aux_weights=cfg.per_loop_aux_weights,
@@ -4758,8 +5374,10 @@ def mopd():
 def mopd_sanity():
     """30-step MOPD sanity validating the rollout loader path."""
     import os
+
     import modal as _modal
     from transformers import AutoTokenizer
+
     from osrt.config import OSRTConfig
     from osrt.train import run_pretrain_extend
     from osrt.train_config import MOPDConfig
@@ -4789,8 +5407,10 @@ def mopd_sanity():
     cfg.phases["extend"]["grad_accum_steps"] = 16
     cfg.phases["extend"]["seq_len"] = 1024
     model_config = OSRTConfig(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         aux_loop_loss_weight=cfg.aux_loop_loss_weight,
         per_loop_aux_weights=cfg.per_loop_aux_weights,
@@ -4865,8 +5485,10 @@ def system_sft_sanity():
 
 def _run_system_sft(sanity: bool = False) -> None:
     import os
+
     import modal as _modal
     from transformers import AutoTokenizer
+
     from osrt.config import OSRTConfig
     from osrt.train import run_pretrain_extend
     from osrt.train_config import SystemSFTConfig
@@ -4896,8 +5518,10 @@ def _run_system_sft(sanity: bool = False) -> None:
     cfg.phases["extend"]["seq_len"] = 1536
 
     model_config = OSRTConfig(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         aux_loop_loss_weight=cfg.aux_loop_loss_weight,
         per_loop_aux_weights=cfg.per_loop_aux_weights,
@@ -4990,17 +5614,17 @@ def pretrain_extend2_sanity():
         # first-forward-pass) resumes from osrt_v5_grpo_final.pt.
         # Swapping to the pre-GRPO sft_math ckpt for sanity isolates
         # whether the GRPO checkpoint itself is the trigger.
-        pretrained_checkpoint = (
-            "/vol/checkpoints/v5/osrt_v5_sft_math_final.pt"
-        )
+        pretrained_checkpoint = "/vol/checkpoints/v5/osrt_v5_sft_math_final.pt"
 
     sanity_cfg = SanityCfg()
     sanity_cfg.phases["extend"]["end"] = 50
     # Datasets now live in PretrainExtend2Config; sanity inherits
     # the locked 9-stream working mix verified via v9-v25 bisection.
 
-    print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
-          "validating all streams + format functions.")
+    print(
+        "pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
+        "validating all streams + format functions."
+    )
     print(f"Resume base: {sanity_cfg.pretrained_checkpoint}")
 
     run_pretrain_extend(model_config, sanity_cfg, vol, tokenizer_name)
@@ -5104,14 +5728,14 @@ def sanity():
         f"{train_cfg.router_gumbel_tau_final} over "
         f"{train_cfg.router_gumbel_anneal_steps} steps"
     )
-    print(
-        f"  early_stop_step     : {train_cfg.early_stop_check_step} "
-        f"(disabled)"
-    )
+    print(f"  early_stop_step     : {train_cfg.early_stop_check_step} (disabled)")
     print()
 
     run_training(
-        model_config, train_cfg, vol, tokenizer_path,
+        model_config,
+        train_cfg,
+        vol,
+        tokenizer_path,
         # Loop-level bias + raw-router aux validation. Bias is now
         # shaped recursive_loops × num_routed_experts (was block-level),
         # so loop-specific imbalances can't cancel in aggregate. Aux
@@ -5205,9 +5829,11 @@ def sweep():
 
     for sc in sweep_configs:
         print("=" * 60)
-        print(f"SWEEP RUN {sc['name']}: "
-              f"aux={sc['aux_coeff']}, "
-              f"tau={sc['tau_init']}→0 over {sc['anneal_steps']}")
+        print(
+            f"SWEEP RUN {sc['name']}: "
+            f"aux={sc['aux_coeff']}, "
+            f"tau={sc['tau_init']}→0 over {sc['anneal_steps']}"
+        )
         print("=" * 60)
 
         model_config = OSRTConfig(
@@ -5230,7 +5856,10 @@ def sweep():
 
         os.makedirs(sc["ckpt_dir"], exist_ok=True)
         run_training(
-            model_config, cfg, vol, tokenizer_path,
+            model_config,
+            cfg,
+            vol,
+            tokenizer_path,
             ckpt_dir=sc["ckpt_dir"],
         )
         print(f"\n>>> Run {sc['name']} complete.\n")
@@ -5400,7 +6029,10 @@ def ablate():
 
         os.makedirs(cell["ckpt_dir"], exist_ok=True)
         run_training(
-            model_config, cfg, vol, tokenizer_path,
+            model_config,
+            cfg,
+            vol,
+            tokenizer_path,
             ckpt_dir=cell["ckpt_dir"],
         )
         print(f"\n>>> Cell {cell['name']} ({cell['label']}) complete.\n")
@@ -5504,6 +6136,7 @@ def sft_v1():
     """v6 SFT v1: system-prompt instruction tuning on midtrain_final.
     seq 2048, reasoning-conditioned <|system|> turns, ~2000 steps."""
     from osrt.train_config import SFTv1Config
+
     _run_sft_v1(SFTv1Config)
 
 
@@ -5524,6 +6157,7 @@ def sft_v1():
 def sft_v1_sanity():
     """30-step SFT-v1 gate: native-HRA load + <|system|> build + VRAM, no eval."""
     from osrt.train_config import SFTv1SanityConfig
+
     _run_sft_v1(SFTv1SanityConfig)
 
 
@@ -5886,8 +6520,7 @@ def evaluate(
     # the transcript dump bloats the JSON ~100×.
     log_samples = limit is not None
     print(
-        f"Running lm-eval on {task_list}... "
-        f"(limit={limit}, log_samples={log_samples})",
+        f"Running lm-eval on {task_list}... (limit={limit}, log_samples={log_samples})",
         flush=True,
     )
     results = simple_evaluate(
@@ -5953,10 +6586,10 @@ def evaluate(
     image=image,
     volumes={
         "/vol/checkpoints": vol,
-        "/vol/tokenizer": tokenizer_vol,        # v4 32K — v5 lineage
+        "/vol/tokenizer": tokenizer_vol,  # v4 32K — v5 lineage
         "/vol/tokenizer_v6": v6_tokenizer_vol,  # v6 65K contract
         "/vol/hf_cache": hf_cache_vol,
-        "/vol/rollouts": rollouts_vol,          # screened GRPO prompt file
+        "/vol/rollouts": rollouts_vol,  # screened GRPO prompt file
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -5964,8 +6597,7 @@ def evaluate(
     ],
     timeout=86400,
 )
-def grpo(config_name: str = "GRPOConfig",
-         tokenizer_path: str = "/vol/tokenizer"):
+def grpo(config_name: str = "GRPOConfig", tokenizer_path: str = "/vol/tokenizer"):
     """Run GRPO with verifiable math rewards.
 
     Parameterised by config so the v6 lineage can reuse this loop instead of
@@ -5987,12 +6619,12 @@ def grpo(config_name: str = "GRPOConfig",
     except ImportError:
         wandb = None
 
+    from osrt import train_config as _tc
     from osrt.config import OSRTConfig
     from osrt.hra import get_param_groups, inject_hra
     from osrt.model import OSRTForCausalLM
     from osrt.rewards import compute_group_advantages, compute_reward
     from osrt.train import apply_router_balance_updates, load_model_state_or_raise
-    from osrt import train_config as _tc
 
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -6003,9 +6635,9 @@ def grpo(config_name: str = "GRPOConfig",
     _sys_text = ""
     if getattr(cfg, "system_persona", ""):
         from osrt.system_prompts import get_by_name
+
         _sys_text = get_by_name(cfg.system_persona)
-        print(f"System persona: {cfg.system_persona} "
-              f"({len(_sys_text)} chars)")
+        print(f"System persona: {cfg.system_persona} ({len(_sys_text)} chars)")
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
 
     print("=" * 60)
@@ -6021,6 +6653,7 @@ def grpo(config_name: str = "GRPOConfig",
     # while everything else loaded fine.
     if getattr(cfg, "hra_native", False):
         from osrt.presets import build_config as _build_v6
+
         model_config = _build_v6(
             vocab_size=len(tok),
             real_vocab_size=len(tok),
@@ -6048,11 +6681,16 @@ def grpo(config_name: str = "GRPOConfig",
     # they still get the differential hra_lr.
     hra_params = []
     if getattr(cfg, "hra_native", False):
-        hra_params = [p for n, p in model.named_parameters()
-                      if "adapters_a" in n or "adapters_b" in n]
-        print(f"HRA is native — skipping inject_hra; found "
-              f"{len(hra_params)} adapter tensors "
-              f"({sum(p.numel() for p in hra_params):,} params) for hra_lr.")
+        hra_params = [
+            p
+            for n, p in model.named_parameters()
+            if "adapters_a" in n or "adapters_b" in n
+        ]
+        print(
+            f"HRA is native — skipping inject_hra; found "
+            f"{len(hra_params)} adapter tensors "
+            f"({sum(p.numel() for p in hra_params):,} params) for hra_lr."
+        )
     elif cfg.hra_enabled:
         print(f"Injecting HRA (rank={cfg.hra_rank})...")
         hra_params = inject_hra(model, rank=cfg.hra_rank)
@@ -6069,7 +6707,9 @@ def grpo(config_name: str = "GRPOConfig",
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt)
     load_model_state_or_raise(
-        model, state_dict, context=f"GRPO SFT load from {ckpt_path}",
+        model,
+        state_dict,
+        context=f"GRPO SFT load from {ckpt_path}",
     )
     print("  Clean load: all keys matched.")
 
@@ -6115,12 +6755,20 @@ def grpo(config_name: str = "GRPOConfig",
     # Optimizer
     if hra_params:
         param_groups = get_param_groups(
-            model, hra_params, cfg.peak_lr, cfg.hra_lr, cfg.weight_decay,
+            model,
+            hra_params,
+            cfg.peak_lr,
+            cfg.hra_lr,
+            cfg.weight_decay,
         )
         optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.peak_lr,
-                                       weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg.peak_lr,
+            weight_decay=cfg.weight_decay,
+            betas=(0.9, 0.95),
+        )
 
     # Prompt dataset
     print("Loading prompt dataset...")
@@ -6143,6 +6791,7 @@ def grpo(config_name: str = "GRPOConfig",
     ckpt_dir = "/vol/checkpoints/v5"
     os.makedirs(ckpt_dir, exist_ok=True)
     import glob as _glob
+
     best_grpo_step = -1
     best_grpo_ckpt: str | None = None
     for pattern in (
@@ -6154,20 +6803,19 @@ def grpo(config_name: str = "GRPOConfig",
                 s = int(f.rsplit("_", 1)[1].split(".")[0])
             except (ValueError, IndexError):
                 continue
-            if s > best_grpo_step or (
-                s == best_grpo_step and "rescue" in f
-            ):
+            if s > best_grpo_step or (s == best_grpo_step and "rescue" in f):
                 best_grpo_step = s
                 best_grpo_ckpt = f
 
     start_step = 0
     if best_grpo_step > 0 and best_grpo_ckpt is not None:
         print(
-            f"Found grpo checkpoint at step {best_grpo_step}: "
-            f"{best_grpo_ckpt}",
+            f"Found grpo checkpoint at step {best_grpo_step}: {best_grpo_ckpt}",
         )
         grpo_ckpt = torch.load(
-            best_grpo_ckpt, map_location=device, weights_only=True,
+            best_grpo_ckpt,
+            map_location=device,
+            weights_only=True,
         )
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         load_model_state_or_raise(
@@ -6208,7 +6856,8 @@ def grpo(config_name: str = "GRPOConfig",
             lr = cfg.peak_lr * eff_step / cfg.warmup_steps
         else:
             progress = (eff_step - cfg.warmup_steps) / max(
-                eff_total - cfg.warmup_steps, 1,
+                eff_total - cfg.warmup_steps,
+                1,
             )
             lr = cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
                 1 + math.cos(math.pi * progress)
@@ -6243,8 +6892,10 @@ def grpo(config_name: str = "GRPOConfig",
             # model off-distribution vs SFT and suppresses the <|think|> block
             # entirely (see GRPOv6Config.system_persona).
             if getattr(cfg, "system_persona", ""):
-                prompt_text = (f"{cfg.system_tag}{_sys_text}"
-                               f"{cfg.user_tag}{question}{cfg.assistant_tag}")
+                prompt_text = (
+                    f"{cfg.system_tag}{_sys_text}"
+                    f"{cfg.user_tag}{question}{cfg.assistant_tag}"
+                )
             else:
                 prompt_text = f"{cfg.user_tag}{question}{cfg.assistant_tag}"
             prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
@@ -6261,7 +6912,8 @@ def grpo(config_name: str = "GRPOConfig",
             # group_size samples in parallel at O(1) attention cost
             # per step.
             prompt_batch = prompt_tensor.expand(
-                cfg.group_size, -1,
+                cfg.group_size,
+                -1,
             ).contiguous()
             with torch.no_grad():
                 generated_batch = inner_for_gen.generate(
@@ -6276,7 +6928,7 @@ def grpo(config_name: str = "GRPOConfig",
             # completion region (inclusive) so downstream scoring and
             # policy log-prob computation don't see the EOS padding.
             comp_region_batch = generated_batch[:, prompt_len:]
-            eos_hits_2d = (comp_region_batch == tok.eos_token_id)
+            eos_hits_2d = comp_region_batch == tok.eos_token_id
             indices = torch.arange(eos_hits_2d.shape[1], device=generated_batch.device)
             masked_indices = torch.where(eos_hits_2d, indices, eos_hits_2d.shape[1])
             first_eos_indices = masked_indices.min(dim=1).values.tolist()
@@ -6284,7 +6936,9 @@ def grpo(config_name: str = "GRPOConfig",
             completions = []
             for row_idx, first_eos in enumerate(first_eos_indices):
                 if first_eos < eos_hits_2d.shape[1]:
-                    completions.append(generated_batch[row_idx, : prompt_len + first_eos + 1])
+                    completions.append(
+                        generated_batch[row_idx, : prompt_len + first_eos + 1]
+                    )
                 else:
                     completions.append(generated_batch[row_idx])
 
@@ -6300,7 +6954,8 @@ def grpo(config_name: str = "GRPOConfig",
                 )
                 comp_tokens = len(comp_ids) - prompt_len
                 reward, breakdown = compute_reward(
-                    comp_text, ground_truth,
+                    comp_text,
+                    ground_truth,
                     correctness_weight=cfg.correctness_reward,
                     format_weight=cfg.format_reward,
                     length_penalty=cfg.length_penalty,
@@ -6323,8 +6978,15 @@ def grpo(config_name: str = "GRPOConfig",
                 # can look healthy while the text is degenerate (that is what
                 # reward hacking looks like), so a human needs to see output.
                 if _accum == 0 and len(_samples) < 3:
-                    _samples.append((question, ground_truth, comp_text,
-                                     reward, bool(breakdown["correct"])))
+                    _samples.append(
+                        (
+                            question,
+                            ground_truth,
+                            comp_text,
+                            reward,
+                            bool(breakdown["correct"]),
+                        )
+                    )
             step_rewards.extend(rewards)
 
             advantages = compute_group_advantages(rewards)
@@ -6332,7 +6994,7 @@ def grpo(config_name: str = "GRPOConfig",
             for comp_ids, adv in zip(completions, advantages):
                 if abs(adv) < 1e-8:
                     continue
-                comp_ids = comp_ids[:cfg.seq_len].to(device)
+                comp_ids = comp_ids[: cfg.seq_len].to(device)
                 comp_len = len(comp_ids) - prompt_len
                 if comp_len <= 0:
                     continue
@@ -6340,23 +7002,27 @@ def grpo(config_name: str = "GRPOConfig",
                 # Policy log probs on the sampled completion
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     out = model(comp_ids.unsqueeze(0))
-                    logits = out.logits[0, :, :model_config.real_vocab_size].float()
-                shift_logits = logits[prompt_len - 1:-1]
+                    logits = out.logits[0, :, : model_config.real_vocab_size].float()
+                shift_logits = logits[prompt_len - 1 : -1]
                 shift_labels = comp_ids[prompt_len:]
-                policy_lp = F.log_softmax(shift_logits, dim=-1).gather(
-                    1, shift_labels.unsqueeze(1)
-                ).squeeze(1)
+                policy_lp = (
+                    F.log_softmax(shift_logits, dim=-1)
+                    .gather(1, shift_labels.unsqueeze(1))
+                    .squeeze(1)
+                )
 
                 # Reference log probs (frozen, no grad)
                 with torch.no_grad():
                     ref_out = ref_model(comp_ids.unsqueeze(0))
                     ref_logits = ref_out.logits[
-                        0, :, :model_config.real_vocab_size
+                        0, :, : model_config.real_vocab_size
                     ].float()
-                ref_shift = ref_logits[prompt_len - 1:-1]
-                ref_lp = F.log_softmax(ref_shift, dim=-1).gather(
-                    1, shift_labels.unsqueeze(1)
-                ).squeeze(1)
+                ref_shift = ref_logits[prompt_len - 1 : -1]
+                ref_lp = (
+                    F.log_softmax(ref_shift, dim=-1)
+                    .gather(1, shift_labels.unsqueeze(1))
+                    .squeeze(1)
+                )
 
                 # Direct policy gradient weighted by group-normalised advantage.
                 # Since we perform only one gradient step per sampled batch,
@@ -6389,30 +7055,39 @@ def grpo(config_name: str = "GRPOConfig",
             vram = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
             mean_kl = step_kl / max(step_total, 1)
-            print(f"step {step:>6d}/{cfg.total_steps} | loss {step_loss:.4f} | "
-                  f"reward {mean_reward:.3f} | acc {accuracy:.1%} | "
-                  f"kl {mean_kl:.4f} | lr {lr:.2e} | "
-                  f"vram {vram:.1f}GB | elapsed {elapsed:.0f}s")
+            print(
+                f"step {step:>6d}/{cfg.total_steps} | loss {step_loss:.4f} | "
+                f"reward {mean_reward:.3f} | acc {accuracy:.1%} | "
+                f"kl {mean_kl:.4f} | lr {lr:.2e} | "
+                f"vram {vram:.1f}GB | elapsed {elapsed:.0f}s"
+            )
             if use_wandb:
-                wandb.log({
-                    "grpo/loss": step_loss,
-                    "grpo/mean_reward": mean_reward,
-                    "grpo/accuracy": accuracy,
-                    "grpo/approx_kl": mean_kl,
-                    "grpo/lr": lr,
-                }, step=step)
+                wandb.log(
+                    {
+                        "grpo/loss": step_loss,
+                        "grpo/mean_reward": mean_reward,
+                        "grpo/accuracy": accuracy,
+                        "grpo/approx_kl": mean_kl,
+                        "grpo/lr": lr,
+                    },
+                    step=step,
+                )
 
         # ── Print real rollouts for a human vibe check ───────────────
         # Scalars cannot tell you the text has gone degenerate; reward hacking
         # shows up as a healthy curve over rubbish output.
         if _samples and step % getattr(cfg, "sample_print_interval", 10) == 0:
-            print(f"  ---- sample rollouts @ step {step} "
-                  f"(T={cfg.temperature}) ----", flush=True)
+            print(
+                f"  ---- sample rollouts @ step {step} (T={cfg.temperature}) ----",
+                flush=True,
+            )
             for si, (q, gt, comp, rw, ok) in enumerate(_samples):
                 q1 = " ".join(q.split())[:150]
                 c1 = " ".join(comp.split())[:400]
-                print(f"  [{si}] {'CORRECT' if ok else 'wrong  '} "
-                      f"reward {rw:+.2f} | gold {gt}")
+                print(
+                    f"  [{si}] {'CORRECT' if ok else 'wrong  '} "
+                    f"reward {rw:+.2f} | gold {gt}"
+                )
                 print(f"       Q: {q1}")
                 print(f"       A: {c1}", flush=True)
 
@@ -6423,31 +7098,42 @@ def grpo(config_name: str = "GRPOConfig",
         if _hi and step > 0 and step % _hi == 0:
             try:
                 from osrt.sft_eval import run_reasoning_eval
+
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     m = run_reasoning_eval(
-                        model, tok, device,
+                        model,
+                        tok,
+                        device,
                         n_problems=getattr(cfg, "heldout_eval_n", 50),
-                        max_new_tokens=cfg.max_gen_len, batch_size=32,
+                        max_new_tokens=cfg.max_gen_len,
+                        batch_size=32,
                         repetition_penalty=1.2,
                     )
-                print(f"  HELD-OUT GSM8K @ step {step}: "
-                      f"acc_on {100 * m['sft_eval/acc_on']:.1f}%  "
-                      f"acc_off {100 * m['sft_eval/acc_off']:.1f}%  "
-                      f"delta {100 * m['sft_eval/acc_delta_on_minus_off']:+.1f}pp  "
-                      f"fmt {100 * m['sft_eval/format_ok_on']:.0f}%", flush=True)
+                print(
+                    f"  HELD-OUT GSM8K @ step {step}: "
+                    f"acc_on {100 * m['sft_eval/acc_on']:.1f}%  "
+                    f"acc_off {100 * m['sft_eval/acc_off']:.1f}%  "
+                    f"delta {100 * m['sft_eval/acc_delta_on_minus_off']:+.1f}pp  "
+                    f"fmt {100 * m['sft_eval/format_ok_on']:.0f}%",
+                    flush=True,
+                )
                 if use_wandb:
                     wandb.log(m, step=step)
                 model.train(True)
             except Exception as e:  # noqa: BLE001 — eval must never kill a run
-                print(f"  HELD-OUT eval FAILED ({type(e).__name__}: {e})",
-                      flush=True)
+                print(f"  HELD-OUT eval FAILED ({type(e).__name__}: {e})", flush=True)
 
         # Checkpoints
         if step > 0 and step % cfg.ckpt_interval == 0:
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            torch.save({"step": step, "model_state_dict": inner.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict()},
-                       f"{ckpt_dir}/osrt_v5_grpo_step_{step}.pt")
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": inner.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                f"{ckpt_dir}/osrt_v5_grpo_step_{step}.pt",
+            )
             vol.commit()
 
         # 23h safety. Filename includes the step so the resume scanner
@@ -6455,14 +7141,15 @@ def grpo(config_name: str = "GRPOConfig",
         # pretrain/sft).
         if time.time() - start_time > 82_800:
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            rescue_path = (
-                f"{ckpt_dir}/osrt_v5_grpo_rescue_step_{step}.pt"
+            rescue_path = f"{ckpt_dir}/osrt_v5_grpo_rescue_step_{step}.pt"
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": inner.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                rescue_path,
             )
-            torch.save({
-                "step": step,
-                "model_state_dict": inner.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }, rescue_path)
             vol.commit()
             print(f"\n23h boundary at step {step}. Rescue: {rescue_path}")
             if use_wandb:
@@ -6471,8 +7158,10 @@ def grpo(config_name: str = "GRPOConfig",
 
     # Final
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    torch.save({"model_state_dict": inner.state_dict(), "training_stage": "grpo"},
-               f"{ckpt_dir}/osrt_v5_grpo_final.pt")
+    torch.save(
+        {"model_state_dict": inner.state_dict(), "training_stage": "grpo"},
+        f"{ckpt_dir}/osrt_v5_grpo_final.pt",
+    )
     vol.commit()
     elapsed_h = (time.time() - start_time) / 3600
     print(f"\nGRPO complete. {cfg.total_steps} steps in {elapsed_h:.1f}h")
@@ -6588,8 +7277,10 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     print("=" * 60)
     print(f"  Envs: {dict(zip(cfg.env_names, cfg.env_weights))}")
     print(f"  Resume: {cfg.pretrained_checkpoint}")
-    print(f"  Steps: {cfg.total_steps}, group_size: {cfg.group_size}, "
-          f"max_gen_len: {cfg.max_gen_len}, kl_coeff: {cfg.kl_coeff}")
+    print(
+        f"  Steps: {cfg.total_steps}, group_size: {cfg.group_size}, "
+        f"max_gen_len: {cfg.max_gen_len}, kl_coeff: {cfg.kl_coeff}"
+    )
     print(f"  Stop token ids: {cfg.stop_token_ids}")
 
     # Model with architecture-fix knobs
@@ -6621,7 +7312,9 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt)
     load_model_state_or_raise(
-        model, state_dict, context=f"grpo_multi load from {ckpt_path}",
+        model,
+        state_dict,
+        context=f"grpo_multi load from {ckpt_path}",
     )
     print("  Clean load: all keys matched.")
 
@@ -6684,23 +7377,32 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         # = "hra" so the LR schedule below applies the hra_lr/peak_lr
         # cosine scaling instead of the default peak_lr scaling.
         optimizer = torch.optim.AdamW(
-            [{
-                "params": hra_params,
-                "lr": cfg.hra_lr,
-                "weight_decay": cfg.weight_decay,
-                "group_name": "hra",
-            }],
-            betas=(0.9, 0.95), eps=1e-8,
+            [
+                {
+                    "params": hra_params,
+                    "lr": cfg.hra_lr,
+                    "weight_decay": cfg.weight_decay,
+                    "group_name": "hra",
+                }
+            ],
+            betas=(0.9, 0.95),
+            eps=1e-8,
         )
     elif hra_params:
         param_groups = get_param_groups(
-            model, hra_params, cfg.peak_lr, cfg.hra_lr, cfg.weight_decay,
+            model,
+            hra_params,
+            cfg.peak_lr,
+            cfg.hra_lr,
+            cfg.weight_decay,
         )
         optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
     else:
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=cfg.peak_lr,
-            weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+            model.parameters(),
+            lr=cfg.peak_lr,
+            weight_decay=cfg.weight_decay,
+            betas=(0.9, 0.95),
         )
 
     # ──────────────────────────────────────────────────────────────
@@ -6726,6 +7428,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             except Exception:
                 pass
             return iter(ds)
+
         return _build
 
     for env_name in cfg.env_names:
@@ -6733,8 +7436,9 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         factory = _make_env_factory(env_name, ds_spec)
         env_ds_factories[env_name] = factory
         env_iters[env_name] = factory(seed=42)
-        print(f"  [{env_name}] loaded from {ds_spec['hf_id']} "
-              f"(split={ds_spec['split']})")
+        print(
+            f"  [{env_name}] loaded from {ds_spec['hf_id']} (split={ds_spec['split']})"
+        )
 
     def _next_example(env_name: str):
         """Get the next prompt + raw row from the env's iterator,
@@ -6772,16 +7476,21 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         return prompt_text, gt
 
     def _score_completion(
-        env_name: str, comp_text: str, gt: object,
+        env_name: str,
+        comp_text: str,
+        gt: object,
     ) -> tuple[float, dict]:
         """Env-aware reward dispatcher. Returns (total_reward, breakdown).
         All envs get compose_template_rewards (shared format signal);
         ifeval/mbpp add their env-specific reward on top."""
         if env_name == "math":
             return compose_template_rewards(
-                comp_text, ground_truth_answer=gt,
-                think_open=cfg.think_open, think_close=cfg.think_close,
-                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                comp_text,
+                ground_truth_answer=gt,
+                think_open=cfg.think_open,
+                think_close=cfg.think_close,
+                answer_open=cfg.answer_open,
+                answer_close=cfg.answer_close,
                 exact_format_reward=cfg.reward_exact_format,
                 approx_format_pos=cfg.reward_approx_format_pos,
                 approx_format_neg=cfg.reward_approx_format_neg,
@@ -6794,9 +7503,12 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             )
         if env_name == "ifeval":
             total, bd = compose_template_rewards(
-                comp_text, ground_truth_answer=None,
-                think_open=cfg.think_open, think_close=cfg.think_close,
-                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                comp_text,
+                ground_truth_answer=None,
+                think_open=cfg.think_open,
+                think_close=cfg.think_close,
+                answer_open=cfg.answer_open,
+                answer_close=cfg.answer_close,
                 exact_format_reward=cfg.reward_exact_format,
                 approx_format_pos=cfg.reward_approx_format_pos,
                 approx_format_neg=cfg.reward_approx_format_neg,
@@ -6807,7 +7519,8 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 comp_text,
                 instruction_id_list=gt["instruction_id_list"] if gt else None,
                 kwargs_list=gt["kwargs"] if gt else None,
-                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                answer_open=cfg.answer_open,
+                answer_close=cfg.answer_close,
             )
             total += ifeval_s
             bd["r_ifeval"] = ifeval_s
@@ -6818,9 +7531,12 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             return total, bd
         if env_name == "mbpp_code":
             total, bd = compose_template_rewards(
-                comp_text, ground_truth_answer=None,
-                think_open=cfg.think_open, think_close=cfg.think_close,
-                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                comp_text,
+                ground_truth_answer=None,
+                think_open=cfg.think_open,
+                think_close=cfg.think_close,
+                answer_open=cfg.answer_open,
+                answer_close=cfg.answer_close,
                 exact_format_reward=cfg.reward_exact_format,
                 approx_format_pos=cfg.reward_approx_format_pos,
                 approx_format_neg=cfg.reward_approx_format_neg,
@@ -6835,7 +7551,8 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             mbpp_s, mbpp_bd = mbpp_test_reward(
                 comp_text,
                 test_list=gt if isinstance(gt, list) else None,
-                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                answer_open=cfg.answer_open,
+                answer_close=cfg.answer_close,
                 allow_unsafe_exec=True,  # explicit opt-in
             )
             total += mbpp_s
@@ -6849,6 +7566,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     ckpt_dir = "/vol/checkpoints/v5"
     os.makedirs(ckpt_dir, exist_ok=True)
     import glob as _glob
+
     best_step = -1
     best_ckpt: str | None = None
     for pattern in (
@@ -6869,7 +7587,8 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         resume_ckpt = torch.load(best_ckpt, map_location=device, weights_only=True)
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         load_model_state_or_raise(
-            inner, resume_ckpt["model_state_dict"],
+            inner,
+            resume_ckpt["model_state_dict"],
             context=f"grpo_multi resume from {best_ckpt}",
         )
         try:
@@ -6890,10 +7609,14 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     # easier to interpret than a sliding window.
     cum_outcomes: dict[str, dict[str, int]] = {
         "math": {"exact": 0, "close": 0, "miss": 0},
-        "ifeval": {"constraints_hit": 0, "constraints_miss": 0,
-                   "no_answer": 0},
-        "mbpp_code": {"all_pass": 0, "all_fail": 0, "timeout": 0,
-                      "no_answer": 0, "other": 0},
+        "ifeval": {"constraints_hit": 0, "constraints_miss": 0, "no_answer": 0},
+        "mbpp_code": {
+            "all_pass": 0,
+            "all_fail": 0,
+            "timeout": 0,
+            "no_answer": 0,
+            "other": 0,
+        },
     }
 
     # Env sampler — weighted random, seeded so reruns are reproducible
@@ -6943,25 +7666,30 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                     stop_token_ids=list(cfg.stop_token_ids),
                 )
             comp = tok.decode(
-                gen[0, len(ids):].tolist(),
+                gen[0, len(ids) :].tolist(),
                 skip_special_tokens=False,
             )
-            ans = extract_answer_text(
-                comp,
-                answer_open=cfg.answer_open,
-                answer_close=cfg.answer_close,
-            ) or ""
+            ans = (
+                extract_answer_text(
+                    comp,
+                    answer_open=cfg.answer_open,
+                    answer_close=cfg.answer_close,
+                )
+                or ""
+            )
             # Lenient: substring match. Strict-format is the training
             # objective; this is generalization.
             hit = expected.lower() in ans.lower()
             if hit:
                 hits += 1
-            details.append({
-                "prompt": prompt_text,
-                "expected": expected,
-                "answer": ans[:120],
-                "hit": hit,
-            })
+            details.append(
+                {
+                    "prompt": prompt_text,
+                    "expected": expected,
+                    "answer": ans[:120],
+                    "hit": hit,
+                }
+            )
         return {
             "score": hits / len(ood_prompts),
             "total": len(ood_prompts),
@@ -6983,7 +7711,9 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         getattr(cfg, "troubleshoot_gen_interval", 0) or 0,
     )
     troubleshoot_prompt = getattr(
-        cfg, "troubleshoot_gen_prompt", "What is 17 * 23?",
+        cfg,
+        "troubleshoot_gen_prompt",
+        "What is 17 * 23?",
     )
 
     def _run_troubleshoot_gen(at_step: int) -> None:
@@ -7003,7 +7733,8 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 stop_token_ids=list(cfg.stop_token_ids),
             )
         completion = tok.decode(
-            gen[0, len(ids):].tolist(), skip_special_tokens=False,
+            gen[0, len(ids) :].tolist(),
+            skip_special_tokens=False,
         )
         print(
             f"\n  ── troubleshoot-gen @ step {at_step} (T={cfg.temperature}) ──",
@@ -7033,7 +7764,8 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             lr = cfg.peak_lr * eff_step / cfg.warmup_steps
         else:
             progress = (eff_step - cfg.warmup_steps) / max(
-                eff_total - cfg.warmup_steps, 1,
+                eff_total - cfg.warmup_steps,
+                1,
             )
             lr = cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
                 1 + math.cos(math.pi * progress)
@@ -7061,10 +7793,14 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         #   mbpp.all_pass / .partial / .all_fail / .timeout / .other
         step_env_outcomes: dict[str, dict[str, int]] = {
             "math": {"exact": 0, "close": 0, "miss": 0},
-            "ifeval": {"constraints_hit": 0, "constraints_miss": 0,
-                       "no_answer": 0},
-            "mbpp_code": {"all_pass": 0, "all_fail": 0, "timeout": 0,
-                          "no_answer": 0, "other": 0},
+            "ifeval": {"constraints_hit": 0, "constraints_miss": 0, "no_answer": 0},
+            "mbpp_code": {
+                "all_pass": 0,
+                "all_fail": 0,
+                "timeout": 0,
+                "no_answer": 0,
+                "other": 0,
+            },
         }
 
         for _accum in range(cfg.grad_accum_steps):
@@ -7074,7 +7810,9 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             prompt_text, gt = _build_prompt_and_gt(env_name, ex)
             prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
             prompt_tensor = torch.tensor(
-                [prompt_ids], dtype=torch.long, device=device,
+                [prompt_ids],
+                dtype=torch.long,
+                device=device,
             )
             prompt_len = len(prompt_ids)
 
@@ -7100,7 +7838,9 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 dtype=generated_batch.dtype,
             )
             comp_region_batch = generated_batch[:, prompt_len:]
-            stop_hits_2d = (comp_region_batch[:, :, None] == stop_ids_t[None, None, :]).any(dim=2)
+            stop_hits_2d = (
+                comp_region_batch[:, :, None] == stop_ids_t[None, None, :]
+            ).any(dim=2)
             indices = torch.arange(stop_hits_2d.shape[1], device=generated_batch.device)
             masked_indices = torch.where(stop_hits_2d, indices, stop_hits_2d.shape[1])
             first_hit_indices = masked_indices.min(dim=1).values.tolist()
@@ -7108,7 +7848,9 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             completions = []
             for row_idx, first_hit in enumerate(first_hit_indices):
                 if first_hit < stop_hits_2d.shape[1]:
-                    completions.append(generated_batch[row_idx, : prompt_len + first_hit + 1])
+                    completions.append(
+                        generated_batch[row_idx, : prompt_len + first_hit + 1]
+                    )
                 else:
                     completions.append(generated_batch[row_idx])
 
@@ -7137,11 +7879,11 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                     if verdict == "no_answer":
                         step_env_outcomes["ifeval"]["no_answer"] += 1
                     else:
-                        step_env_outcomes["ifeval"]["constraints_hit"] += (
-                            bd.get("ifeval_hits", 0)
+                        step_env_outcomes["ifeval"]["constraints_hit"] += bd.get(
+                            "ifeval_hits", 0
                         )
-                        step_env_outcomes["ifeval"]["constraints_miss"] += (
-                            bd.get("ifeval_misses", 0)
+                        step_env_outcomes["ifeval"]["constraints_miss"] += bd.get(
+                            "ifeval_misses", 0
                         )
                 elif env_name == "mbpp_code":
                     verdict = bd.get("mbpp_verdict", "")
@@ -7161,7 +7903,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             for comp_ids, adv in zip(completions, advantages):
                 if abs(adv) < 1e-8:
                     continue
-                comp_ids = comp_ids[:cfg.seq_len].to(device)
+                comp_ids = comp_ids[: cfg.seq_len].to(device)
                 comp_len = len(comp_ids) - prompt_len
                 if comp_len <= 0:
                     continue
@@ -7169,31 +7911,43 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     out = model(comp_ids.unsqueeze(0))
                     logits = out.logits[
-                        0, :, :model_config.real_vocab_size,
+                        0,
+                        :,
+                        : model_config.real_vocab_size,
                     ].float()
-                shift_logits = logits[prompt_len - 1:-1]
+                shift_logits = logits[prompt_len - 1 : -1]
                 shift_labels = comp_ids[prompt_len:]
-                policy_lp = F.log_softmax(shift_logits, dim=-1).gather(
-                    1, shift_labels.unsqueeze(1),
-                ).squeeze(1)
+                policy_lp = (
+                    F.log_softmax(shift_logits, dim=-1)
+                    .gather(
+                        1,
+                        shift_labels.unsqueeze(1),
+                    )
+                    .squeeze(1)
+                )
 
                 with torch.no_grad():
                     ref_out = ref_model(comp_ids.unsqueeze(0))
                     ref_logits = ref_out.logits[
-                        0, :, :model_config.real_vocab_size,
+                        0,
+                        :,
+                        : model_config.real_vocab_size,
                     ].float()
-                ref_shift = ref_logits[prompt_len - 1:-1]
-                ref_lp = F.log_softmax(ref_shift, dim=-1).gather(
-                    1, shift_labels.unsqueeze(1),
-                ).squeeze(1)
+                ref_shift = ref_logits[prompt_len - 1 : -1]
+                ref_lp = (
+                    F.log_softmax(ref_shift, dim=-1)
+                    .gather(
+                        1,
+                        shift_labels.unsqueeze(1),
+                    )
+                    .squeeze(1)
+                )
 
                 adv_t = torch.tensor(adv, device=device, dtype=torch.float32)
                 policy_loss = -(policy_lp * adv_t).mean()
                 log_ratio = ref_lp - policy_lp
                 approx_kl = (torch.exp(log_ratio) - log_ratio - 1).mean()
-                loss = (
-                    policy_loss + cfg.kl_coeff * approx_kl
-                ) / cfg.grad_accum_steps
+                loss = (policy_loss + cfg.kl_coeff * approx_kl) / cfg.grad_accum_steps
                 loss.backward()
                 step_loss += loss.item()
                 step_kl += approx_kl.item()
@@ -7216,9 +7970,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         )
         ema_overall.update(
             mean_reward_step,
-            **{
-                f"env_{n}": step_env_counts[n] for n in cfg.env_names
-            },
+            **{f"env_{n}": step_env_counts[n] for n in cfg.env_names},
         )
 
         # Logging
@@ -7234,7 +7986,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 f"step {step:>5d}/{cfg.total_steps} | "
                 f"loss {step_loss:.4f} | reward {mean_reward_step:+.3f} "
                 f"(ema {ema_overall.value:+.3f}) | "
-                f"kl {step_kl/n_rollouts:.4f} | lr {lr:.2e} | "
+                f"kl {step_kl / n_rollouts:.4f} | lr {lr:.2e} | "
                 f"vram {vram:.1f}GB | elapsed {elapsed:.0f}s",
                 flush=True,
             )
@@ -7244,7 +7996,8 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             )
             per_env_str = "  ".join(
                 f"{n}={ema_per_env[n].value:+.3f}"
-                if ema_per_env[n].value is not None else f"{n}=—"
+                if ema_per_env[n].value is not None
+                else f"{n}=—"
                 for n in cfg.env_names
             )
             print(f"           ema_reward_per_env: {per_env_str}", flush=True)
@@ -7255,9 +8008,7 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             m = cum_outcomes["math"]
             m_total = m["exact"] + m["close"] + m["miss"]
             m_rate = (m["exact"] / m_total) if m_total > 0 else 0.0
-            m_partial_rate = (
-                (m["exact"] + m["close"]) / m_total if m_total > 0 else 0.0
-            )
+            m_partial_rate = (m["exact"] + m["close"]) / m_total if m_total > 0 else 0.0
 
             i = cum_outcomes["ifeval"]
             i_attempted = i["constraints_hit"] + i["constraints_miss"]
@@ -7288,40 +8039,35 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 for n in cfg.env_names:
                     log_dict[f"grpo_multi/env_{n}_count"] = step_env_counts[n]
                     if ema_per_env[n].value is not None:
-                        log_dict[f"grpo_multi/env_{n}_ema_reward"] = (
-                            ema_per_env[n].value
-                        )
+                        log_dict[f"grpo_multi/env_{n}_ema_reward"] = ema_per_env[
+                            n
+                        ].value
                 # Capability success rates (cumulative)
-                log_dict.update({
-                    "grpo_multi/math_exact_rate": m_rate,
-                    "grpo_multi/math_partial_rate": m_partial_rate,
-                    "grpo_multi/math_total_rollouts": m_total,
-                    "grpo_multi/ifeval_constraint_hit_rate": i_rate,
-                    "grpo_multi/ifeval_constraints_attempted": i_attempted,
-                    "grpo_multi/mbpp_all_pass_rate": c_rate,
-                    "grpo_multi/mbpp_total_rollouts": c_total,
-                    "grpo_multi/mbpp_timeout_count": c["timeout"],
-                })
+                log_dict.update(
+                    {
+                        "grpo_multi/math_exact_rate": m_rate,
+                        "grpo_multi/math_partial_rate": m_partial_rate,
+                        "grpo_multi/math_total_rollouts": m_total,
+                        "grpo_multi/ifeval_constraint_hit_rate": i_rate,
+                        "grpo_multi/ifeval_constraints_attempted": i_attempted,
+                        "grpo_multi/mbpp_all_pass_rate": c_rate,
+                        "grpo_multi/mbpp_total_rollouts": c_total,
+                        "grpo_multi/mbpp_timeout_count": c["timeout"],
+                    }
+                )
                 wandb.log(log_dict, step=step)
 
         # ── Troubleshoot generation (every troubleshoot_interval steps) ──
         # Print a single rollout-temperature sample so we can SEE what
         # the model is producing during training. Cheaper than OOD probe.
-        if (
-            troubleshoot_interval > 0
-            and step > 0
-            and step % troubleshoot_interval == 0
-        ):
+        if troubleshoot_interval > 0 and step > 0 and step % troubleshoot_interval == 0:
             _run_troubleshoot_gen(step)
 
         # ── OOD probe (every cfg.ood_probe_interval steps) ──
         # Generalization check on a held-out set the policy is NOT
         # training on. Diverges from training-reward EMA when the
         # model starts reward-hacking.
-        if (
-            ood_interval > 0 and ood_prompts
-            and step > 0 and step % ood_interval == 0
-        ):
+        if ood_interval > 0 and ood_prompts and step > 0 and step % ood_interval == 0:
             probe = _run_ood_probe(step)
             print(
                 f"           ood_probe: {probe['hits']}/{probe['total']} "
@@ -7336,35 +8082,42 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                     flush=True,
                 )
             if use_wandb:
-                wandb.log({
-                    "grpo_multi/ood_score": probe["score"],
-                    "grpo_multi/ood_hits": probe["hits"],
-                    "grpo_multi/ood_total": probe["total"],
-                }, step=step)
+                wandb.log(
+                    {
+                        "grpo_multi/ood_score": probe["score"],
+                        "grpo_multi/ood_hits": probe["hits"],
+                        "grpo_multi/ood_total": probe["total"],
+                    },
+                    step=step,
+                )
 
         # Checkpoints
         if step > 0 and step % cfg.ckpt_interval == 0:
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
             ckpt_out = f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_step_{step}.pt"
-            torch.save({
-                "step": step,
-                "model_state_dict": inner.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }, ckpt_out)
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": inner.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                ckpt_out,
+            )
             vol.commit()
             print(f"  -> Checkpoint saved: {ckpt_out}", flush=True)
 
         # 23h safety
         if time.time() - start_time > 82_800:
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            rescue_path = (
-                f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_rescue_step_{step}.pt"
+            rescue_path = f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_rescue_step_{step}.pt"
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": inner.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                rescue_path,
             )
-            torch.save({
-                "step": step,
-                "model_state_dict": inner.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }, rescue_path)
             vol.commit()
             print(f"\n23h boundary at step {step}. Rescue: {rescue_path}")
             if use_wandb:
@@ -7373,14 +8126,19 @@ def _run_grpo_multi(sanity: bool = False) -> None:
 
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     final_out = f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_final.pt"
-    torch.save({
-        "model_state_dict": inner.state_dict(),
-        "training_stage": cfg.stage_prefix,
-    }, final_out)
+    torch.save(
+        {
+            "model_state_dict": inner.state_dict(),
+            "training_stage": cfg.stage_prefix,
+        },
+        final_out,
+    )
     vol.commit()
     elapsed_h = (time.time() - start_time) / 3600
-    print(f"\n{cfg.stage_prefix} complete. {cfg.total_steps} steps in "
-          f"{elapsed_h:.1f}h. Final ckpt: {final_out}")
+    print(
+        f"\n{cfg.stage_prefix} complete. {cfg.total_steps} steps in "
+        f"{elapsed_h:.1f}h. Final ckpt: {final_out}"
+    )
     if use_wandb:
         wandb.finish()
 
@@ -7393,21 +8151,20 @@ def _run_grpo_multi(sanity: bool = False) -> None:
 # =============================================================================
 # GRPO v6 — from the SFT-v4 soup. See GRPOv6Config for the measured settings.
 # =============================================================================
-@app.function(image=image, timeout=86400)   # must OUTLIVE the blocking
-                                           # grpo.remote() call it wraps
+@app.function(image=image, timeout=86400)  # must OUTLIVE the blocking
+# grpo.remote() call it wraps
 def grpo_v6():
     """Spawn-able v6 GRPO. Delegates to the shared loop with the v6 config and
     the 65K tokenizer (the default mount is the v4 32K one)."""
     grpo.remote(config_name="GRPOv6Config", tokenizer_path="/vol/tokenizer_v6")
 
 
-@app.function(image=image, timeout=86400)   # ditto
+@app.function(image=image, timeout=86400)  # ditto
 def grpo_v6_sanity():
     """30-step v6 GRPO probe — measures TRAINING-phase VRAM (policy + grads +
     optimiser state + reference copy for KL) and seconds/step at the real wave
     size. The rollout probes could not measure this."""
-    grpo.remote(config_name="GRPOv6SanityConfig",
-                tokenizer_path="/vol/tokenizer_v6")
+    grpo.remote(config_name="GRPOv6SanityConfig", tokenizer_path="/vol/tokenizer_v6")
 
 
 @app.local_entrypoint()
@@ -7519,6 +8276,8 @@ def main(stage: str = "pretrain"):
         "build_grpo_prompts": (build_grpo_prompts, REMOTE),
         "grpo_v6": (grpo_v6, SPAWN),
         "grpo_v6_sanity": (grpo_v6_sanity, SPAWN),
+        # v7 paid trunk is intentionally absent until roadmap gates close.
+        "v7_sanity": (v7_sanity, SPAWN),
     }
     entry = registry.get(stage)
     if entry is None:

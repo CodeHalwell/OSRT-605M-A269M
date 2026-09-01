@@ -4,6 +4,7 @@ SFT examples on REAL rows before a long training run.
 
 Run: HF_TOKEN=... PYTHONPATH=src python scripts/probe_sft_rows.py --n 10
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,13 +26,20 @@ DATASETS = [
     ("openhermes", "teknium/OpenHermes-2.5", None, "train", "openhermes", "off"),
     ("gsm8k", "openai/gsm8k", "main", "train", "gsm8k", "on"),
     ("numina_math", "AI-MO/NuminaMath-CoT", None, "train", "numina_math", "on"),
-    ("evol_code", "nickrosh/Evol-Instruct-Code-80k-v1", None, "train", "evol_code", "off"),
+    (
+        "evol_code",
+        "nickrosh/Evol-Instruct-Code-80k-v1",
+        None,
+        "train",
+        "evol_code",
+        "off",
+    ),
 ]
 
 
 def _clip(s: str, n: int = 220) -> str:
     s = (s or "").replace("\n", "\\n")
-    return s if len(s) <= n else s[:n] + f"…(+{len(s)-n} chars)"
+    return s if len(s) <= n else s[:n] + f"…(+{len(s) - n} chars)"
 
 
 def main() -> int:
@@ -40,16 +48,21 @@ def main() -> int:
     args = ap.parse_args()
 
     from datasets import load_dataset
+
     from osrt.sft_data import FORMAT_FN
 
     for name, repo, cfg, split, fmt, mode in DATASETS:
         print("\n" + "=" * 78)
-        print(f"{name}  [{repo}{'/'+cfg if cfg else ''}]  format={fmt}  reasoning={mode}")
+        repo_label = f"{repo}{'/' + cfg if cfg else ''}"
+        print(f"{name}  [{repo_label}]  format={fmt}  reasoning={mode}")
         print("=" * 78)
         fn = FORMAT_FN[fmt]
         try:
-            ds = (load_dataset(repo, cfg, split=split, streaming=True) if cfg
-                  else load_dataset(repo, split=split, streaming=True))
+            ds = (
+                load_dataset(repo, cfg, split=split, streaming=True)
+                if cfg
+                else load_dataset(repo, split=split, streaming=True)
+            )
         except Exception as e:
             print(f"  STREAM FAILED: {type(e).__name__}: {str(e)[:150]}")
             continue
@@ -58,7 +71,7 @@ def main() -> int:
         for row in ds:
             try:
                 q, r, a = fn(row)
-            except Exception as e:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 skipped += 1
                 continue
             if not q or not a:

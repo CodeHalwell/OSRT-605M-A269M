@@ -45,13 +45,11 @@ class OSRTConfig(PretrainedConfig):
         num_kv_heads: int | None = None,
         vocab_size: int = 32768,
         real_vocab_size: int = 32768,
-
         # Recursive structure (unchanged from v4)
         num_blocks: int = 3,
         recursive_loops: int = 6,
         adapter_rank: int = 16,
         adapter_alpha: float = 16.0,
-
         # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8). When
         # enabled the residual stream carries n_hc channels mixed per-token by
         # a doubly-stochastic (Birkhoff/Sinkhorn) matrix. use_mhc=False keeps
@@ -59,11 +57,9 @@ class OSRTConfig(PretrainedConfig):
         use_mhc: bool = False,
         n_hc: int = 4,
         mhc_sinkhorn_iters: int = 20,
-
         # SwiGLU stability clamp applied inside every expert (shared + routed).
         # None disables it (bit-identical to the un-clamped path).
         swiglu_clamp: float | None = None,
-
         # SiTU-GLU (Kimi K3 §2.3.2): a smooth-capped GLU that bounds both the
         # gate's linear factor and the up branch so |expert output| <=
         # situ_beta_gate * situ_beta_up. It is a differentiable alternative to
@@ -74,7 +70,6 @@ class OSRTConfig(PretrainedConfig):
         situ_glu: bool = False,
         situ_beta_gate: float = 4.0,
         situ_beta_up: float = 25.0,
-
         # Attention sink (ARCHITECTURE.md §6.6). When True, each RecursiveBlock
         # carries a per-head learnable sink logit that is added to the softmax
         # DENOMINATOR only (the sink has a zero "value", so it never contributes
@@ -82,14 +77,13 @@ class OSRTConfig(PretrainedConfig):
         # the head can attend to "nothing" when no key is relevant. False keeps
         # the exact F.scaled_dot_product_attention path (bit-identical to before).
         attention_sink: bool = False,
-
         # --- MoE (v5 architecture) ---
         # No dense FFN. Shared expert replaces it at larger hidden size.
         # 8 routed experts × hidden 2048, top-2 (Mixtral-style).
         num_routed_experts: int = 8,
         top_k_experts: int = 2,
-        expert_hidden: int = 2048,          # routed experts
-        shared_expert_hidden: int = 4096,   # shared expert (replaces dense FFN)
+        expert_hidden: int = 2048,  # routed experts
+        shared_expert_hidden: int = 4096,  # shared expert (replaces dense FFN)
         # B4: grouped-GEMM MoE dispatch. False → the per-expert .nonzero()
         # loop (correct, but the data-dependent .nonzero() is the ONLY
         # torch.compile graph break in the model). True → sort pairs by expert
@@ -97,7 +91,6 @@ class OSRTConfig(PretrainedConfig):
         # reference on CPU), dropless. Off by default; turn on for compiled
         # GPU training to get a fullgraph compile.
         moe_grouped_gemm: bool = False,
-
         # --- Routing (Switch-style + explicit load controller) ---
         # Balance loss: num_experts * sum(f_i * p_i) where
         #   f_i = fraction of tokens routed to expert i (hard assignment)
@@ -118,7 +111,6 @@ class OSRTConfig(PretrainedConfig):
         # pre-bias router logits while the explicit bias controller below
         # handles deployed clean-routing load.
         router_aux_loss_coeff: float = 0.10,
-
         # --- Router Z-loss (numerical safety + early router health) ---
         # Penalty on the router's pre-softmax log-partition:
         #   L_z = mean_token (logsumexp(router_logits))^2
@@ -129,7 +121,6 @@ class OSRTConfig(PretrainedConfig):
         # value is ~1e-3; small enough not to compete with task loss but
         # large enough to keep raw logit magnitudes O(1).
         router_z_loss_coeff: float = 1e-3,
-
         # --- Sequence-wise balance loss (DeepSeek-V3 §5.2) ---
         # Per-sequence Switch-style loss penalising imbalance INSIDE a
         # single sequence. Useful at long context where one document can
@@ -138,7 +129,6 @@ class OSRTConfig(PretrainedConfig):
         # When non-zero, a small value (1e-3 to 1e-2) is enough; the
         # global aux loss does the heavy lifting.
         router_seq_balance_loss_coeff: float = 0.0,
-
         # --- Per-loop auxiliary LM-head loss (architecture fix) ---
         # When > 0, an aux CE loss is computed on the hidden state at
         # the END of each recursive loop except the last one, by
@@ -152,7 +142,6 @@ class OSRTConfig(PretrainedConfig):
         # which is large enough to drive learning without overpowering
         # the primary objective. Set to 0 to disable.
         aux_loop_loss_weight: float = 0.0,
-
         # --- Per-loop aux weights (optional override) ---
         # If set (length must equal recursive_loops - 1), overrides
         # the uniform aux_loop_loss_weight with per-loop scaling. E.g.
@@ -161,7 +150,6 @@ class OSRTConfig(PretrainedConfig):
         # info and need more help to become useful). When None, all
         # intermediate loops are weighted uniformly by aux_loop_loss_weight.
         per_loop_aux_weights: list[float] | None = None,
-
         # --- Multi-Token Prediction heads (ARCHITECTURE.md §9.3, §11.4) ---
         # TRAINING-TIME auxiliary objective. In addition to the main +1
         # next-token prediction, mtp_heads extra heads predict tokens at
@@ -176,7 +164,6 @@ class OSRTConfig(PretrainedConfig):
         # Head k = 1..mtp_heads predicts the token at offset +(1+k).
         mtp_heads: int = 0,
         mtp_loss_weight: float = 0.3,
-
         # --- Memory: fused (chunked) linear-cross-entropy for aux/MTP heads ---
         # The per-loop aux heads and MTP heads each project the hidden state to
         # the full vocab and upcast to fp32 for CE. At the training batch/seq
@@ -189,7 +176,6 @@ class OSRTConfig(PretrainedConfig):
         # memory. 0 = OFF (bit-identical to the plain F.linear+CE path). The
         # main +1 head is unaffected (its logits are returned in the output).
         fused_cross_entropy_chunks: int = 0,
-
         # NOTE: gradient (activation) checkpointing is deliberately NOT a field
         # here. `gradient_checkpointing` is an HF-managed name on PretrainedConfig
         # /PreTrainedModel — setting config.gradient_checkpointing=True makes
@@ -198,7 +184,6 @@ class OSRTConfig(PretrainedConfig):
         # no-ops on others). Instead the trainer flips a private runtime gate
         # (OSRTModel._osrt_grad_ckpt) — see run_training. Making the HF mechanism
         # work is tracked under "HF tier-1 compliance".
-
         # --- Loop dropout (stochastic depth for recursive loops) ---
         # With probability loop_dropout_prob during training, truncate
         # the recursive loop chain to a random length in
@@ -210,7 +195,6 @@ class OSRTConfig(PretrainedConfig):
         # output some fraction of the time. Set prob=0 to disable.
         loop_dropout_prob: float = 0.0,
         loop_dropout_min_loops: int = 3,
-
         # --- Balance-bias controller (DeepSeek-style) ---
         # Per-expert additive bias applied to router logits as part of the
         # routing mechanism in both train and eval. Bias is per recursive loop
@@ -227,10 +211,24 @@ class OSRTConfig(PretrainedConfig):
         # imbalance. Since it is persistent and applied at eval, clean router
         # health means "router logits + loop-specific balance bias, no Gumbel".
         router_balance_bias_enabled: bool = True,
+        # Bias update controller:
+        #   "fixed_step" — historical v5/v6 load-error controller.
+        #   "quantile"   — Kimi-K3 Quantile Balancing (QB). QB derives the
+        #                  complete next-step bias from a histogram of
+        #                  per-token router margins, mean-centres it, and
+        #                  applies it one optimizer step later. The bias only
+        #                  affects expert selection; routed mixture weights
+        #                  remain functions of the unbiased router scores.
+        # The default preserves every existing checkpoint's routing behavior.
+        router_balance_method: str = "fixed_step",
         router_balance_bias_update_rate: float = 0.10,
         router_balance_bias_ema_rate: float = 0.05,
         router_balance_bias_max: float = 1.5,
-
+        # Histogram resolution for QB. At 2,048 bins the persistent controller
+        # state is ~4 MiB for the committed v7 shape (3 blocks x 6 loops x
+        # 28 experts), while quantile resolution is fine enough for the
+        # probability-normalised sqrt(softplus) router scores.
+        router_qb_histogram_bins: int = 2048,
         # --- Router affinity transform (ARCHITECTURE.md §7.4, §16.3) ---
         # How per-expert router logits become routing affinities:
         #   "softmax"       — Mixtral/v5 behavior: softmax over logits gives
@@ -244,12 +242,10 @@ class OSRTConfig(PretrainedConfig):
         #                     that balanced affinity. Telemetry/balance-loss use
         #                     an affinity-normalised probability view.
         router_affinity: str = "softmax",
-
         # Training-time noisy top-k. The training loop anneals this buffer;
         # default stays 0.0 so unit tests and standalone/eval forwards are
         # deterministic unless the trainer explicitly enables exploration.
         router_gumbel_tau_init: float = 0.0,
-
         # --- Speculative decoding draft loop count (ARCHITECTURE.md §12.3) ---
         # When generate(speculative=True) is used, the cheap DRAFT pass runs
         # this many recursive loops (the aux per-loop LM head makes a low-loop
@@ -259,7 +255,6 @@ class OSRTConfig(PretrainedConfig):
         # this is purely an inference-time knob — it does not affect training
         # or the default (non-speculative) generation path.
         spec_draft_loops: int = 3,
-
         # --- Hash routing for early blocks (ARCHITECTURE.md §7.5) ---
         # Physical blocks with block_idx < hash_routing_blocks use deterministic
         # HASH routing instead of the learned router: top-1 selection with
@@ -269,32 +264,26 @@ class OSRTConfig(PretrainedConfig):
         # router has warmed up. Default 0 = off (every block uses the learned
         # router); the standard path is unchanged.
         hash_routing_blocks: int = 0,
-
         # Capacity factor: expert_capacity = capacity_factor * N / num_experts
         # 2.0 is loose enough that router preferences actually drive routing.
         # Dropped tokens (exceeded capacity) skip the MoE path and get
         # only the shared expert + residual. Switch uses 1.25; we loosen
         # to 2.0 because v4 showed tight caps hide router decisions.
         router_capacity_factor: float = 2.0,
-
         # Orthogonal expert initialisation:
         # Initialise each routed expert's projection weights with mutually
         # orthogonal feature subspaces so experts start in different
         # directions of the hidden space. Uses QR decomposition of random
         # matrices with a per-expert seed offset.
         expert_orthogonal_init: bool = True,
-
         # Loop embedding init std (kept from v4 — was correct)
         loop_embedding_init_std: float = 0.1,
-
         # --- Sequence length (unchanged from v4) ---
         max_position_embeddings: int = 8192,
         rope_theta: float = 10000.0,
         rope_scaling: dict | None = None,
-
         # --- Training defaults ---
         initializer_range: float = 0.02,
-
         # --- Token IDs (must match tokenizer special tokens) ---
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -310,7 +299,6 @@ class OSRTConfig(PretrainedConfig):
         user_token_id: int = 11,
         assistant_token_id: int = 12,
         system_token_id: int = 13,
-
         **kwargs,
     ):
         self.dim = dim
@@ -349,9 +337,11 @@ class OSRTConfig(PretrainedConfig):
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
         self.router_balance_bias_enabled = router_balance_bias_enabled
+        self.router_balance_method = router_balance_method
         self.router_balance_bias_update_rate = router_balance_bias_update_rate
         self.router_balance_bias_ema_rate = router_balance_bias_ema_rate
         self.router_balance_bias_max = router_balance_bias_max
+        self.router_qb_histogram_bins = router_qb_histogram_bins
         self.router_affinity = router_affinity
         self.router_gumbel_tau_init = router_gumbel_tau_init
         # spec_draft_loops is an inference-only knob (§12.3). The default (3)
@@ -394,6 +384,14 @@ class OSRTConfig(PretrainedConfig):
         self._validate()
 
     def _validate(self) -> None:
+        if self.dim < 1:
+            raise ValueError(f"dim must be >= 1, got {self.dim}")
+        if self.heads < 1:
+            raise ValueError(f"heads must be >= 1, got {self.heads}")
+        if self.head_dim < 1:
+            raise ValueError(f"head_dim must be >= 1, got {self.head_dim}")
+        if self.num_kv_heads < 1:
+            raise ValueError(f"num_kv_heads must be >= 1, got {self.num_kv_heads}")
         if self.dim % self.heads != 0:
             raise ValueError(
                 f"dim ({self.dim}) must be divisible by heads ({self.heads})"
@@ -424,8 +422,11 @@ class OSRTConfig(PretrainedConfig):
                 f"num_routed_experts ({self.num_routed_experts})"
             )
         if self.top_k_experts < 1:
+            raise ValueError(f"top_k_experts must be >= 1, got {self.top_k_experts}")
+        if self.num_routed_experts < 2:
             raise ValueError(
-                f"top_k_experts must be >= 1, got {self.top_k_experts}"
+                "num_routed_experts must be >= 2 for sparse MoE routing, got "
+                f"{self.num_routed_experts}"
             )
         if self.top_k_experts > self.num_routed_experts // 2:
             raise ValueError(
@@ -440,6 +441,30 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"recursive_loops must be >= 1, got {self.recursive_loops}"
             )
+        if self.expert_hidden < 1 or self.shared_expert_hidden < 1:
+            raise ValueError(
+                "expert_hidden and shared_expert_hidden must both be >= 1, "
+                f"got {self.expert_hidden} and {self.shared_expert_hidden}"
+            )
+        if self.adapter_rank < 1:
+            raise ValueError(f"adapter_rank must be >= 1, got {self.adapter_rank}")
+        if self.use_mhc and self.n_hc < 1:
+            raise ValueError(f"n_hc must be >= 1 when mHC is on, got {self.n_hc}")
+        if self.mhc_sinkhorn_iters < 1:
+            raise ValueError(
+                f"mhc_sinkhorn_iters must be >= 1, got {self.mhc_sinkhorn_iters}"
+            )
+        if not 0.0 <= self.loop_dropout_prob <= 1.0:
+            raise ValueError(
+                f"loop_dropout_prob must be in [0, 1], got {self.loop_dropout_prob}"
+            )
+        if self.loop_dropout_prob > 0 and not (
+            1 <= self.loop_dropout_min_loops <= self.recursive_loops
+        ):
+            raise ValueError(
+                "loop_dropout_min_loops must be in [1, recursive_loops="
+                f"{self.recursive_loops}], got {self.loop_dropout_min_loops}"
+            )
         if self.router_capacity_factor <= 1.0:
             raise ValueError(
                 f"router_capacity_factor must be > 1.0, got "
@@ -448,13 +473,11 @@ class OSRTConfig(PretrainedConfig):
             )
         if self.router_aux_loss_coeff < 0:
             raise ValueError(
-                f"router_aux_loss_coeff must be >= 0, got "
-                f"{self.router_aux_loss_coeff}"
+                f"router_aux_loss_coeff must be >= 0, got {self.router_aux_loss_coeff}"
             )
         if self.router_z_loss_coeff < 0:
             raise ValueError(
-                f"router_z_loss_coeff must be >= 0, got "
-                f"{self.router_z_loss_coeff}"
+                f"router_z_loss_coeff must be >= 0, got {self.router_z_loss_coeff}"
             )
         if self.router_seq_balance_loss_coeff < 0:
             raise ValueError(
@@ -465,6 +488,16 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"router_balance_bias_update_rate must be >= 0, got "
                 f"{self.router_balance_bias_update_rate}"
+            )
+        if self.router_balance_method not in ("fixed_step", "quantile"):
+            raise ValueError(
+                "router_balance_method must be 'fixed_step' or 'quantile', got "
+                f"{self.router_balance_method!r}"
+            )
+        if self.router_qb_histogram_bins < 16:
+            raise ValueError(
+                "router_qb_histogram_bins must be >= 16, got "
+                f"{self.router_qb_histogram_bins}"
             )
         if not 0 <= self.router_balance_bias_ema_rate <= 1:
             raise ValueError(
@@ -487,9 +520,7 @@ class OSRTConfig(PretrainedConfig):
                 f"{self.router_affinity!r}"
             )
         if self.mtp_heads < 0:
-            raise ValueError(
-                f"mtp_heads must be >= 0, got {self.mtp_heads}"
-            )
+            raise ValueError(f"mtp_heads must be >= 0, got {self.mtp_heads}")
         if self.mtp_loss_weight < 0:
             raise ValueError(
                 f"mtp_loss_weight must be >= 0, got {self.mtp_loss_weight}"
@@ -507,4 +538,37 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"hash_routing_blocks must be in [0, num_blocks="
                 f"{self.num_blocks}], got {self.hash_routing_blocks}"
+            )
+        if self.vocab_size < 1:
+            raise ValueError(f"vocab_size must be >= 1, got {self.vocab_size}")
+        if not 1 <= self.real_vocab_size <= self.vocab_size:
+            raise ValueError(
+                "real_vocab_size must be in [1, vocab_size="
+                f"{self.vocab_size}], got {self.real_vocab_size}"
+            )
+        token_ids = {
+            "bos_token_id": self.bos_token_id,
+            "eos_token_id": self.eos_token_id,
+            "pad_token_id": self.pad_token_id,
+            "unk_token_id": self.unk_token_id,
+            "fim_prefix_id": self.fim_prefix_id,
+            "fim_middle_id": self.fim_middle_id,
+            "fim_suffix_id": self.fim_suffix_id,
+            "think_open_id": self.think_open_id,
+            "think_close_id": self.think_close_id,
+            "answer_open_id": self.answer_open_id,
+            "answer_close_id": self.answer_close_id,
+            "user_token_id": self.user_token_id,
+            "assistant_token_id": self.assistant_token_id,
+            "system_token_id": self.system_token_id,
+        }
+        invalid_ids = {
+            name: token_id
+            for name, token_id in token_ids.items()
+            if token_id is None or not 0 <= token_id < self.real_vocab_size
+        }
+        if invalid_ids:
+            raise ValueError(
+                "special token IDs must be inside real_vocab_size; invalid: "
+                f"{invalid_ids}"
             )

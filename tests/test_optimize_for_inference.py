@@ -6,6 +6,7 @@ math change, verified bit-exact on GPU: max|Δlogit|=0, 100% greedy token-match)
 and isn't exercised here — CPU inductor is slow/flaky in CI and adds no signal
 beyond the telemetry gate, which is the only thing that touches forward outputs.
 """
+
 import os
 import sys
 
@@ -49,9 +50,9 @@ def test_optimize_for_inference_no_compile_matches_eager():
         ret = model.optimize_for_inference(compile_model=False)
         opt = model(x).logits.clone()
 
-    assert ret is model                       # returns self for chaining
-    assert model.training is False            # eval() applied
-    assert torch.equal(ref, opt)              # outputs unchanged
+    assert ret is model  # returns self for chaining
+    assert model.training is False  # eval() applied
+    assert torch.equal(ref, opt)  # outputs unchanged
 
 
 def test_optimize_for_inference_disables_telemetry_on_all_blocks():
@@ -97,10 +98,12 @@ def test_prepack_matches_per_call_stack_and_is_nonpersistent():
 
     moe.prepack_expert_weights()
 
-    ref_gate = torch.stack(
-        [e.w_gate.weight.t() for e in moe.experts]).to(torch.bfloat16)
-    ref_down = torch.stack(
-        [e.w_down.weight.t() for e in moe.experts]).to(torch.bfloat16)
+    ref_gate = torch.stack([e.w_gate.weight.t() for e in moe.experts]).to(
+        torch.bfloat16
+    )
+    ref_down = torch.stack([e.w_down.weight.t() for e in moe.experts]).to(
+        torch.bfloat16
+    )
     assert torch.equal(moe._packed_w_gate, ref_gate)
     assert torch.equal(moe._packed_w_down, ref_down)
     assert moe._packed_w_gate.dtype == torch.bfloat16
@@ -123,15 +126,15 @@ def test_prepack_invalidated_by_train_and_load():
 
     moe.prepack_expert_weights()
     model.train()
-    assert moe._packed_w_gate is None          # train() invalidates
+    assert moe._packed_w_gate is None  # train() invalidates
 
     moe.prepack_expert_weights()
     model.eval()
-    assert moe._packed_w_gate is not None      # eval() keeps the packs
+    assert moe._packed_w_gate is not None  # eval() keeps the packs
 
     sd = model.state_dict()
     model.load_state_dict(sd, strict=True)
-    assert moe._packed_w_gate is None          # new weights invalidate
+    assert moe._packed_w_gate is None  # new weights invalidate
 
 
 def test_fwd_falls_back_to_eager_when_not_optimized():

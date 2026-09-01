@@ -8,6 +8,7 @@ the gold answer, the extracted prediction, and whether it's well-formed / correc
 Run: HF_TOKEN=... PYTHONPATH=src python scripts/local_sft_sample.py \
         --ckpt checkpoints/v5/osrt_v5_sft_v1_final.pt --n 4
 """
+
 from __future__ import annotations
 
 import argparse
@@ -36,14 +37,16 @@ def main() -> int:
     ap.add_argument("--rep-penalty", type=float, default=1.0)
     args = ap.parse_args()
 
+    import random
+
     import torch
     from transformers import AutoTokenizer
-    from osrt.presets import build_config
+
     from osrt.model import OSRTForCausalLM
-    from osrt.sft_eval import _load_gsm8k_heldout, _WELL_FORMED, _norm
-    from osrt.system_prompts import sample_system_prompt
+    from osrt.presets import build_config
     from osrt.rewards import extract_numeric_answer
-    import random
+    from osrt.sft_eval import _WELL_FORMED, _load_gsm8k_heldout, _norm
+    from osrt.system_prompts import sample_system_prompt
 
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -55,9 +58,12 @@ def main() -> int:
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     cfg = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
     model = OSRTForCausalLM(cfg)
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=True)
@@ -66,28 +72,39 @@ def main() -> int:
     if args.dtype == "bf16":
         model = model.to(torch.bfloat16)
     model = model.to(device).eval()
-    print(f"loaded {args.ckpt}  (stage={ck.get('training_stage')}, "
-          f"steps={ck.get('total_steps')})\n", flush=True)
+    print(
+        f"loaded {args.ckpt}  (stage={ck.get('training_stage')}, "
+        f"steps={ck.get('total_steps')})\n",
+        flush=True,
+    )
 
     # Same fixed personas the scored eval uses, so this mirrors it.
     on_name, on_sys = sample_system_prompt(random.Random(0), "on")
     off_name, off_sys = sample_system_prompt(random.Random(0), "off")
     print(f"ON  persona [{on_name}]: {on_sys}")
     print(f"OFF persona [{off_name}]: {off_sys}")
-    print(f"decode: temp={args.temperature} top_p={args.top_p} "
-          f"rep_penalty={args.rep_penalty}\n")
+    print(
+        f"decode: temp={args.temperature} top_p={args.top_p} "
+        f"rep_penalty={args.rep_penalty}\n"
+    )
 
     @torch.no_grad()
     def gen(system_text: str, question: str) -> str:
         prompt = f"<|system|>{system_text}<|user|>{question}<|assistant|>"
-        ids = torch.tensor([tok.encode(prompt, add_special_tokens=False)],
-                           dtype=torch.long, device=device)
-        out = model.generate(
-            ids, max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature, top_p=args.top_p,
-            repetition_penalty=args.rep_penalty, eos_token_id=tok.eos_token_id,
+        ids = torch.tensor(
+            [tok.encode(prompt, add_special_tokens=False)],
+            dtype=torch.long,
+            device=device,
         )
-        return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=False)
+        out = model.generate(
+            ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            repetition_penalty=args.rep_penalty,
+            eos_token_id=tok.eos_token_id,
+        )
+        return tok.decode(out[0, ids.shape[1] :], skip_special_tokens=False)
 
     problems = _load_gsm8k_heldout(args.n)
     for i, (q, gold) in enumerate(problems, 1):
@@ -99,8 +116,7 @@ def main() -> int:
             pred = _norm(extract_numeric_answer(text))
             ok_fmt = bool(_WELL_FORMED.search(text))
             correct = pred is not None and pred == _norm(gold)
-            print(f"\n  --- {side} --- fmt_ok={ok_fmt}  pred={pred}  "
-                  f"correct={correct}")
+            print(f"\n  --- {side} --- fmt_ok={ok_fmt}  pred={pred}  correct={correct}")
             print(f"  {text}")
         print()
     return 0

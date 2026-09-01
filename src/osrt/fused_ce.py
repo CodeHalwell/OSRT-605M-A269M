@@ -72,12 +72,15 @@ def fused_linear_cross_entropy(
     def _chunk_ce(h_chunk: Tensor, w_full: Tensor, lbl: Tensor) -> Tensor:
         logits = F.linear(h_chunk, w_full).float()
         return F.cross_entropy(
-            logits, lbl, ignore_index=ignore_index, reduction="sum",
+            logits,
+            lbl,
+            ignore_index=ignore_index,
+            reduction="sum",
         )
 
     for start in range(0, n, chunk):
-        h_c = hidden[start:start + chunk]
-        l_c = labels[start:start + chunk]
+        h_c = hidden[start : start + chunk]
+        l_c = labels[start : start + chunk]
         if torch.is_grad_enabled() and (h_c.requires_grad or w.requires_grad):
             # Checkpoint so the chunk's logits are recomputed in backward rather
             # than retained — this is what bounds peak memory.

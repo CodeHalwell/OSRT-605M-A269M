@@ -47,6 +47,7 @@ Correctness notes
   weighted by the group-normalised advantage, plus Schulman's non-negative KL
   approximation `exp(log_ratio) - log_ratio - 1`. Only the batching differs.
 """
+
 from __future__ import annotations
 
 import math
@@ -65,14 +66,14 @@ from osrt.system_prompts import FEW_SHOT_EXEMPLARS
 class Rollout:
     """One sampled completion and everything needed to train on it."""
 
-    ids: Tensor          # full sequence: prompt + completion (1-D, on device)
+    ids: Tensor  # full sequence: prompt + completion (1-D, on device)
     prompt_len: int
     advantage: float
     reward: float
     correct: bool
-    text: str            # decoded completion only (for printing / rewards)
-    gold: str = ""       # ground-truth answer, for offline re-scoring
-    breakdown: dict | None = None   # compute_reward's per-term breakdown
+    text: str  # decoded completion only (for printing / rewards)
+    gold: str = ""  # ground-truth answer, for offline re-scoring
+    breakdown: dict | None = None  # compute_reward's per-term breakdown
 
 
 def _left_pad(seqs: list[list[int]], pad_id: int, device) -> tuple[Tensor, Tensor, int]:
@@ -80,18 +81,20 @@ def _left_pad(seqs: list[list[int]], pad_id: int, device) -> tuple[Tensor, Tenso
     width = max(len(s) for s in seqs)
     ids = torch.tensor(
         [[pad_id] * (width - len(s)) + s for s in seqs],
-        dtype=torch.long, device=device,
+        dtype=torch.long,
+        device=device,
     )
     attn = torch.tensor(
         [[0] * (width - len(s)) + [1] * len(s) for s in seqs],
-        dtype=torch.long, device=device,
+        dtype=torch.long,
+        device=device,
     )
     return ids, attn, width
 
 
 def _seq_logprobs(
     model: nn.Module,
-    batch_ids: Tensor,          # (B, L) right-padded
+    batch_ids: Tensor,  # (B, L) right-padded
     prompt_lens: list[int],
     seq_lens: list[int],
     real_vocab_size: int,
@@ -126,11 +129,13 @@ def _seq_logprobs(
     out: list[Tensor] = []
     for i, (p_len, s_len) in enumerate(zip(prompt_lens, seq_lens)):
         # predict token t from position t-1
-        shift_logits = logits[i, p_len - 1:s_len - 1]
+        shift_logits = logits[i, p_len - 1 : s_len - 1]
         shift_labels = batch_ids[i, p_len:s_len]
-        lp = F.log_softmax(shift_logits, dim=-1).gather(
-            1, shift_labels.unsqueeze(1)
-        ).squeeze(1)
+        lp = (
+            F.log_softmax(shift_logits, dim=-1)
+            .gather(1, shift_labels.unsqueeze(1))
+            .squeeze(1)
+        )
         out.append(lp)
     return out
 
@@ -138,7 +143,7 @@ def _seq_logprobs(
 def generate_rollouts(
     model: nn.Module,
     tok: Any,
-    prompts: list[tuple[str, str]],      # (prompt_text, gold_answer)
+    prompts: list[tuple[str, str]],  # (prompt_text, gold_answer)
     cfg: Any,
     device,
     stop_token_ids: list[int] | None = None,
@@ -171,7 +176,8 @@ def generate_rollouts(
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         out = model.generate(
-            ids, attention_mask=attn,
+            ids,
+            attention_mask=attn,
             max_new_tokens=cfg.max_gen_len,
             temperature=cfg.temperature,
             top_p=getattr(cfg, "top_p", 1.0),
@@ -194,32 +200,43 @@ def generate_rollouts(
                     comp_ids = comp_ids[: int(nz[0]) + 1]
             text = tok.decode(comp_ids, skip_special_tokens=False)
             reward, breakdown = compute_reward(
-                text, gold,
+                text,
+                gold,
                 correctness_weight=cfg.correctness_reward,
                 format_weight=cfg.format_reward,
                 length_penalty=cfg.length_penalty,
-                think_open=cfg.think_open, think_close=cfg.think_close,
-                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                think_open=cfg.think_open,
+                think_close=cfg.think_close,
+                answer_open=cfg.answer_open,
+                answer_close=cfg.answer_close,
                 max_tokens=cfg.max_gen_len,
                 completion_tokens=len(comp_ids),
                 reasoning_bonus=cfg.reasoning_bonus,
                 truncation_penalty=cfg.truncation_penalty,
                 empty_think_penalty=cfg.empty_think_penalty,
                 few_shot_exemplar=exemplar,
-                few_shot_echo_penalty=getattr(
-                    cfg, "few_shot_echo_penalty", -3.0),
+                few_shot_echo_penalty=getattr(cfg, "few_shot_echo_penalty", -3.0),
             )
             rewards.append(reward)
             # full sequence = the UNPADDED prompt + this completion
-            full = torch.cat([
-                torch.tensor(enc[pi], dtype=torch.long, device=device),
-                comp_ids.to(device),
-            ])
-            rollouts.append(Rollout(
-                ids=full[: cfg.seq_len], prompt_len=p_len, advantage=0.0,
-                reward=reward, correct=bool(breakdown.get("correct")),
-                text=text, gold=str(gold), breakdown=dict(breakdown),
-            ))
+            full = torch.cat(
+                [
+                    torch.tensor(enc[pi], dtype=torch.long, device=device),
+                    comp_ids.to(device),
+                ]
+            )
+            rollouts.append(
+                Rollout(
+                    ids=full[: cfg.seq_len],
+                    prompt_len=p_len,
+                    advantage=0.0,
+                    reward=reward,
+                    correct=bool(breakdown.get("correct")),
+                    text=text,
+                    gold=str(gold),
+                    breakdown=dict(breakdown),
+                )
+            )
         advs = compute_group_advantages(rewards)
         for r, a in zip(rollouts, advs):
             r.advantage = float(a)
@@ -256,8 +273,9 @@ def ema_update(ema: dict[str, Tensor], model: nn.Module, decay: float) -> None:
         live = model.state_dict()
         missing = set(ema) - set(live)
         if missing:
-            raise KeyError(f"EMA shadow has keys absent from the model: "
-                           f"{sorted(missing)[:3]}")
+            raise KeyError(
+                f"EMA shadow has keys absent from the model: {sorted(missing)[:3]}"
+            )
         for k, e in ema.items():
             e.mul_(decay).add_(live[k].detach().float(), alpha=1.0 - decay)
 
@@ -301,20 +319,29 @@ def dump_rollouts(
         for gi, group in enumerate(groups):
             for r in group:
                 ids = r.ids.tolist()
-                f.write(json.dumps({
-                    "ckpt": ckpt, "step": step, "seed": seed,
-                    "temperature": temperature, "top_p": top_p,
-                    "group": gi,
-                    "prompt_ids": ids[: r.prompt_len],
-                    "completion_ids": ids[r.prompt_len:],
-                    "prompt_len": r.prompt_len,
-                    "gold": r.gold,
-                    "text": r.text,
-                    "reward": r.reward,
-                    "advantage": r.advantage,
-                    "correct": bool(r.correct),
-                    "breakdown": r.breakdown or {},
-                }, ensure_ascii=False) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "ckpt": ckpt,
+                            "step": step,
+                            "seed": seed,
+                            "temperature": temperature,
+                            "top_p": top_p,
+                            "group": gi,
+                            "prompt_ids": ids[: r.prompt_len],
+                            "completion_ids": ids[r.prompt_len :],
+                            "prompt_len": r.prompt_len,
+                            "gold": r.gold,
+                            "text": r.text,
+                            "reward": r.reward,
+                            "advantage": r.advantage,
+                            "correct": bool(r.correct),
+                            "breakdown": r.breakdown or {},
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
                 n += 1
     return n
 
@@ -329,16 +356,26 @@ def load_rollout_dump(path: str, device) -> tuple[list[list[Rollout]], dict]:
     with open(path) as f:
         for line in f:
             d = json.loads(line)
-            meta = {k: d[k] for k in
-                    ("ckpt", "step", "seed", "temperature", "top_p") if k in d}
-            ids = torch.tensor(d["prompt_ids"] + d["completion_ids"],
-                               dtype=torch.long, device=device)
-            buckets.setdefault((d["step"], d["group"]), []).append(Rollout(
-                ids=ids, prompt_len=int(d["prompt_len"]),
-                advantage=float(d["advantage"]), reward=float(d["reward"]),
-                correct=bool(d["correct"]), text=d.get("text", ""),
-                gold=str(d.get("gold", "")), breakdown=d.get("breakdown") or {},
-            ))
+            meta = {
+                k: d[k]
+                for k in ("ckpt", "step", "seed", "temperature", "top_p")
+                if k in d
+            }
+            ids = torch.tensor(
+                d["prompt_ids"] + d["completion_ids"], dtype=torch.long, device=device
+            )
+            buckets.setdefault((d["step"], d["group"]), []).append(
+                Rollout(
+                    ids=ids,
+                    prompt_len=int(d["prompt_len"]),
+                    advantage=float(d["advantage"]),
+                    reward=float(d["reward"]),
+                    correct=bool(d["correct"]),
+                    text=d.get("text", ""),
+                    gold=str(d.get("gold", "")),
+                    breakdown=d.get("breakdown") or {},
+                )
+            )
     return list(buckets.values()), meta
 
 
@@ -373,10 +410,11 @@ def train_on_rollouts(
     live = sorted(usable, key=lambda r: len(r.ids), reverse=True)
 
     for i in range(0, n, micro_batch):
-        chunk = live[i:i + micro_batch]
+        chunk = live[i : i + micro_batch]
         max_len = max(len(r.ids) for r in chunk)
-        batch = torch.full((len(chunk), max_len), pad_id,
-                           dtype=torch.long, device=device)
+        batch = torch.full(
+            (len(chunk), max_len), pad_id, dtype=torch.long, device=device
+        )
         for k, r in enumerate(chunk):
             batch[k, : len(r.ids)] = r.ids
         p_lens = [r.prompt_len for r in chunk]
@@ -385,22 +423,23 @@ def train_on_rollouts(
         # Same temperature for BOTH, or the KL compares two different
         # distributions and the penalty becomes meaningless.
         temp = getattr(cfg, "temperature", 1.0) or 1.0
-        pol = _seq_logprobs(model, batch, p_lens, s_lens, real_vocab_size, True,
-                            temperature=temp)
-        ref = _seq_logprobs(ref_model, batch, p_lens, s_lens, real_vocab_size, False,
-                            temperature=temp)
+        pol = _seq_logprobs(
+            model, batch, p_lens, s_lens, real_vocab_size, True, temperature=temp
+        )
+        ref = _seq_logprobs(
+            ref_model, batch, p_lens, s_lens, real_vocab_size, False, temperature=temp
+        )
 
         loss = torch.zeros((), device=device)
         for lp, rlp, r in zip(pol, ref, chunk):
             log_ratio = rlp.detach() - lp
             approx_kl = (torch.exp(log_ratio) - log_ratio - 1).mean()
-            loss = loss + cfg.kl_coeff * approx_kl      # anchors EVERY rollout
+            loss = loss + cfg.kl_coeff * approx_kl  # anchors EVERY rollout
             total_kl += float(approx_kl.detach())
-            if abs(r.advantage) > 1e-8:                 # policy term only here
-                adv = torch.tensor(r.advantage, device=device,
-                                   dtype=torch.float32)
+            if abs(r.advantage) > 1e-8:  # policy term only here
+                adv = torch.tensor(r.advantage, device=device, dtype=torch.float32)
                 loss = loss + -(lp * adv).mean()
-        loss = loss / n          # mean over ALL live rollouts in the step
+        loss = loss / n  # mean over ALL live rollouts in the step
         loss.backward()
         total_loss += float(loss.detach())
 

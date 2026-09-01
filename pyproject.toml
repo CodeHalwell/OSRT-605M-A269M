@@ -1,7 +1,7 @@
 [project]
 name = "osrt"
 version = "0.6.0"
-description = "OSRT — Optimized Sparse Recursive Transformer: recursive sparse-MoE LM (~608M physical / ~279M active)"
+description = "OSRT — Optimized Sparse Recursive Transformer: recursive sparse-MoE LM (~601M physical / ~278M active)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -43,6 +43,13 @@ packages = ["src/osrt"]
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+extend-exclude = [
+    "archive",
+    "compile_expanded_paper.py",
+    "midtrain3_colab.py",
+    "qwen3_(4b)_grpo_doubt.py",
+    "scripts/wand_inference.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

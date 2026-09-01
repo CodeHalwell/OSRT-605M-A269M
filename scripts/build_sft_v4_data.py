@@ -47,6 +47,7 @@ the real v6 tokenizer, single-turn only, deterministic (SEED=42).
 Run:  HF_TOKEN=... PYTHONPATH=src python scripts/build_sft_v4_data.py
       (--smoke for a 1/100-scale end-to-end check)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -77,7 +78,7 @@ REPORT = ROOT / "rollouts" / "sft_v4_report.md"
 SEED = 42
 MAX_SEQ_TOKENS = 4096
 MAX_SEQ_CHARS = MAX_SEQ_TOKENS * 5
-MIN_RESPONSE_CHARS = 40      # prose slices
+MIN_RESPONSE_CHARS = 40  # prose slices
 MIN_RESPONSE_CHARS_MATH = 1  # math answers are bare numbers ("72")
 # Hard cap on ON thinking. The model emits 250-440c; 2,000c keeps exemplars
 # within reach while still allowing a genuinely multi-step derivation.
@@ -86,11 +87,22 @@ TOKENIZER = "v6_tokenizer_export"
 NGRAM = 8
 N_VAL = 1_000
 
-_GENERAL_ON = ["minimal_format", "concise_direct", "reasoning_3shot",
-               "instruction_strict", "verbose_teaching", "casual_helpful",
-               "general_default"]
-_GENERAL_OFF = ["direct_concise", "no_reasoning", "assistant_plain",
-                "instruction_direct", "chat_direct"]
+_GENERAL_ON = [
+    "minimal_format",
+    "concise_direct",
+    "reasoning_3shot",
+    "instruction_strict",
+    "verbose_teaching",
+    "casual_helpful",
+    "general_default",
+]
+_GENERAL_OFF = [
+    "direct_concise",
+    "no_reasoning",
+    "assistant_plain",
+    "instruction_direct",
+    "chat_direct",
+]
 
 # Order matters: earlier slices WIN the cross-source problem dedup. Short-CoT
 # math is first so GSM8K-train's human solution beats the mopd narration on
@@ -119,19 +131,19 @@ TARGETS = {
     # ── OFF: tool calling (plain-text delimiters) ────────────────────
     "smol_xlam_tool": 1_500,
     "smol_hermes_tool": 1_000,
-    "smol_agentic_tool_on": 1_000,   # reasoning THEN tool call
+    "smol_agentic_tool_on": 1_000,  # reasoning THEN tool call
     # ── SPECIALITIES (the v4b broadening) ────────────────────────────
     # Mostly OFF/answer-only: these teach a SKILL, and long teacher CoT
     # would just re-run the v3 mistake. A 601M model asked for code should
     # write the code, not narrate about writing it.
-    "evol_code_off": 3_000,          # short code outputs (~620c)
-    "nemotron_code_off": 2_000,      # competitive-programming, CoT stripped
-    "nemotron_safety_off": 1_500,    # refusal / harm-handling behaviour
-    "smol_science_short_off": 2_000, # Mixture-of-Thoughts science (short)
-    "smol_tables_off": 1_500,        # structured-data manipulation
+    "evol_code_off": 3_000,  # short code outputs (~620c)
+    "nemotron_code_off": 2_000,  # competitive-programming, CoT stripped
+    "nemotron_safety_off": 1_500,  # refusal / harm-handling behaviour
+    "smol_science_short_off": 2_000,  # Mixture-of-Thoughts science (short)
+    "smol_tables_off": 1_500,  # structured-data manipulation
     "smol_multilingual_off": 1_500,  # 8 languages (65K byte-level BPE)
     "smol_openthoughts_off": 1_500,  # mixed reasoning, answer-only
-    "smol_s1k_on": 400,              # s1 curated reasoning (only ~1k exist)
+    "smol_s1k_on": 400,  # s1 curated reasoning (only ~1k exist)
     # ── CHAT ─────────────────────────────────────────────────────────
     "smol_everyday_chat": 2_000,
     "smol_systemchats_chat": 2_000,
@@ -141,7 +153,7 @@ TARGETS = {
 TOOL_INSTRUCTION = (
     "\n\nYou have access to these tools:\n{tools}\n"
     "When a tool is needed, emit the call as "
-    "<tool_call>{{\"name\": ..., \"arguments\": {{...}}}}</tool_call> "
+    '<tool_call>{{"name": ..., "arguments": {{...}}}}</tool_call> '
     "inside <|answer|>...<|/answer|>. Call a tool rather than guessing at "
     "a calculation or a fact you cannot verify."
 )
@@ -157,7 +169,7 @@ def _phash(text: str) -> str:
 
 def _ngrams(text: str, n: int = NGRAM) -> set[str]:
     w = re.findall(r"[a-z0-9]+", (text or "").lower())
-    return {" ".join(w[i:i + n]) for i in range(len(w) - n + 1)}
+    return {" ".join(w[i : i + n]) for i in range(len(w) - n + 1)}
 
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
@@ -183,13 +195,13 @@ def _normalise_tool_calls(answer: str) -> str | None:
         except json.JSONDecodeError:
             try:
                 import ast
+
                 obj = ast.literal_eval(raw)
             except (ValueError, SyntaxError):
                 return None
         if not isinstance(obj, dict):
             return None
-        out = out.replace(
-            raw, json.dumps(obj, ensure_ascii=False, sort_keys=True))
+        out = out.replace(raw, json.dumps(obj, ensure_ascii=False, sort_keys=True))
     return out
 
 
@@ -210,8 +222,11 @@ def _clean_gsm8k_solution(answer: str) -> tuple[str, str] | None:
 
 def main() -> int:  # noqa: PLR0915
     ap = argparse.ArgumentParser()
-    ap.add_argument("--smoke", action="store_true",
-                    help="1/100-scale targets: end-to-end pipe check")
+    ap.add_argument(
+        "--smoke",
+        action="store_true",
+        help="1/100-scale targets: end-to-end pipe check",
+    )
     args = ap.parse_args()
 
     import pandas as pd
@@ -223,44 +238,56 @@ def main() -> int:  # noqa: PLR0915
 
     targets = dict(TARGETS)
     if args.smoke:
-        targets = {k: (40 if v >= 10**9 else max(5, v // 100))
-                   for k, v in TARGETS.items()}
+        targets = {
+            k: (40 if v >= 10**9 else max(5, v // 100)) for k, v in TARGETS.items()
+        }
 
     tok = AutoTokenizer.from_pretrained(TOKENIZER)
     rng = random.Random(SEED)
 
     def assembled_len(system: str, q: str, think: str, ans: str) -> int:
-        seq = (f"<|system|>{system}<|user|>{q}<|assistant|>"
-               f"<|think|>{think}<|/think|><|answer|>{ans}<|/answer|>")
+        seq = (
+            f"<|system|>{system}<|user|>{q}<|assistant|>"
+            f"<|think|>{think}<|/think|><|answer|>{ans}<|/answer|>"
+        )
         if len(seq) > MAX_SEQ_CHARS:
             return 10**9
         return len(tok.encode(seq, add_special_tokens=False))
 
     # ── decontamination: GSM8K TEST + MATH-500 (train splits are fair) ─
-    print("building decontamination sets (GSM8K test + MATH-500)...",
-          flush=True)
+    print("building decontamination sets (GSM8K test + MATH-500)...", flush=True)
     contam_ngrams: set[str] = set()
     contam_prefix: set[str] = set()
-    gsm_test = pd.read_parquet(hf_hub_download(
-        "openai/gsm8k", "main/test-00000-of-00001.parquet",
-        repo_type="dataset"))
+    gsm_test = pd.read_parquet(
+        hf_hub_download(
+            "openai/gsm8k", "main/test-00000-of-00001.parquet", repo_type="dataset"
+        )
+    )
     for q in gsm_test["question"]:
         contam_ngrams |= _ngrams(q)
         contam_prefix.add(_norm_prefix(q))
     n_gsm = len(contam_prefix)
-    for row in load_dataset("HuggingFaceH4/MATH-500", split="test",
-                            streaming=True):
+    for row in load_dataset("HuggingFaceH4/MATH-500", split="test", streaming=True):
         contam_ngrams |= _ngrams(row["problem"])
         contam_prefix.add(_norm_prefix(row["problem"]))
-    print(f"  {n_gsm} GSM8K-test + {len(contam_prefix) - n_gsm} MATH-500 "
-          f"-> {len(contam_ngrams)} 8-grams", flush=True)
+    print(
+        f"  {n_gsm} GSM8K-test + {len(contam_prefix) - n_gsm} MATH-500 "
+        f"-> {len(contam_ngrams)} 8-grams",
+        flush=True,
+    )
 
     seen: set[str] = set()
     records: list[dict] = []
     lengths: list[int] = []
     think_lens: list[int] = []
-    stats = {"contaminated": 0, "dup": 0, "toolong": 0, "parsefail": 0,
-             "narration_reject": 0, "think_truncated": 0}
+    stats = {
+        "contaminated": 0,
+        "dup": 0,
+        "toolong": 0,
+        "parsefail": 0,
+        "narration_reject": 0,
+        "think_truncated": 0,
+    }
     kept: dict[str, int] = {k: 0 for k in targets}
 
     def admit(problem: str) -> bool:
@@ -278,8 +305,16 @@ def main() -> int:  # noqa: PLR0915
         seen.add(h)
         return True
 
-    def add(mode: str, source: str, system: str, q: str, think: str,
-            ans: str, *, math: bool = False) -> bool:
+    def add(
+        mode: str,
+        source: str,
+        system: str,
+        q: str,
+        think: str,
+        ans: str,
+        *,
+        math: bool = False,
+    ) -> bool:
         """Append one record. Enforces the two v4 guards on ON rows."""
         think = (think or "").strip()
         min_resp = MIN_RESPONSE_CHARS_MATH if math else MIN_RESPONSE_CHARS
@@ -301,8 +336,16 @@ def main() -> int:  # noqa: PLR0915
         if L > MAX_SEQ_TOKENS:
             stats["toolong"] += 1
             return False
-        records.append({"system": system, "prompt": q, "thinking": think,
-                        "response": ans, "mode": mode, "source": source})
+        records.append(
+            {
+                "system": system,
+                "prompt": q,
+                "thinking": think,
+                "response": ans,
+                "mode": mode,
+                "source": source,
+            }
+        )
         lengths.append(L)
         if think:
             think_lens.append(len(think))
@@ -317,9 +360,11 @@ def main() -> int:  # noqa: PLR0915
     # covering the same problems.
     print("GSM8K-train (human solutions -> thinking)...", flush=True)
     key = "gsm8k_train_on"
-    gsm_train = pd.read_parquet(hf_hub_download(
-        "openai/gsm8k", "main/train-00000-of-00001.parquet",
-        repo_type="dataset"))
+    gsm_train = pd.read_parquet(
+        hf_hub_download(
+            "openai/gsm8k", "main/train-00000-of-00001.parquet", repo_type="dataset"
+        )
+    )
     idx = list(range(len(gsm_train)))
     rng.shuffle(idx)
     for i in idx:
@@ -343,8 +388,9 @@ def main() -> int:  # noqa: PLR0915
     key = "orca_math_on"
     scanned = 0
     cap = 60_000 // (50 if args.smoke else 1)
-    for row in load_dataset("microsoft/orca-math-word-problems-200k",
-                            split="train", streaming=True):
+    for row in load_dataset(
+        "microsoft/orca-math-word-problems-200k", split="train", streaming=True
+    ):
         scanned += 1
         if kept[key] >= targets[key] or scanned > cap:
             break
@@ -359,8 +405,7 @@ def main() -> int:  # noqa: PLR0915
             continue
         if not admit(q):
             continue
-        if add("on", "orca-math", persona("on"), q, sol,
-               str(final).strip(), math=True):
+        if add("on", "orca-math", persona("on"), q, sol, str(final).strip(), math=True):
             kept[key] += 1
     print(f"  {key}: {kept[key]}", flush=True)
 
@@ -382,8 +427,7 @@ def main() -> int:  # noqa: PLR0915
             own_sys = (msgs[0].get("content") or "").strip()
             msgs = msgs[1:]
         for i in range(len(msgs) - 1):
-            if (msgs[i].get("role") != "user"
-                    or msgs[i + 1].get("role") != "assistant"):
+            if msgs[i].get("role") != "user" or msgs[i + 1].get("role") != "assistant":
                 continue
             q = (msgs[i].get("content") or "").strip()
             a = (msgs[i + 1].get("content") or "").strip()
@@ -399,13 +443,18 @@ def main() -> int:  # noqa: PLR0915
             return own_sys, q, think, a
         return None
 
-    def smol_slice(split: str, key: str, mode: str, *,
-                   keep_system: bool = False, want_think: bool = False,
-                   tools: bool = False) -> None:
+    def smol_slice(
+        split: str,
+        key: str,
+        mode: str,
+        *,
+        keep_system: bool = False,
+        want_think: bool = False,
+        tools: bool = False,
+    ) -> None:
         """Stream one smoltalk2 SFT split into the corpus."""
         print(f"smoltalk2 [{split}]...", flush=True)
-        ds = load_dataset("HuggingFaceTB/smoltalk2", "SFT", split=split,
-                          streaming=True)
+        ds = load_dataset("HuggingFaceTB/smoltalk2", "SFT", split=split, streaming=True)
         scanned = 0
         cap = 60_000 // (50 if args.smoke else 1)
         for row in ds:
@@ -444,63 +493,106 @@ def main() -> int:  # noqa: PLR0915
                 ans = fixed
             if not admit(q):
                 continue
-            system = own_sys if (keep_system and own_sys) else persona(
-                "on" if mode == "on" else "off")
+            system = (
+                own_sys
+                if (keep_system and own_sys)
+                else persona("on" if mode == "on" else "off")
+            )
             if spec_text:
                 system = system + TOOL_INSTRUCTION.format(tools=spec_text)
-            if add(mode, f"smoltalk2:{split.replace('_no_think','')}",
-                   system, q, think, ans):
+            if add(
+                mode,
+                f"smoltalk2:{split.replace('_no_think', '')}",
+                system,
+                q,
+                think,
+                ans,
+            ):
                 kept[key] += 1
         print(f"  {key}: {kept[key]}", flush=True)
 
     # ON — general reasoning (the v3 domain-entanglement fix)
-    smol_slice("smoltalk_everyday_convs_reasoning_Qwen3_32B_think",
-               "smol_everyday_think", "on", want_think=True)
-    smol_slice("smoltalk_systemchats_Qwen3_32B_think",
-               "smol_systemchats_think", "on", want_think=True,
-               keep_system=True)
-    smol_slice("aya_dataset_Qwen3_32B_think", "smol_aya_think", "on",
-               want_think=True)
-    smol_slice("multi_turn_reasoning_if_think", "smol_multiturn_if_think",
-               "on", want_think=True)
+    smol_slice(
+        "smoltalk_everyday_convs_reasoning_Qwen3_32B_think",
+        "smol_everyday_think",
+        "on",
+        want_think=True,
+    )
+    smol_slice(
+        "smoltalk_systemchats_Qwen3_32B_think",
+        "smol_systemchats_think",
+        "on",
+        want_think=True,
+        keep_system=True,
+    )
+    smol_slice("aya_dataset_Qwen3_32B_think", "smol_aya_think", "on", want_think=True)
+    smol_slice(
+        "multi_turn_reasoning_if_think",
+        "smol_multiturn_if_think",
+        "on",
+        want_think=True,
+    )
 
     # OFF — general instruct: what a 601M actually does well
-    smol_slice("smoltalk_smollm3_smol_magpie_ultra_no_think",
-               "smol_magpie_off", "off")
-    smol_slice("tulu_3_sft_personas_instruction_following_no_think",
-               "smol_tulu_if_off", "off")
-    smol_slice("smoltalk_smollm3_smol_rewrite_no_think",
-               "smol_rewrite_off", "off", keep_system=True)
-    smol_slice("smoltalk_smollm3_smol_summarize_no_think",
-               "smol_summarize_off", "off", keep_system=True)
-    smol_slice("smoltalk_smollm3_explore_instruct_rewriting_no_think",
-               "smol_explore_rewrite_off", "off")
+    smol_slice("smoltalk_smollm3_smol_magpie_ultra_no_think", "smol_magpie_off", "off")
+    smol_slice(
+        "tulu_3_sft_personas_instruction_following_no_think", "smol_tulu_if_off", "off"
+    )
+    smol_slice(
+        "smoltalk_smollm3_smol_rewrite_no_think",
+        "smol_rewrite_off",
+        "off",
+        keep_system=True,
+    )
+    smol_slice(
+        "smoltalk_smollm3_smol_summarize_no_think",
+        "smol_summarize_off",
+        "off",
+        keep_system=True,
+    )
+    smol_slice(
+        "smoltalk_smollm3_explore_instruct_rewriting_no_think",
+        "smol_explore_rewrite_off",
+        "off",
+    )
 
     # OFF — tool calling
     smol_slice("xlam_traces_no_think", "smol_xlam_tool", "off", tools=True)
-    smol_slice("hermes_function_calling_v1_no_think", "smol_hermes_tool",
-               "off", tools=True)
+    smol_slice(
+        "hermes_function_calling_v1_no_think", "smol_hermes_tool", "off", tools=True
+    )
 
     # ON — agentic: reason, then emit the tool call
-    smol_slice("smolagents_toolcalling_traces_think", "smol_agentic_tool_on",
-               "on", want_think=True, tools=True)
+    smol_slice(
+        "smolagents_toolcalling_traces_think",
+        "smol_agentic_tool_on",
+        "on",
+        want_think=True,
+        tools=True,
+    )
 
     # SPECIALITIES — answer-only (skill without impossible-length CoT)
-    smol_slice("Mixture_of_Thoughts_science_no_think",
-               "smol_science_short_off", "off")
+    smol_slice("Mixture_of_Thoughts_science_no_think", "smol_science_short_off", "off")
     smol_slice("table_gpt_no_think", "smol_tables_off", "off")
-    smol_slice("smoltalk_multilingual_8languages_lang_5_no_think",
-               "smol_multilingual_off", "off")
-    smol_slice("OpenThoughts3_1.2M_no_think_no_think",
-               "smol_openthoughts_off", "off")
+    smol_slice(
+        "smoltalk_multilingual_8languages_lang_5_no_think",
+        "smol_multilingual_off",
+        "off",
+    )
+    smol_slice("OpenThoughts3_1.2M_no_think_no_think", "smol_openthoughts_off", "off")
     # s1k is curated + tiny; take whatever clears the 2,000c think cap.
     smol_slice("s1k_1.1_think", "smol_s1k_on", "on", want_think=True)
 
     # CHAT
-    smol_slice("smoltalk_smollm3_everyday_conversations_no_think",
-               "smol_everyday_chat", "chat")
-    smol_slice("smoltalk_smollm3_systemchats_30k_no_think",
-               "smol_systemchats_chat", "chat", keep_system=True)
+    smol_slice(
+        "smoltalk_smollm3_everyday_conversations_no_think", "smol_everyday_chat", "chat"
+    )
+    smol_slice(
+        "smoltalk_smollm3_systemchats_30k_no_think",
+        "smol_systemchats_chat",
+        "chat",
+        keep_system=True,
+    )
 
     # ── Evol-Instruct-Code: short code outputs (instruction/output) ────
     # The v6 corpus had ZERO code before v4b. Outputs are ~620c — already the
@@ -509,8 +601,9 @@ def main() -> int:  # noqa: PLR0915
     key = "evol_code_off"
     scanned = 0
     cap = 60_000 // (50 if args.smoke else 1)
-    for row in load_dataset("nickrosh/Evol-Instruct-Code-80k-v1",
-                            split="train", streaming=True):
+    for row in load_dataset(
+        "nickrosh/Evol-Instruct-Code-80k-v1", split="train", streaming=True
+    ):
         scanned += 1
         if kept[key] >= targets[key] or scanned > cap:
             break
@@ -541,13 +634,19 @@ def main() -> int:  # noqa: PLR0915
             return q, head.replace("<think>", "").strip(), post.strip()
         return q, "", out
 
-    for split, key, mode in (("science", "nemotron_science_short_on", "on"),
-                             ("math", "nemotron_math_off", "off"),
-                             ("code", "nemotron_code_off", "off"),
-                             ("safety", "nemotron_safety_off", "off")):
+    for split, key, mode in (
+        ("science", "nemotron_science_short_on", "on"),
+        ("math", "nemotron_math_off", "off"),
+        ("code", "nemotron_code_off", "off"),
+        ("safety", "nemotron_safety_off", "off"),
+    ):
         print(f"nemotron-pt [{split}] -> {mode}...", flush=True)
-        ds = load_dataset("nvidia/Llama-Nemotron-Post-Training-Dataset",
-                          "SFT", split=split, streaming=True)
+        ds = load_dataset(
+            "nvidia/Llama-Nemotron-Post-Training-Dataset",
+            "SFT",
+            split=split,
+            streaming=True,
+        )
         scanned = 0
         cap = 120_000 // (50 if args.smoke else 1)
         for row in ds:
@@ -576,9 +675,11 @@ def main() -> int:  # noqa: PLR0915
             r = json.loads(line)
             by_src.setdefault(r["source"], []).append(r)
 
-    for key, src, mode in (("openr1_off", "openr1", "off"),
-                           ("mopd_off", "mopd-verified", "off"),
-                           ("v2_chat", "chat", "chat")):
+    for key, src, mode in (
+        ("openr1_off", "openr1", "off"),
+        ("mopd_off", "mopd-verified", "off"),
+        ("v2_chat", "chat", "chat"),
+    ):
         rows = by_src.get(src, [])
         rng.shuffle(rows)
         for r in rows:
@@ -589,8 +690,7 @@ def main() -> int:  # noqa: PLR0915
                 continue
             # thinking DROPPED for openr1 (too long) and mopd (narration).
             system = r["system"] if mode == "chat" else persona("off")
-            if add(mode, f"v2:{src}", system, q, "",
-                   (r.get("response") or "").strip()):
+            if add(mode, f"v2:{src}", system, q, "", (r.get("response") or "").strip()):
                 kept[key] += 1
         print(f"  {key}: {kept[key]}", flush=True)
 
@@ -619,17 +719,29 @@ def main() -> int:  # noqa: PLR0915
     def pct(xs: list[int], p: float) -> int:
         return xs[min(len(xs) - 1, int(p * (len(xs) - 1)))] if xs else 0
 
-    MATHY = ("gsm8k-train", "orca-math", "nemotron:math", "nemotron:science",
-             "v2:openr1", "v2:mopd-verified", "v2:stratos",
-             "smoltalk2:Mixture_of_Thoughts_science")
+    MATHY = (
+        "gsm8k-train",
+        "orca-math",
+        "nemotron:math",
+        "nemotron:science",
+        "v2:openr1",
+        "v2:mopd-verified",
+        "v2:stratos",
+        "smoltalk2:Mixture_of_Thoughts_science",
+    )
     CODEY = ("evol-code", "nemotron:code", "smoltalk2:OpenThoughts3")
     mathy = sum(c for s, c in by_source.items() if s.startswith(MATHY))
     code = sum(c for s, c in by_source.items() if s.startswith(CODEY))
-    tool = sum(c for s, c in by_source.items()
-               if "xlam" in s or "hermes" in s or "smolagents" in s)
-    spec = sum(c for s, c in by_source.items()
-               if "table_gpt" in s or "multilingual" in s
-               or s.startswith("nemotron:safety"))
+    tool = sum(
+        c
+        for s, c in by_source.items()
+        if "xlam" in s or "hermes" in s or "smolagents" in s
+    )
+    spec = sum(
+        c
+        for s, c in by_source.items()
+        if "table_gpt" in s or "multilingual" in s or s.startswith("nemotron:safety")
+    )
     lines = [
         "# SFT-v4 corpus report",
         "",
@@ -658,8 +770,8 @@ def main() -> int:  # noqa: PLR0915
         "## THINKING length — the v4 headline "
         "(model emits 250-440c; v3 median was ~4,500c)",
         f"- rows with thinking: {len(think_lens)}",
-        f"- p10={pct(think_lens, .10)} p50={pct(think_lens, .50)} "
-        f"p90={pct(think_lens, .90)} max={think_lens[-1] if think_lens else 0}",
+        f"- p10={pct(think_lens, 0.10)} p50={pct(think_lens, 0.50)} "
+        f"p90={pct(think_lens, 0.90)} max={think_lens[-1] if think_lens else 0}",
         "",
         "### Histogram (250-char buckets)",
     ]
@@ -668,10 +780,12 @@ def main() -> int:  # noqa: PLR0915
         bar = "#" * round(60 * c / max(1, len(think_lens)))
         lines.append(f"- {lo:>4}-{lo + 250:<4}: {c:>6} {bar}")
     lines += [
-        "", "## Assembled length (tokens)",
-        f"- p50={pct(lengths, .50)} p90={pct(lengths, .90)} "
-        f"p99={pct(lengths, .99)} max={lengths[-1]}",
-        "", "## Drops",
+        "",
+        "## Assembled length (tokens)",
+        f"- p50={pct(lengths, 0.50)} p90={pct(lengths, 0.90)} "
+        f"p99={pct(lengths, 0.99)} max={lengths[-1]}",
+        "",
+        "## Drops",
         f"- contaminated (8-gram/prefix vs GSM8K-test + MATH-500): "
         f"{stats['contaminated']}",
         f"- duplicate problem (cross-source hash): {stats['dup']}",
@@ -680,9 +794,9 @@ def main() -> int:  # noqa: PLR0915
         f"- **think > {MAX_THINK_CHARS}c (impossible-length trace)**: "
         f"{stats['think_truncated']}",
         f"- assembled > {MAX_SEQ_TOKENS} tokens: {stats['toolong']}",
-        f"- parse-fail / too-short / no extractable answer: "
-        f"{stats['parsefail']}",
-        "", "## Slice fill vs target",
+        f"- parse-fail / too-short / no extractable answer: {stats['parsefail']}",
+        "",
+        "## Slice fill vs target",
     ]
     for k in targets:
         t = targets[k] if targets[k] < 10**9 else "ALL"

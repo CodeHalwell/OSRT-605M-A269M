@@ -26,6 +26,7 @@ stops so further compute isn't wasted on a known-bad run.
 import glob
 import math
 import os
+import re
 import sys
 import time
 
@@ -43,19 +44,150 @@ from osrt.data import make_loader  # reused unchanged
 from osrt.model import OSRTForCausalLM
 from osrt.train_config import PretrainConfig
 
+_STRICT_MODEL_CONFIG_KEYS = (
+    "dim",
+    "heads",
+    "head_dim",
+    "num_kv_heads",
+    "vocab_size",
+    "real_vocab_size",
+    "num_blocks",
+    "recursive_loops",
+    "num_routed_experts",
+    "top_k_experts",
+    "expert_hidden",
+    "shared_expert_hidden",
+    "adapter_rank",
+    "adapter_alpha",
+    "use_mhc",
+    "n_hc",
+    "mhc_sinkhorn_iters",
+    "situ_glu",
+    "situ_beta_gate",
+    "situ_beta_up",
+    "swiglu_clamp",
+    "attention_sink",
+    "moe_grouped_gemm",
+    "router_affinity",
+    "router_aux_loss_coeff",
+    "router_z_loss_coeff",
+    "router_balance_bias_enabled",
+    "router_balance_method",
+    "router_balance_bias_update_rate",
+    "router_balance_bias_ema_rate",
+    "router_balance_bias_max",
+    "router_qb_histogram_bins",
+    "router_seq_balance_loss_coeff",
+    "router_capacity_factor",
+    "hash_routing_blocks",
+    "aux_loop_loss_weight",
+    "per_loop_aux_weights",
+    "mtp_heads",
+    "mtp_loss_weight",
+    "fused_cross_entropy_chunks",
+    "loop_dropout_prob",
+    "loop_dropout_min_loops",
+    "max_position_embeddings",
+    "rope_theta",
+    "rope_scaling",
+    "bos_token_id",
+    "eos_token_id",
+    "pad_token_id",
+    "unk_token_id",
+    "fim_prefix_id",
+    "fim_middle_id",
+    "fim_suffix_id",
+    "think_open_id",
+    "think_close_id",
+    "answer_open_id",
+    "answer_close_id",
+    "user_token_id",
+    "assistant_token_id",
+    "system_token_id",
+)
+
+_STRICT_OPTIMIZER_GROUP_KEYS = (
+    "momentum",
+    "nesterov",
+    "ns_steps",
+    "ns_stable_steps",
+    "update_rms",
+    "weight_decay",
+    "betas",
+    "eps",
+    "head_dim",
+    "_peak_lr",
+    "_min_lr",
+)
+
+_STRICT_TRAIN_RECIPE_KEYS = (
+    "batch_size",
+    "grad_accum_steps",
+    "total_steps",
+    "warmup_steps",
+    "lr_schedule",
+    "wsd_decay_steps",
+    "peak_lr",
+    "min_lr",
+    "weight_decay",
+    "grad_clip",
+    "optimizer_name",
+    "muon_lr",
+    "muon_min_lr",
+    "per_head_muon",
+    "muon_momentum",
+    "muon_ns_steps",
+    "muon_ns_stable_steps",
+    "muon_update_rms",
+    "adamw_beta1",
+    "adamw_beta2",
+    "adamw_eps",
+    "router_gumbel_tau_init",
+    "router_gumbel_tau_final",
+    "router_gumbel_anneal_steps",
+    "gradient_checkpointing",
+    "phases",
+)
+
+
+def _training_recipe_metadata(cfg: PretrainConfig) -> dict:
+    """Serializable training semantics that must not drift across v7 resume."""
+    return {key: getattr(cfg, key, None) for key in _STRICT_TRAIN_RECIPE_KEYS}
+
 
 def get_lr(step: int, cfg: PretrainConfig) -> float:
-    """Cosine LR with linear warmup, returning the AdamW/Lion peak_lr."""
+    """Scheduled AdamW/Lion LR with linear warmup."""
+    warmup = max(cfg.warmup_steps, 1)
     if step < cfg.warmup_steps:
-        return cfg.peak_lr * step / cfg.warmup_steps
-    progress = (step - cfg.warmup_steps) / max(cfg.total_steps - cfg.warmup_steps, 1)
+        return cfg.peak_lr * step / warmup
+    schedule = getattr(cfg, "lr_schedule", "cosine").lower()
+    if schedule == "wsd":
+        decay_steps = getattr(cfg, "wsd_decay_steps", 0)
+        if not 0 < decay_steps <= cfg.total_steps - cfg.warmup_steps:
+            raise ValueError(
+                "WSD requires 0 < wsd_decay_steps <= total_steps - warmup_steps"
+            )
+        decay_start = cfg.total_steps - decay_steps
+        if step < decay_start:
+            return cfg.peak_lr
+        progress = min(max((step - decay_start) / decay_steps, 0.0), 1.0)
+    elif schedule == "cosine":
+        progress = (step - cfg.warmup_steps) / max(
+            cfg.total_steps - cfg.warmup_steps,
+            1,
+        )
+        progress = min(max(progress, 0.0), 1.0)
+    else:
+        raise ValueError(f"Unknown lr_schedule {schedule!r}")
     return cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
         1 + math.cos(math.pi * progress)
     )
 
 
 def _set_param_group_lrs(
-    optimizer, step: int, cfg: PretrainConfig,
+    optimizer,
+    step: int,
+    cfg: PretrainConfig,
 ) -> float:
     """Apply the cosine schedule to every param group, respecting the
     per-group `_peak_lr` / `_min_lr` tags written at construction.
@@ -76,16 +208,38 @@ def _set_param_group_lrs(
     eff_step = max(step - anchor, 0)
     eff_total = max(cfg.total_steps - anchor, 1)
     if eff_step < cfg.warmup_steps:
-        ratio = eff_step / cfg.warmup_steps
+        ratio = eff_step / max(cfg.warmup_steps, 1)
         for pg in optimizer.param_groups:
             peak = pg.get("_peak_lr", cfg.peak_lr)
             pg["lr"] = peak * ratio
         return cfg.peak_lr * ratio
 
-    progress = (eff_step - cfg.warmup_steps) / max(
-        eff_total - cfg.warmup_steps, 1,
-    )
-    cosine_half = 0.5 * (1 + math.cos(math.pi * progress))
+    schedule = getattr(cfg, "lr_schedule", "cosine").lower()
+    if schedule == "wsd":
+        decay_steps = getattr(cfg, "wsd_decay_steps", 0)
+        if not 0 < decay_steps <= eff_total - cfg.warmup_steps:
+            raise ValueError(
+                "WSD requires 0 < wsd_decay_steps <= effective "
+                "total_steps - warmup_steps"
+            )
+        decay_start = eff_total - decay_steps
+        if eff_step < decay_start:
+            cosine_half = 1.0
+        else:
+            progress = min(
+                max((eff_step - decay_start) / decay_steps, 0.0),
+                1.0,
+            )
+            cosine_half = 0.5 * (1 + math.cos(math.pi * progress))
+    elif schedule == "cosine":
+        progress = (eff_step - cfg.warmup_steps) / max(
+            eff_total - cfg.warmup_steps,
+            1,
+        )
+        progress = min(max(progress, 0.0), 1.0)
+        cosine_half = 0.5 * (1 + math.cos(math.pi * progress))
+    else:
+        raise ValueError(f"Unknown lr_schedule {schedule!r}")
     for pg in optimizer.param_groups:
         peak = pg.get("_peak_lr", cfg.peak_lr)
         floor = pg.get("_min_lr", cfg.min_lr)
@@ -132,8 +286,10 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     step: int,
     path: str,
+    training_stage: str = "pretrain_v5",
+    training_recipe: dict | None = None,
 ) -> None:
-    """Save a training checkpoint (v5 format)."""
+    """Save a training checkpoint atomically."""
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     # Atomic save: serialize to a temp file, then os.replace onto the final
     # name. torch.save writes directly, and a ~4.9GB checkpoint takes several
@@ -147,7 +303,11 @@ def save_checkpoint(
             "step": step,
             "model_state_dict": inner.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "training_stage": "pretrain_v5",
+            "training_stage": training_stage,
+            "training_recipe": training_recipe,
+            "model_config": (
+                inner.config.to_dict() if hasattr(inner, "config") else None
+            ),
         },
         tmp_path,
     )
@@ -179,6 +339,11 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     path: str,
     device: torch.device,
+    *,
+    strict_optimizer: bool = False,
+    strict_metadata: bool = False,
+    expected_training_stage: str | None = None,
+    expected_training_recipe: dict | None = None,
 ) -> int:
     """Load from checkpoint. Returns step to resume from (0 if path missing)."""
     if not os.path.exists(path):
@@ -190,10 +355,70 @@ def load_checkpoint(
         ckpt["model_state_dict"],
         context=f"pretrain resume from {path}",
     )
+    if strict_metadata:
+        saved_stage = ckpt.get("training_stage")
+        if (
+            expected_training_stage is not None
+            and saved_stage != expected_training_stage
+        ):
+            raise RuntimeError(
+                "Strict resume found training-stage drift: "
+                f"checkpoint={saved_stage!r}, "
+                f"configured={expected_training_stage!r}"
+            )
+        saved_recipe = ckpt.get("training_recipe")
+        if saved_recipe is None or expected_training_recipe is None:
+            raise RuntimeError(
+                "Strict resume requires training_recipe checkpoint metadata."
+            )
+        if saved_recipe != expected_training_recipe:
+            drift = {
+                key: (saved_recipe.get(key), expected_training_recipe.get(key))
+                for key in set(saved_recipe) | set(expected_training_recipe)
+                if saved_recipe.get(key) != expected_training_recipe.get(key)
+            }
+            raise RuntimeError(f"Strict resume found training-recipe drift: {drift}")
+        saved_config = ckpt.get("model_config")
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+        current_config = inner.config.to_dict() if hasattr(inner, "config") else None
+        if saved_config is None or current_config is None:
+            raise RuntimeError(
+                "Strict resume requires model_config checkpoint metadata."
+            )
+        drift = {
+            key: (saved_config.get(key), current_config.get(key))
+            for key in _STRICT_MODEL_CONFIG_KEYS
+            if saved_config.get(key) != current_config.get(key)
+        }
+        if drift:
+            raise RuntimeError(
+                f"Strict resume found model configuration drift: {drift}"
+            )
+
+    expected_optimizer_groups = [
+        {key: group.get(key) for key in _STRICT_OPTIMIZER_GROUP_KEYS}
+        for group in optimizer.param_groups
+    ]
     try:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     except (ValueError, RuntimeError) as e:
+        if strict_optimizer:
+            raise RuntimeError(
+                "Optimizer state mismatch during strict resume; refusing to "
+                "continue with reset momentum/state."
+            ) from e
         print(f"  Optimizer state mismatch, starting fresh: {e}")
+    if strict_optimizer:
+        loaded_optimizer_groups = [
+            {key: group.get(key) for key in _STRICT_OPTIMIZER_GROUP_KEYS}
+            for group in optimizer.param_groups
+        ]
+        if loaded_optimizer_groups != expected_optimizer_groups:
+            raise RuntimeError(
+                "Optimizer recipe drift during strict resume; refusing to "
+                "continue after checkpoint hyperparameters replaced the "
+                "configured v7 recipe."
+            )
     start_step = ckpt["step"] + 1
     print(f"  Resumed at step {start_step}")
     return start_step
@@ -289,6 +514,7 @@ def run_eval(
         # "Fatal Python error: PyGILState_Release" in one of the workers
         # — a leak per eval call. Force order + GC so workers exit cleanly.
         import gc
+
         del data_iter
         del loader
         gc.collect()
@@ -364,8 +590,7 @@ def run_rollout_eval(
     if hasattr(inner, "set_moe_telemetry"):
         inner.set_moe_telemetry(False)
 
-    cache_key = ("rollout", jsonl_path, tokenizer_name, seq_len, batch_size,
-                 eval_steps)
+    cache_key = ("rollout", jsonl_path, tokenizer_name, seq_len, batch_size, eval_steps)
     cached = _EVAL_BATCH_CACHE.get(cache_key)
     if cached is None:
         loader = make_rollout_loader(
@@ -374,7 +599,7 @@ def run_rollout_eval(
             tokenizer_name=tokenizer_name,
             batch_size=batch_size,
             step_num=999999,  # fixed seed; never collides with training seeds
-            num_workers=0,    # same rationale as run_eval: no worker spawn
+            num_workers=0,  # same rationale as run_eval: no worker spawn
         )
         data_iter = iter(loader)
         cached = []
@@ -385,6 +610,7 @@ def run_rollout_eval(
                 break
         _EVAL_BATCH_CACHE[cache_key] = cached
         import gc
+
         del data_iter
         del loader
         gc.collect()
@@ -699,13 +925,16 @@ def _average_moe_snapshots(
         "bias_ema_max": avg.get("moe/bias_ema_max_mean", 0.0),
         "bias_ema_min": avg.get("moe/bias_ema_min_mean", 0.0),
         "prebias_per_token_H": avg.get(
-            "moe/prebias_per_token_entropy_mean", 0.0,
+            "moe/prebias_per_token_entropy_mean",
+            0.0,
         ),
         "prebias_marginal_H": avg.get(
-            "moe/prebias_marginal_entropy_mean", 0.0,
+            "moe/prebias_marginal_entropy_mean",
+            0.0,
         ),
         "prebias_assign_H": avg.get(
-            "moe/prebias_assignment_entropy_mean", 0.0,
+            "moe/prebias_assignment_entropy_mean",
+            0.0,
         ),
         "prebias_raw_max": avg.get("moe/prebias_raw_max_prob_mean", 0.0),
         "prebias_top_margin": avg.get("moe/prebias_top_margin_mean", 0.0),
@@ -720,7 +949,10 @@ def _average_moe_snapshots(
 
 
 def _check_early_stop_criteria(
-    step: int, summary: dict, cfg: PretrainConfig, model_cfg: OSRTConfig,
+    step: int,
+    summary: dict,
+    cfg: PretrainConfig,
+    model_cfg: OSRTConfig,
 ) -> list[str]:
     """Return list of failing criteria (empty means all pass)."""
     failures: list[str] = []
@@ -728,9 +960,11 @@ def _check_early_stop_criteria(
     raw_max = summary.get("clean_raw_max", summary["raw_max"])
     top_margin = summary.get("clean_top_margin", summary["top_margin"])
     marginal_h = summary.get("clean_marginal_H", summary["marginal_H"])
-    # per_token_entropy target: init near ln(num_routed) = ln(8) ≈ 2.079.
+    # Per-token entropy starts near ln(num_routed) under uniform routing.
     # Require it to drop by at least min_per_token_entropy_drop.
-    target_pte = 2.079 - cfg.min_per_token_entropy_drop
+    target_pte = math.log(model_cfg.num_routed_experts) - (
+        cfg.min_per_token_entropy_drop
+    )
     if per_token_h > target_pte:
         failures.append(
             f"clean_per_token_entropy {per_token_h:.3f} > "
@@ -753,7 +987,9 @@ def _check_early_stop_criteria(
         )
     prebias_marginal_h = summary.get("prebias_marginal_H", marginal_h)
     min_prebias_marginal = getattr(
-        cfg, "min_prebias_marginal_entropy", cfg.min_marginal_entropy,
+        cfg,
+        "min_prebias_marginal_entropy",
+        cfg.min_marginal_entropy,
     )
     if prebias_marginal_h < min_prebias_marginal:
         failures.append(
@@ -769,11 +1005,18 @@ def _check_early_stop_criteria(
             f"{min_prebias_expert:.4f} "
             "(one or more experts are dead before balance bias)"
         )
-    bias_limit = (
-        model_cfg.router_balance_bias_max
-        * getattr(cfg, "max_bias_saturation_fraction", 1.0)
+    bias_limit = model_cfg.router_balance_bias_max * getattr(
+        cfg, "max_bias_saturation_fraction", 1.0
     )
-    if model_cfg.router_balance_bias_enabled and bias_limit > 0:
+    fixed_step_balance = (
+        getattr(
+            model_cfg,
+            "router_balance_method",
+            "fixed_step",
+        )
+        == "fixed_step"
+    )
+    if model_cfg.router_balance_bias_enabled and fixed_step_balance and bias_limit > 0:
         bias_abs_max = summary.get("bias_abs_max", 0.0)
         if bias_abs_max > bias_limit:
             failures.append(
@@ -803,6 +1046,14 @@ def run_training(
             with real checkpoints.
     """
     device = torch.device("cuda")
+    checkpoint_prefix = getattr(train_cfg, "checkpoint_prefix", "osrt_v5")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", checkpoint_prefix) is None:
+        raise ValueError(
+            "checkpoint_prefix must be a filename-safe stem without path "
+            f"separators, got {checkpoint_prefix!r}"
+        )
+    training_stage = getattr(train_cfg, "training_stage", "pretrain_v5")
+    training_recipe = _training_recipe_metadata(train_cfg)
 
     print("=" * 60)
     print("OSRT — Mixtral MoE Pre-training")
@@ -853,12 +1104,14 @@ def run_training(
     )
     print(f"Hidden dim          : {model_config.dim}")
     print(f"Peak LR             : {train_cfg.peak_lr}")
+    print(f"LR schedule         : {getattr(train_cfg, 'lr_schedule', 'cosine')}")
     print(f"Optimizer           : {train_cfg.optimizer_name}")
     print(f"Total steps         : {train_cfg.total_steps}")
     print(f"Aux loss coeff      : {model_config.router_aux_loss_coeff}")
     print(
         f"Balance bias        : {model_config.router_balance_bias_enabled} "
-        f"(rate={model_config.router_balance_bias_update_rate}, "
+        f"({getattr(model_config, 'router_balance_method', 'fixed_step')}; "
+        f"rate={model_config.router_balance_bias_update_rate}, "
         f"max={model_config.router_balance_bias_max})"
     )
     print(
@@ -880,6 +1133,7 @@ def run_training(
         # compiles fullgraph (verified: 0 breaks vs 12 for the loop path).
         if getattr(model_config, "moe_grouped_gemm", False):
             import torch._dynamo as _dynamo
+
             _dynamo.config.capture_scalar_outputs = True
             _dynamo.config.capture_dynamic_output_shape_ops = True
             print("Grouped-GEMM MoE: enabled dynamo scalar/dynamic-shape capture")
@@ -908,18 +1162,14 @@ def run_training(
                 "shared_expert_hidden": model_config.shared_expert_hidden,
                 "capacity_factor": model_config.router_capacity_factor,
                 "aux_loss_coeff": model_config.router_aux_loss_coeff,
-                "balance_bias_enabled": (
-                    model_config.router_balance_bias_enabled
-                ),
+                "balance_bias_enabled": (model_config.router_balance_bias_enabled),
                 "balance_bias_update_rate": (
                     model_config.router_balance_bias_update_rate
                 ),
                 "balance_bias_max": model_config.router_balance_bias_max,
                 "router_gumbel_tau_init": train_cfg.router_gumbel_tau_init,
                 "router_gumbel_tau_final": train_cfg.router_gumbel_tau_final,
-                "router_gumbel_anneal_steps": (
-                    train_cfg.router_gumbel_anneal_steps
-                ),
+                "router_gumbel_anneal_steps": (train_cfg.router_gumbel_anneal_steps),
                 "peak_lr": train_cfg.peak_lr,
                 "optimizer": train_cfg.optimizer_name,
                 "total_steps": train_cfg.total_steps,
@@ -959,15 +1209,21 @@ def run_training(
         muon = Muon(
             muon_params,
             lr=muon_lr,
-            momentum=0.95,
+            momentum=getattr(train_cfg, "muon_momentum", 0.95),
             nesterov=True,
+            ns_steps=getattr(train_cfg, "muon_ns_steps", 5),
+            ns_stable_steps=getattr(train_cfg, "muon_ns_stable_steps", 0),
+            update_rms=getattr(train_cfg, "muon_update_rms", None),
             weight_decay=train_cfg.weight_decay,
         )
         adamw = torch.optim.AdamW(
             adamw_groups,
             lr=train_cfg.peak_lr,
-            betas=(0.9, 0.95),
-            eps=1e-8,
+            betas=(
+                getattr(train_cfg, "adamw_beta1", 0.9),
+                getattr(train_cfg, "adamw_beta2", 0.95),
+            ),
+            eps=getattr(train_cfg, "adamw_eps", 1e-8),
         )
         # Tag each group with its peak/min for the cosine schedule.
         muon_min = getattr(train_cfg, "muon_min_lr", muon_lr * 0.1)
@@ -1006,6 +1262,7 @@ def run_training(
 
         if train_cfg.optimizer_name.lower() == "lion":
             from lion_pytorch import Lion
+
             optimizer = Lion(
                 [
                     {"params": other_params, "weight_decay": train_cfg.weight_decay},
@@ -1021,23 +1278,26 @@ def run_training(
                     {"params": router_params, "weight_decay": 0.0},
                 ],
                 lr=train_cfg.peak_lr,
-                betas=(0.9, 0.95),
-                eps=1e-8,
+                betas=(
+                    getattr(train_cfg, "adamw_beta1", 0.9),
+                    getattr(train_cfg, "adamw_beta2", 0.95),
+                ),
+                eps=getattr(train_cfg, "adamw_eps", 1e-8),
             )
             print(f"Using AdamW (wd={train_cfg.weight_decay}, router_wd=0.0)")
 
     # Checkpoint resume.
     # Three kinds of checkpoints with different naming:
-    #   osrt_v5_step_N.pt          — normal interval save (resumable)
-    #   osrt_v5_rescue_step_N.pt   — 23h timeout rescue    (resumable)
-    #   osrt_v5_failed_step_N.pt   — failed early-stop     (NOT resumed; the
+    #   <prefix>_step_N.pt          — normal interval save (resumable)
+    #   <prefix>_rescue_step_N.pt   — 23h timeout rescue    (resumable)
+    #   <prefix>_failed_step_N.pt   — failed early-stop     (NOT resumed; the
     #     run declared itself bad. If you want to investigate or force-resume
     #     anyway, rename the file to osrt_v5_step_N.pt explicitly.)
     # Resume scans the first two patterns and picks the highest step.
     os.makedirs(ckpt_dir, exist_ok=True)
 
     def _extract_step(path: str) -> int | None:
-        """Extract the step number from an osrt_v5_..._step_N.pt path."""
+        """Extract the step number from a <prefix>_..._step_N.pt path."""
         try:
             return int(path.rsplit("_", 1)[1].split(".")[0])
         except (ValueError, IndexError):
@@ -1054,8 +1314,8 @@ def run_training(
     # on ties. When steps differ, higher step always wins regardless
     # of pattern.
     for pattern in (
-        f"{ckpt_dir}/osrt_v5_step_*.pt",
-        f"{ckpt_dir}/osrt_v5_rescue_step_*.pt",
+        f"{ckpt_dir}/{checkpoint_prefix}_step_*.pt",
+        f"{ckpt_dir}/{checkpoint_prefix}_rescue_step_*.pt",
     ):
         for f in glob.glob(pattern):
             s = _extract_step(f)
@@ -1066,19 +1326,36 @@ def run_training(
                 best_ckpt = f
 
     # Explicit notice if there's a FAILED checkpoint — user should know.
-    failed_paths = sorted(glob.glob(f"{ckpt_dir}/osrt_v5_failed_step_*.pt"))
+    failed_paths = sorted(glob.glob(f"{ckpt_dir}/{checkpoint_prefix}_failed_step_*.pt"))
     if failed_paths:
         print(
             f"WARNING: Found {len(failed_paths)} failed-early-stop "
             f"checkpoint(s): {[os.path.basename(p) for p in failed_paths]}. "
             f"These are NOT resumed automatically. Rename to "
-            f"osrt_v5_step_N.pt if you want to force-resume.",
+            f"{checkpoint_prefix}_step_N.pt if you want to force-resume.",
         )
 
     start_step = 0
     if best_step > 0 and best_ckpt is not None:
         print(f"Found checkpoint at step {best_step}: {best_ckpt}")
-        start_step = load_checkpoint(model, optimizer, best_ckpt, device)
+        start_step = load_checkpoint(
+            model,
+            optimizer,
+            best_ckpt,
+            device,
+            strict_optimizer=getattr(
+                train_cfg,
+                "strict_optimizer_resume",
+                False,
+            ),
+            strict_metadata=getattr(
+                train_cfg,
+                "strict_optimizer_resume",
+                False,
+            ),
+            expected_training_stage=training_stage,
+            expected_training_recipe=training_recipe,
+        )
 
     # ------------------------------------------------------------------
     # Training loop
@@ -1100,10 +1377,12 @@ def run_training(
             current_phase = phase_name
             current_seq_len = phase_cfg["seq_len"]
             grad_accum = phase_cfg.get(
-                "grad_accum_steps", train_cfg.grad_accum_steps,
+                "grad_accum_steps",
+                train_cfg.grad_accum_steps,
             )
             current_batch_size = phase_cfg.get(
-                "batch_size", train_cfg.batch_size,
+                "batch_size",
+                train_cfg.batch_size,
             )
 
             print(
@@ -1111,9 +1390,7 @@ def run_training(
                 f"batch: {current_batch_size} | accum: {grad_accum} | "
                 f"Step: {step}"
             )
-            print(
-                f"    Datasets: {[d['name'] for d in phase_cfg['datasets']]}"
-            )
+            print(f"    Datasets: {[d['name'] for d in phase_cfg['datasets']]}")
 
             if current_loader is not None:
                 # Tear down the previous phase's loader BEFORE building the
@@ -1131,6 +1408,7 @@ def run_training(
                 # refs and force a GC pass so old workers fully exit
                 # before any new ones come up.
                 import gc
+
                 loader_iter = None
                 current_loader = None
                 gc.collect()
@@ -1153,10 +1431,12 @@ def run_training(
             print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
         else:
             grad_accum = phase_cfg.get(
-                "grad_accum_steps", train_cfg.grad_accum_steps,
+                "grad_accum_steps",
+                train_cfg.grad_accum_steps,
             )
             current_batch_size = phase_cfg.get(
-                "batch_size", train_cfg.batch_size,
+                "batch_size",
+                train_cfg.batch_size,
             )
 
         # Schedule writes per-group LRs honouring _peak_lr / _min_lr
@@ -1240,7 +1520,19 @@ def run_training(
             labels = labels.to(device, non_blocking=True)
 
             if step == start_step and micro == 0:
-                print(f"First batch fetched in {time.time() - batch_t:.1f}s")
+                import hashlib
+
+                first_batch_sha = hashlib.sha256(
+                    input_ids.detach().to("cpu").numpy().tobytes()
+                ).hexdigest()[:16]
+                print(
+                    f"First batch fetched in {time.time() - batch_t:.1f}s | "
+                    f"resume_step={start_step} "
+                    f"first_batch_sha={first_batch_sha}"
+                )
+                if use_wandb:
+                    wandb.run.summary["data/first_batch_sha"] = first_batch_sha
+                    wandb.run.summary["data/first_batch_resume_step"] = start_step
                 print("Running first forward pass (torch.compile tracing)...")
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -1251,9 +1543,7 @@ def run_training(
             # Pull separated components from the unwrapped model for clean
             # logging (total loss includes aux; these are the components).
             if inner.last_task_loss is not None:
-                accum_task_loss += (
-                    inner.last_task_loss.detach() / grad_accum
-                )
+                accum_task_loss += inner.last_task_loss.detach() / grad_accum
             if inner.last_balance_loss_normalised is not None:
                 accum_balance_norm += (
                     inner.last_balance_loss_normalised.detach() / grad_accum
@@ -1288,8 +1578,13 @@ def run_training(
             torch.cuda.reset_peak_memory_stats()
             eff_batch = current_batch_size * grad_accum
             steps_done = max(step - start_step, 1)
-            tok_per_sec = eff_batch * current_seq_len / max(
-                elapsed / steps_done, 1e-8,
+            tok_per_sec = (
+                eff_batch
+                * current_seq_len
+                / max(
+                    elapsed / steps_done,
+                    1e-8,
+                )
             )
 
             # moe_metrics / moe_summary are already computed above as the
@@ -1353,8 +1648,9 @@ def run_training(
                 f"           loop |dx|/|x|: {loop_str}",
                 flush=True,
             )
+            loop_min = moe_summary["loop_update_norm_min"]
             print(
-                f"           collapse: loop_upd min={moe_summary['loop_update_norm_min']:.3f} "
+                f"           collapse: loop_upd min={loop_min:.3f} "
                 f"last={moe_summary['loop_update_norm_last']:.3f} "
                 f"mean={moe_summary['loop_update_norm_mean']:.3f} | "
                 f"dead_experts={int(moe_summary['dead_experts_total'])} | "
@@ -1386,9 +1682,13 @@ def run_training(
         # --- Eval on held-out FineWeb-Edu ---
         if step > 0 and step % train_cfg.eval_interval == 0:
             eval_metrics = run_eval(
-                model, tokenizer_name, current_seq_len,
-                current_batch_size, train_cfg.eval_steps,
-                device, model_config.real_vocab_size,
+                model,
+                tokenizer_name,
+                current_seq_len,
+                current_batch_size,
+                train_cfg.eval_steps,
+                device,
+                model_config.real_vocab_size,
             )
             print(
                 f"  EVAL step {step} | "
@@ -1410,12 +1710,14 @@ def run_training(
             # single-batch snapshot — so the gate isn't tripped by sample
             # noise on a 16k-token micro-batch.
             failures = _check_early_stop_criteria(
-                step, moe_summary, train_cfg, model_config,
+                step,
+                moe_summary,
+                train_cfg,
+                model_config,
             )
             if failures:
                 print(
-                    f"\n>>> EARLY STOP at step {step}: "
-                    f"router-health criteria failed:",
+                    f"\n>>> EARLY STOP at step {step}: router-health criteria failed:",
                     flush=True,
                 )
                 for f in failures:
@@ -1428,8 +1730,15 @@ def run_training(
                     "before retrying.",
                     flush=True,
                 )
-                failed_path = f"{ckpt_dir}/osrt_v5_failed_step_{step}.pt"
-                save_checkpoint(model, optimizer, step, failed_path)
+                failed_path = f"{ckpt_dir}/{checkpoint_prefix}_failed_step_{step}.pt"
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    step,
+                    failed_path,
+                    training_stage,
+                    training_recipe,
+                )
                 vol.commit()
                 early_stop_triggered = True
                 break
@@ -1444,16 +1753,30 @@ def run_training(
         # Runs AFTER early-stop check so failed runs never produce a
         # step_N.pt that would bypass the gate on resume.
         if step > 0 and step % train_cfg.ckpt_interval == 0:
-            path = f"{ckpt_dir}/osrt_v5_step_{step}.pt"
-            save_checkpoint(model, optimizer, step, path)
+            path = f"{ckpt_dir}/{checkpoint_prefix}_step_{step}.pt"
+            save_checkpoint(
+                model,
+                optimizer,
+                step,
+                path,
+                training_stage,
+                training_recipe,
+            )
             vol.commit()
 
         # --- 23h Modal safety (rescue checkpoint + clean exit) ---
         # Rescue filename includes the step so resume scanner can rank it
         # against numbered checkpoints.
         if time.time() - start_time > 82_800:
-            rescue_path = f"{ckpt_dir}/osrt_v5_rescue_step_{step}.pt"
-            save_checkpoint(model, optimizer, step, rescue_path)
+            rescue_path = f"{ckpt_dir}/{checkpoint_prefix}_rescue_step_{step}.pt"
+            save_checkpoint(
+                model,
+                optimizer,
+                step,
+                rescue_path,
+                training_stage,
+                training_recipe,
+            )
             vol.commit()
             print(
                 f"\n23h boundary reached at step {step}. "
@@ -1470,16 +1793,22 @@ def run_training(
     if not early_stop_triggered:
         elapsed_total = time.time() - start_time
         print(
-            f"\nPretrain complete. {step:,} steps in "
-            f"{elapsed_total / 3600:.1f}h",
+            f"\nPretrain complete. {step:,} steps in {elapsed_total / 3600:.1f}h",
             flush=True,
         )
         # Gate the final save: sanity/mem/compile checks set
         # save_final_checkpoint=False so they don't write a throwaway
         # osrt_v5_final.pt that would clobber a real run's final on the volume.
         if getattr(train_cfg, "save_final_checkpoint", True):
-            final_path = f"{ckpt_dir}/osrt_v5_final.pt"
-            save_checkpoint(model, optimizer, step, final_path)
+            final_path = f"{ckpt_dir}/{checkpoint_prefix}_final.pt"
+            save_checkpoint(
+                model,
+                optimizer,
+                step,
+                final_path,
+                training_stage,
+                training_recipe,
+            )
             vol.commit()
             print(f"Final checkpoint: {final_path}", flush=True)
         else:
@@ -1595,6 +1924,7 @@ def run_pretrain_extend(
     hra_native = getattr(extend_cfg, "hra_native", False)
     if extend_cfg.hra_enabled and not hra_native:
         from osrt.hra import inject_hra
+
         print(f"Injecting HRA before load (rank={extend_cfg.hra_rank})...")
         inject_hra(
             model,
@@ -1632,9 +1962,7 @@ def run_pretrain_extend(
     # ── Freeze HRA after load ──────────────────────────────────────
     if extend_cfg.hra_enabled and getattr(extend_cfg, "hra_frozen", False):
         n_frozen_params, n_frozen_tensors = _freeze_hra_params(model)
-        trainable_after = sum(
-            p.numel() for p in model.parameters() if p.requires_grad
-        )
+        trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(
             f"Froze {n_frozen_tensors} HRA tensors "
             f"({n_frozen_params:,} params, "
@@ -1672,8 +2000,7 @@ def run_pretrain_extend(
                 "warmup_steps": extend_cfg.warmup_steps,
                 "total_steps": extend_cfg.total_steps,
                 "datasets": [
-                    d["name"]
-                    for d in extend_cfg.phases["extend"]["datasets"]
+                    d["name"] for d in extend_cfg.phases["extend"]["datasets"]
                 ],
             },
         }
@@ -1691,6 +2018,7 @@ def run_pretrain_extend(
             Muon,
             build_param_groups,
         )
+
         muon_params, adamw_groups = build_param_groups(
             inner_model.named_parameters(),
             weight_decay=extend_cfg.weight_decay,
@@ -1809,6 +2137,7 @@ def run_pretrain_extend(
     rollout_path = getattr(extend_cfg, "rollout_dataset_path", None)
     if rollout_path:
         from osrt.data import make_rollout_loader
+
         print(f"    [MOPD] using rollout dataset: {rollout_path}")
         loader = make_rollout_loader(
             jsonl_path=rollout_path,
@@ -1843,9 +2172,7 @@ def run_pretrain_extend(
     # never reads).
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     base = inner.model if hasattr(inner, "model") else inner
-    need_ckpt = bool(
-        getattr(extend_cfg, "gradient_checkpointing", seq_len >= 4096)
-    )
+    need_ckpt = bool(getattr(extend_cfg, "gradient_checkpointing", seq_len >= 4096))
     base._osrt_grad_ckpt = need_ckpt
     print(
         f"    Gradient checkpointing: {'ENABLED' if need_ckpt else 'disabled'} "
@@ -1863,10 +2190,14 @@ def run_pretrain_extend(
     base_cfg = inner.config
     final_aux_weight = getattr(base_cfg, "aux_loop_loss_weight", 0.0)
     aux_curriculum_steps = getattr(
-        extend_cfg, "aux_loop_curriculum_steps", 0,
+        extend_cfg,
+        "aux_loop_curriculum_steps",
+        0,
     )
     aux_curriculum_start = getattr(
-        extend_cfg, "aux_loop_weight_start", final_aux_weight,
+        extend_cfg,
+        "aux_loop_weight_start",
+        final_aux_weight,
     )
 
     while step < extend_cfg.total_steps:
@@ -1878,9 +2209,8 @@ def run_pretrain_extend(
         if aux_curriculum_steps > 0 and final_aux_weight > 0:
             if step < aux_curriculum_steps:
                 ratio = step / aux_curriculum_steps
-                base_cfg.aux_loop_loss_weight = (
-                    aux_curriculum_start
-                    + ratio * (final_aux_weight - aux_curriculum_start)
+                base_cfg.aux_loop_loss_weight = aux_curriculum_start + ratio * (
+                    final_aux_weight - aux_curriculum_start
                 )
             else:
                 base_cfg.aux_loop_loss_weight = final_aux_weight
@@ -1918,21 +2248,23 @@ def run_pretrain_extend(
                 # Loader exhausted — rebuild with a different seed.
                 # Honour the MOPD rollout-path override here too.
                 import gc
+
                 loader_iter = None
                 del loader
                 gc.collect()
                 if rollout_path:
                     from osrt.data import make_rollout_loader
+
                     loader = make_rollout_loader(
                         jsonl_path=rollout_path,
                         seq_len=seq_len,
                         tokenizer_name=tokenizer_name,
                         batch_size=batch_size,
                         step_num=step,
-                        num_workers=getattr(
-                            extend_cfg, "dataloader_num_workers", 2),
+                        num_workers=getattr(extend_cfg, "dataloader_num_workers", 2),
                         prefetch_factor=getattr(
-                            extend_cfg, "dataloader_prefetch_factor", 2),
+                            extend_cfg, "dataloader_prefetch_factor", 2
+                        ),
                     )
                 else:
                     # Thread the configured worker/prefetch settings, matching
@@ -1947,10 +2279,10 @@ def run_pretrain_extend(
                         tokenizer_name,
                         batch_size,
                         step,
-                        num_workers=getattr(
-                            extend_cfg, "dataloader_num_workers", 4),
+                        num_workers=getattr(extend_cfg, "dataloader_num_workers", 4),
                         prefetch_factor=getattr(
-                            extend_cfg, "dataloader_prefetch_factor", 4),
+                            extend_cfg, "dataloader_prefetch_factor", 4
+                        ),
                     )
                 loader_iter = iter(loader)
                 input_ids, labels = next(loader_iter)
@@ -1977,9 +2309,7 @@ def run_pretrain_extend(
                 )
                 if use_wandb:
                     wandb.run.summary["data/first_batch_sha"] = fb_sha
-                    wandb.run.summary["data/first_batch_resume_step"] = (
-                        start_step
-                    )
+                    wandb.run.summary["data/first_batch_resume_step"] = start_step
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 outputs = model(input_ids, labels=labels)
@@ -1987,9 +2317,7 @@ def run_pretrain_extend(
             loss.backward()
 
             if inner.last_task_loss is not None:
-                accum_task_loss += (
-                    inner.last_task_loss.detach() / grad_accum
-                )
+                accum_task_loss += inner.last_task_loss.detach() / grad_accum
             if inner.last_balance_loss_normalised is not None:
                 accum_balance_norm += (
                     inner.last_balance_loss_normalised.detach() / grad_accum
@@ -1999,7 +2327,8 @@ def run_pretrain_extend(
                 moe_snapshots.append(micro_metrics)
 
         torch.nn.utils.clip_grad_norm_(
-            model.parameters(), extend_cfg.grad_clip,
+            model.parameters(),
+            extend_cfg.grad_clip,
         )
         optimizer.step()
         apply_router_balance_updates(model)
@@ -2017,8 +2346,13 @@ def run_pretrain_extend(
             torch.cuda.reset_peak_memory_stats()
             eff_batch = batch_size * grad_accum
             steps_done = max(step - start_step, 1)
-            tok_per_sec = eff_batch * seq_len / max(
-                elapsed / steps_done, 1e-8,
+            tok_per_sec = (
+                eff_batch
+                * seq_len
+                / max(
+                    elapsed / steps_done,
+                    1e-8,
+                )
             )
 
             # Recursion telemetry: per-loop aux CE loss (if enabled) and
@@ -2027,9 +2361,11 @@ def run_pretrain_extend(
             # predict next-token. The adapter magnitude tells us whether
             # those loops' adapters are growing or staying tiny. Together
             # they answer "is the recursive depth being used?" in real time.
-            per_loop_aux = [
-                l.item() for l in inner.last_per_loop_aux_losses
-            ] if hasattr(inner, "last_per_loop_aux_losses") else []
+            per_loop_aux = (
+                [loss.item() for loss in inner.last_per_loop_aux_losses]
+                if hasattr(inner, "last_per_loop_aux_losses")
+                else []
+            )
             aux_total = (
                 inner.last_aux_loop_total.item()
                 if getattr(inner, "last_aux_loop_total", None) is not None
@@ -2068,8 +2404,7 @@ def run_pretrain_extend(
             if per_loop_aux:
                 aux_str = " ".join(f"{v:.3f}" for v in per_loop_aux)
                 print(
-                    f"           aux: total={aux_total:.3f}  "
-                    f"per_loop=[{aux_str}]",
+                    f"           aux: total={aux_total:.3f}  per_loop=[{aux_str}]",
                     flush=True,
                 )
             adapter_str = " ".join(f"{v:.3f}" for v in per_loop_adapter_norm)
@@ -2144,8 +2479,12 @@ def run_pretrain_extend(
         # best-effort contract as the FineWeb eval above.
         sft_eval_path = getattr(extend_cfg, "rollout_eval_path", "")
         sft_eval_interval = getattr(extend_cfg, "rollout_eval_interval", 0)
-        if (sft_eval_path and sft_eval_interval and step > 0
-                and step % sft_eval_interval == 0):
+        if (
+            sft_eval_path
+            and sft_eval_interval
+            and step > 0
+            and step % sft_eval_interval == 0
+        ):
             try:
                 m = run_rollout_eval(
                     model,
@@ -2181,9 +2520,7 @@ def run_pretrain_extend(
 
         # ── 23h Modal safety rescue ────────────────────────────────
         if time.time() - start_time > 82_800:
-            rescue_path = (
-                f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_{step}.pt"
-            )
+            rescue_path = f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_{step}.pt"
             save_checkpoint(model, optimizer, step, rescue_path)
             vol.commit()
             print(
@@ -2218,8 +2555,7 @@ def run_pretrain_extend(
     vol.commit()
     elapsed_total = time.time() - start_time
     print(
-        f"\n{prefix} complete. {step:,} steps in "
-        f"{elapsed_total / 3600:.1f}h",
+        f"\n{prefix} complete. {step:,} steps in {elapsed_total / 3600:.1f}h",
         flush=True,
     )
     print(f"Final checkpoint: {final_path}", flush=True)

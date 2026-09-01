@@ -28,6 +28,7 @@ in SFTv2Config). Eval the periodic checkpoints offline with:
     PYTHONPATH=src python scripts/local_sft_eval.py \
         --ckpt checkpoints/v5/osrt_v5_sft_v2_step_300.pt --n 100
 """
+
 from __future__ import annotations
 
 import argparse
@@ -50,10 +51,14 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt-dir", default="checkpoints/v5")
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
-    ap.add_argument("--rollout", default="rollouts/sft_v2.jsonl",
-                    help="local path to the SFT-v2 corpus")
-    ap.add_argument("--sanity", action="store_true",
-                    help="run the 30-step SFTv2SanityConfig gate")
+    ap.add_argument(
+        "--rollout",
+        default="rollouts/sft_v2.jsonl",
+        help="local path to the SFT-v2 corpus",
+    )
+    ap.add_argument(
+        "--sanity", action="store_true", help="run the 30-step SFTv2SanityConfig gate"
+    )
     args = ap.parse_args()
 
     import torch
@@ -64,24 +69,31 @@ def main() -> int:
     from osrt.train_config import SFTv2Config, SFTv2SanityConfig
 
     if not torch.cuda.is_available():
-        print("WARNING: CUDA not available — SFT v2 is meant for a GPU box. "
-              "Aborting.", flush=True)
+        print(
+            "WARNING: CUDA not available — SFT v2 is meant for a GPU box. Aborting.",
+            flush=True,
+        )
         return 2
     print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
 
     if not os.path.exists(args.rollout):
-        print(f"ERROR: rollout corpus not found at {args.rollout}. "
-              f"Run: PYTHONPATH=src python scripts/build_sft_v2_data.py",
-              flush=True)
+        print(
+            f"ERROR: rollout corpus not found at {args.rollout}. "
+            f"Run: PYTHONPATH=src python scripts/build_sft_v2_data.py",
+            flush=True,
+        )
         return 2
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     print(f"tokenizer: vocab={len(tok)}", flush=True)
 
     model_config = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
 
     cfg = SFTv2SanityConfig() if args.sanity else SFTv2Config()
@@ -89,22 +101,27 @@ def main() -> int:
     # midtrain2 step_1750 — best intact midtrain2 artifact (final save was
     # truncated on the volume); see SFTv2Config lineage note.
     cfg.pretrained_checkpoint = os.path.join(
-        args.ckpt_dir, "osrt_v5_midtrain2_step_1750.pt")
+        args.ckpt_dir, "osrt_v5_midtrain2_step_1750.pt"
+    )
     cfg.rollout_dataset_path = args.rollout
     if args.sanity:
         cfg.wandb_log = False
 
+    effective_batch = (
+        cfg.phases["extend"]["batch_size"] * cfg.phases["extend"]["grad_accum_steps"]
+    )
     print(
         f"{cfg.__class__.__name__}: {cfg.total_steps} steps @ seq "
         f"{cfg.phases['extend']['seq_len']}, eff batch "
-        f"{cfg.phases['extend']['batch_size'] * cfg.phases['extend']['grad_accum_steps']}, "
+        f"{effective_batch}, "
         f"peak_lr {cfg.peak_lr}, hra_native={cfg.hra_native}, "
         f"base={cfg.pretrained_checkpoint}, rollout={cfg.rollout_dataset_path}",
         flush=True,
     )
 
-    run_pretrain_extend(model_config, cfg, _LocalVol(), args.tokenizer,
-                        ckpt_dir=args.ckpt_dir)
+    run_pretrain_extend(
+        model_config, cfg, _LocalVol(), args.tokenizer, ckpt_dir=args.ckpt_dir
+    )
     return 0
 
 

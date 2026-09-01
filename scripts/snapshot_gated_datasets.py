@@ -29,6 +29,7 @@ than the small repos anyway (more shards, less per-shard contention). This
 script snapshots the SMALL fragile repos by default and SKIPS CC-Math unless
 --include-ccmath is passed.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,23 +41,34 @@ import time
 # config's parquet subtree so we don't pull unrelated configs.
 SMALL_GATED = [
     ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-STEM-SFT"),
-    ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-Math-Textbooks"),
-    ("nvidia/Nemotron-Pretraining-Specialized-v1", "Nemotron-Pretraining-InfiniByte-Reasoning"),
+    (
+        "nvidia/Nemotron-Pretraining-Specialized-v1",
+        "Nemotron-Pretraining-Math-Textbooks",
+    ),
+    (
+        "nvidia/Nemotron-Pretraining-Specialized-v1",
+        "Nemotron-Pretraining-InfiniByte-Reasoning",
+    ),
     ("nvidia/Nemotron-Pretraining-Code-v2", "Synthetic-Question-Answering"),
 ]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache", required=True,
-                    help="HF_DATASETS_CACHE dir to snapshot into (persistent disk)")
-    ap.add_argument("--include-ccmath", action="store_true",
-                    help="also snapshot Nemotron-CC-Math-v1 4plus (~52B tokens, large)")
+    ap.add_argument(
+        "--cache",
+        required=True,
+        help="HF_DATASETS_CACHE dir to snapshot into (persistent disk)",
+    )
+    ap.add_argument(
+        "--include-ccmath",
+        action="store_true",
+        help="also snapshot Nemotron-CC-Math-v1 4plus (~52B tokens, large)",
+    )
     args = ap.parse_args()
 
     if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
-        print("ERROR: no HF_TOKEN in env — gated Nemotron repos will 403.",
-              flush=True)
+        print("ERROR: no HF_TOKEN in env — gated Nemotron repos will 403.", flush=True)
         return 2
 
     os.makedirs(args.cache, exist_ok=True)
@@ -76,19 +88,17 @@ def main() -> int:
             # streaming=False downloads + caches the parquet locally. Iterate a
             # couple rows to confirm it materialised, then it's cached for the
             # offline streaming path during training.
-            ds = load_dataset(repo, name=cfg, split="train",
-                              cache_dir=args.cache)
+            ds = load_dataset(repo, name=cfg, split="train", cache_dir=args.cache)
             n = ds.num_rows if hasattr(ds, "num_rows") else len(ds)
-            print(f"  OK: {n:,} rows cached in {time.time()-t:.0f}s", flush=True)
+            print(f"  OK: {n:,} rows cached in {time.time() - t:.0f}s", flush=True)
             ok += 1
         except Exception as e:
-            print(f"  FAIL {repo}/{cfg}: {type(e).__name__}: {str(e)[:160]}",
-                  flush=True)
+            print(
+                f"  FAIL {repo}/{cfg}: {type(e).__name__}: {str(e)[:160]}", flush=True
+            )
 
-    print(f"\n=== snapshot result: {ok}/{len(targets)} repos cached ===",
-          flush=True)
-    print("Now train with HF_HUB_OFFLINE=1 HF_DATASETS_CACHE=" + args.cache,
-          flush=True)
+    print(f"\n=== snapshot result: {ok}/{len(targets)} repos cached ===", flush=True)
+    print("Now train with HF_HUB_OFFLINE=1 HF_DATASETS_CACHE=" + args.cache, flush=True)
     return 0 if ok == len(targets) else 1
 
 

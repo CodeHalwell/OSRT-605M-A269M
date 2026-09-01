@@ -51,10 +51,10 @@ def test_mbpp_partial_credit_not_collapsed_to_zero():
     # other two. The buggy implementation scored this as 0 of 4.
     code = "def add(a, b):\n    return a + b\n"
     tests = [
-        "assert add(1, 2) == 3",      # passes
-        "assert add(0, 0) == 0",      # passes
-        "assert add(1, 1) == 99",     # fails — wrong expected value
-        "assert add(2, 2) == 99",     # fails — wrong expected value
+        "assert add(1, 2) == 3",  # passes
+        "assert add(0, 0) == 0",  # passes
+        "assert add(1, 1) == 99",  # fails — wrong expected value
+        "assert add(2, 2) == 99",  # fails — wrong expected value
     ]
     r, bd = mbpp_test_reward(
         _completion(code),
@@ -76,7 +76,7 @@ def test_mbpp_partial_credit_not_collapsed_to_zero():
 
 def test_mbpp_all_fail():
     """0 of N assertions pass -> penalty_fail."""
-    code = "def add(a, b):\n    return 999\n"   # always wrong
+    code = "def add(a, b):\n    return 999\n"  # always wrong
     tests = [
         "assert add(1, 2) == 3",
         "assert add(0, 0) == 0",
@@ -112,9 +112,9 @@ def test_mbpp_one_of_three_partial():
     """1 of 3 passing — confirm rate-proportional reward."""
     code = "def f(x):\n    return x if x == 1 else None\n"
     tests = [
-        "assert f(1) == 1",       # passes
-        "assert f(2) == 2",       # fails (returns None)
-        "assert f(3) == 3",       # fails (returns None)
+        "assert f(1) == 1",  # passes
+        "assert f(2) == 2",  # fails (returns None)
+        "assert f(3) == 3",  # fails (returns None)
     ]
     r, bd = mbpp_test_reward(
         _completion(code),
@@ -148,7 +148,9 @@ def test_mbpp_model_code_crashes():
 def test_mbpp_no_tests():
     code = "def f(): return 1"
     r, bd = mbpp_test_reward(
-        _completion(code), test_list=[], allow_unsafe_exec=True,
+        _completion(code),
+        test_list=[],
+        allow_unsafe_exec=True,
         python_executable=sys.executable,
     )
     assert bd["verdict"] == "no_tests"

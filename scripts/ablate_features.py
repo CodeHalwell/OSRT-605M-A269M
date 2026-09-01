@@ -35,12 +35,23 @@ def make_batch() -> torch.Tensor:
 
 
 BASE = dict(
-    dim=256, heads=8, head_dim=32, num_kv_heads=2,
-    vocab_size=VOCAB, real_vocab_size=VOCAB, num_blocks=2, recursive_loops=4,
-    num_routed_experts=8, top_k_experts=2, expert_hidden=128,
-    shared_expert_hidden=128, max_position_embeddings=SEQ,
-    aux_loop_loss_weight=0.05, router_balance_bias_enabled=True,
-    router_aux_loss_coeff=0.10, router_z_loss_coeff=1e-3,
+    dim=256,
+    heads=8,
+    head_dim=32,
+    num_kv_heads=2,
+    vocab_size=VOCAB,
+    real_vocab_size=VOCAB,
+    num_blocks=2,
+    recursive_loops=4,
+    num_routed_experts=8,
+    top_k_experts=2,
+    expert_hidden=128,
+    shared_expert_hidden=128,
+    max_position_embeddings=SEQ,
+    aux_loop_loss_weight=0.05,
+    router_balance_bias_enabled=True,
+    router_aux_loss_coeff=0.10,
+    router_z_loss_coeff=1e-3,
 )
 
 VARIANTS = {
@@ -85,16 +96,24 @@ def run(name: str, over: dict) -> None:
         if step == 0:
             first = task
         last = task
-    drop = "n/a" if first is None or last is None else f"{100*(first-last)/first:5.1f}%"
+    drop = (
+        "n/a"
+        if first is None or last is None
+        else f"{100 * (first - last) / first:5.1f}%"
+    )
     nan = f" NaN@{nan_at}" if nan_at is not None else ""
-    print(f"  {name:22s} taskCE {first:.2f}->{last:.2f}  drop {drop}  "
-          f"max_gnorm {max_gnorm:10.1f}{nan}")
+    print(
+        f"  {name:22s} taskCE {first:.2f}->{last:.2f}  drop {drop}  "
+        f"max_gnorm {max_gnorm:10.1f}{nan}"
+    )
 
 
 def main() -> None:
     print(f"copy task, {STEPS} steps each, grad-clip 1.0, Muon 5e-3 / AdamW 1.5e-3")
-    print(f"(uniform task CE = {torch.log(torch.tensor(float(VOCAB-4))):.2f}; "
-          f"learning => taskCE falls, healthy => max_gnorm is O(1-100))\n")
+    print(
+        f"(uniform task CE = {torch.log(torch.tensor(float(VOCAB - 4))):.2f}; "
+        f"learning => taskCE falls, healthy => max_gnorm is O(1-100))\n"
+    )
     for name, over in VARIANTS.items():
         run(name, over)
 

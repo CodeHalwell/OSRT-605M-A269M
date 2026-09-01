@@ -1,5 +1,11 @@
 # OSRT v6 — Agent Handoff: midtrain3 → SFT v2 → GRPO
 
+> **2026-09-01 status note:** this file is retained as the v6 lineage handoff
+> and its "do right now" section is historical. The v7 implementation review
+> is in `docs/V7_RUNBOOK.md`; v7 is preflight-ready but its paid trunk is a
+> NO-GO pending G2, G3a, G7, and the 30-step GPU/resume gate. Do not launch a
+> v7 trunk from the older instructions below.
+
 **Last updated:** 2026-07-06. Written for an agent resuming this work on an
 always-on machine. Read this end-to-end before doing anything. The code is
 ground truth (`src/osrt/`); this doc explains the *why* and the *how to run*.

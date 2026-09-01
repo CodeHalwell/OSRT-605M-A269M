@@ -28,6 +28,7 @@ USAGE (e.g. on the Lightning box or anywhere with OPENROUTER access):
 
 Resumes automatically: existing rollout IDs in --output are skipped.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -60,8 +61,19 @@ CASCADE = [
 DEFAULT_OUTPUT = Path(__file__).parent.parent / "rollouts" / "distill_cascade_v1.jsonl"
 
 # Errors worth falling back / retrying on (rate limits, 5xx, timeouts).
-_RETRYABLE = ("429", "rate", "limit", "503", "500", "502", "504", "timeout",
-              "overloaded", "unavailable", "connection")
+_RETRYABLE = (
+    "429",
+    "rate",
+    "limit",
+    "503",
+    "500",
+    "502",
+    "504",
+    "timeout",
+    "overloaded",
+    "unavailable",
+    "connection",
+)
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -69,7 +81,11 @@ def _is_retryable(exc: Exception) -> bool:
 
 
 async def cascade_call(
-    client, prompt: str, *, ultra_retries: int, per_model_retries: int,
+    client,
+    prompt: str,
+    *,
+    ultra_retries: int,
+    per_model_retries: int,
 ) -> dict:
     """Try each teacher in CASCADE order. The PRIMARY (Ultra) gets
     `ultra_retries` attempts with backoff before we fall through; each
@@ -86,7 +102,10 @@ async def cascade_call(
             try:
                 # call_openrouter is sync → run in a worker thread.
                 result = await asyncio.to_thread(
-                    call_openrouter, client, prompt, model_id,
+                    call_openrouter,
+                    client,
+                    prompt,
+                    model_id,
                 )
                 # A model can return 200 with empty content (free-tier
                 # truncation / refusal). Treat empty as a soft failure so
@@ -99,12 +118,11 @@ async def cascade_call(
             except Exception as e:  # noqa: BLE001
                 last = attempt == attempts - 1
                 if _is_retryable(e) and not last:
-                    wait = 2 ** attempt + random.random()
+                    wait = 2**attempt + random.random()
                     await asyncio.sleep(wait)
                     continue
                 # non-retryable, or out of attempts for this model → next teacher
-                print(f"  [{tname} gave up: {str(e)[:90]}] -> next teacher",
-                      flush=True)
+                print(f"  [{tname} gave up: {str(e)[:90]}] -> next teacher", flush=True)
                 break
     raise RuntimeError(f"cascade exhausted (tried {chain})")
 
@@ -114,11 +132,10 @@ async def collect(args: argparse.Namespace) -> None:
     import os
 
     loop = asyncio.get_running_loop()
-    loop.set_default_executor(
-        _cf.ThreadPoolExecutor(max_workers=args.concurrency + 50)
-    )
+    loop.set_default_executor(_cf.ThreadPoolExecutor(max_workers=args.concurrency + 50))
     try:
         import resource
+
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         target = max(soft, args.concurrency * 4 + 256)
         if target > soft:
@@ -133,11 +150,14 @@ async def collect(args: argparse.Namespace) -> None:
     except ImportError:
         print("ERROR: openrouter not installed. uv add openrouter", file=sys.stderr)
         sys.exit(1)
-    api_key = (os.environ.get("OPEN_ROUTER_API_KEY")
-               or os.environ.get("OPENROUTER_API_KEY"))
+    api_key = os.environ.get("OPEN_ROUTER_API_KEY") or os.environ.get(
+        "OPENROUTER_API_KEY"
+    )
     if not api_key:
-        print("ERROR: OPEN_ROUTER_API_KEY (or OPENROUTER_API_KEY) not set",
-              file=sys.stderr)
+        print(
+            "ERROR: OPEN_ROUTER_API_KEY (or OPENROUTER_API_KEY) not set",
+            file=sys.stderr,
+        )
         sys.exit(1)
     client = OpenRouter(api_key=api_key)
 
@@ -145,8 +165,10 @@ async def collect(args: argparse.Namespace) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     done_ids = load_done_ids(output)
     print(f"Cascade: {' -> '.join(t for t, _ in CASCADE)}")
-    print(f"Primary retries (ultra)={args.ultra_retries}, "
-          f"per-fallback retries={args.per_model_retries}")
+    print(
+        f"Primary retries (ultra)={args.ultra_retries}, "
+        f"per-fallback retries={args.per_model_retries}"
+    )
     print(f"Output: {output}")
     print(f"Resume: {len(done_ids)} rollouts already on disk\n", flush=True)
 
@@ -163,8 +185,7 @@ async def collect(args: argparse.Namespace) -> None:
             added += 1
         print(f"[{src_key}] queued {added} prompts", flush=True)
 
-    print(f"\nTotal queued: {len(queue)}, concurrency={args.concurrency}",
-          flush=True)
+    print(f"\nTotal queued: {len(queue)}, concurrency={args.concurrency}", flush=True)
     if not queue:
         print("Nothing to do.", flush=True)
         return
@@ -190,7 +211,8 @@ async def collect(args: argparse.Namespace) -> None:
             t0 = time.time()
             try:
                 result = await cascade_call(
-                    client, prompt,
+                    client,
+                    prompt,
                     ultra_retries=args.ultra_retries,
                     per_model_retries=args.per_model_retries,
                 )
@@ -199,9 +221,13 @@ async def collect(args: argparse.Namespace) -> None:
                 print(f"  ✗ {rid}: {str(e)[:100]}", flush=True)
                 return
             rec = {
-                "id": rid, "source": src_key, "prompt": prompt,
-                "thinking": result["thinking"], "response": result["response"],
-                "ts": time.time(), "elapsed_s": round(time.time() - t0, 2),
+                "id": rid,
+                "source": src_key,
+                "prompt": prompt,
+                "thinking": result["thinking"],
+                "response": result["response"],
+                "ts": time.time(),
+                "elapsed_s": round(time.time() - t0, 2),
                 "input_tokens": result["input_tokens"],
                 "output_tokens": result["output_tokens"],
                 "teacher": result["teacher"],
@@ -214,35 +240,55 @@ async def collect(args: argparse.Namespace) -> None:
             )
             if stats["done"] % 25 == 0:
                 rate = stats["done"] / max(time.time() - start, 1e-6)
-                mix = " ".join(f"{k}:{v}" for k, v in
-                               sorted(stats["by_teacher"].items()))
-                print(f"  {stats['done']}/{len(queue)} done "
-                      f"({rate:.1f}/s, failed {stats['failed']}) | {mix}",
-                      flush=True)
+                mix = " ".join(
+                    f"{k}:{v}" for k, v in sorted(stats["by_teacher"].items())
+                )
+                print(
+                    f"  {stats['done']}/{len(queue)} done "
+                    f"({rate:.1f}/s, failed {stats['failed']}) | {mix}",
+                    flush=True,
+                )
 
     await asyncio.gather(*(worker(r, s, p) for r, s, p in queue))
     await write_q.put(None)
     await writer_task
 
     mix = " ".join(f"{k}:{v}" for k, v in sorted(stats["by_teacher"].items()))
-    print(f"\n=== DONE: {stats['done']} rollouts, {stats['failed']} failed "
-          f"in {(time.time()-start)/60:.1f} min ===")
+    print(
+        f"\n=== DONE: {stats['done']} rollouts, {stats['failed']} failed "
+        f"in {(time.time() - start) / 60:.1f} min ==="
+    )
     print(f"teacher mix: {mix}")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT))
-    p.add_argument("--sources", nargs="+",
-                   default=["gsm8k", "open_thoughts", "mbpp", "ultrachat", "sciq"],
-                   help="prompt sources from collect_rollouts.SOURCES")
+    p.add_argument(
+        "--sources",
+        nargs="+",
+        default=["gsm8k", "open_thoughts", "mbpp", "ultrachat", "sciq"],
+        help="prompt sources from collect_rollouts.SOURCES",
+    )
     p.add_argument("--max-per-source", type=int, default=2_000)
-    p.add_argument("--concurrency", type=int, default=8,
-                   help="free-tier rate limits are the real cap; start ~8")
-    p.add_argument("--ultra-retries", type=int, default=3,
-                   help="attempts on Ultra (primary) before falling back")
-    p.add_argument("--per-model-retries", type=int, default=2,
-                   help="attempts per fallback teacher (Super, Qwen)")
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=8,
+        help="free-tier rate limits are the real cap; start ~8",
+    )
+    p.add_argument(
+        "--ultra-retries",
+        type=int,
+        default=3,
+        help="attempts on Ultra (primary) before falling back",
+    )
+    p.add_argument(
+        "--per-model-retries",
+        type=int,
+        default=2,
+        help="attempts per fallback teacher (Super, Qwen)",
+    )
     return p.parse_args()
 
 

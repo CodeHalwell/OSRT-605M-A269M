@@ -8,6 +8,7 @@ confirm the checkpoint loads cleanly and produces coherent continuations.
 Run: PYTHONPATH=src python scripts/smoke_midtrain_ckpt.py
 CPU/MPS, no network, no Modal. ~601M params in bf16 ≈ 1.2GB RAM for weights.
 """
+
 from __future__ import annotations
 
 import os
@@ -17,8 +18,8 @@ import time
 import torch
 from transformers import AutoTokenizer
 
-from osrt.presets import build_config
 from osrt.model import OSRTForCausalLM
+from osrt.presets import build_config
 from osrt.train import load_model_state_or_raise
 
 CKPT = "checkpoints/v5/osrt_v5_midtrain_rescue_step_3978.pt"
@@ -53,8 +54,10 @@ def main() -> int:
     print(f"device={dev} (MPS fallback enabled)")
 
     tok = AutoTokenizer.from_pretrained(TOK)
-    print(f"tokenizer: vocab={len(tok)} bos={tok.bos_token_id} "
-          f"eos={tok.eos_token_id} pad={tok.pad_token_id}")
+    print(
+        f"tokenizer: vocab={len(tok)} bos={tok.bos_token_id} "
+        f"eos={tok.eos_token_id} pad={tok.pad_token_id}"
+    )
 
     cfg = build_config(
         vocab_size=len(tok),
@@ -67,7 +70,7 @@ def main() -> int:
     print("building model (OSRT_605M_A288M, native HRA rank=256)...")
     model = OSRTForCausalLM(cfg).to(device=dev)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  params: {n_params:,} ({n_params/1e6:.0f}M)")
+    print(f"  params: {n_params:,} ({n_params / 1e6:.0f}M)")
 
     print(f"loading checkpoint {CKPT} ...")
     t = time.time()
@@ -76,8 +79,10 @@ def main() -> int:
     saved_step = ckpt.get("step", "?") if isinstance(ckpt, dict) else "?"
     # native HRA: keys must match with NO inject_hra. This raises on any drift.
     load_model_state_or_raise(model, state, context=f"smoke load {CKPT}")
-    print(f"  CLEAN LOAD: all keys matched (saved step={saved_step}, "
-          f"{time.time()-t:.1f}s)")
+    print(
+        f"  CLEAN LOAD: all keys matched (saved step={saved_step}, "
+        f"{time.time() - t:.1f}s)"
+    )
 
     model.eval()
     model.train(False)  # disable MoE capacity drops for inference
@@ -88,9 +93,10 @@ def main() -> int:
         ids = torch.tensor([tok(p).input_ids], dtype=torch.long, device=dev)
         t = time.time()
         with torch.no_grad():
-            out = model.generate(ids, max_new_tokens=40, temperature=0.0,
-                                  eos_token_id=tok.eos_token_id)
-        gen = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+            out = model.generate(
+                ids, max_new_tokens=40, temperature=0.0, eos_token_id=tok.eos_token_id
+            )
+        gen = tok.decode(out[0, ids.shape[1] :], skip_special_tokens=True)
         dt = time.time() - t
         coherent = len(gen.strip()) > 0
         ok += coherent
@@ -98,8 +104,10 @@ def main() -> int:
         print(f"  -> {gen!r}")
         print(f"  ({dt:.1f}s, {'non-empty' if coherent else 'EMPTY'})")
 
-    print(f"\n=== SMOKE RESULT: loaded clean + {ok}/{len(PROMPTS)} "
-          f"non-empty generations ===")
+    print(
+        f"\n=== SMOKE RESULT: loaded clean + {ok}/{len(PROMPTS)} "
+        f"non-empty generations ==="
+    )
     return 0 if ok == len(PROMPTS) else 1
 
 

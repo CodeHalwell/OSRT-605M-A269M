@@ -9,6 +9,7 @@ Reports: count, length percentiles, and % dropped at seq_len thresholds
 
 Run: HF_TOKEN=... PYTHONPATH=src python scripts/probe_sft_lengths.py --n 3000
 """
+
 from __future__ import annotations
 
 import argparse
@@ -45,11 +46,13 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=3000)
     args = ap.parse_args()
 
+    import random
+
     from datasets import load_dataset
     from transformers import AutoTokenizer
+
     from osrt.sft_data import FORMAT_FN
     from osrt.system_prompts import sample_system_prompt
-    import random
 
     tok = AutoTokenizer.from_pretrained("v6_tokenizer_export")
     rng = random.Random(0)
@@ -58,8 +61,11 @@ def main() -> int:
 
     for name, repo, cfg, split, fmt in DATASETS:
         fn = FORMAT_FN[fmt]
-        ds = (load_dataset(repo, cfg, split=split, streaming=True) if cfg
-              else load_dataset(repo, split=split, streaming=True))
+        ds = (
+            load_dataset(repo, cfg, split=split, streaming=True)
+            if cfg
+            else load_dataset(repo, split=split, streaming=True)
+        )
         lens, n, skipped_fmt = [], 0, 0
         for row in ds:
             try:
@@ -69,19 +75,27 @@ def main() -> int:
             if not q or not a:
                 skipped_fmt += 1
                 continue
-            seq = (f"<|system|>{persona_on}<|user|>{q}<|assistant|>"
-                   f"<|think|>{r}<|/think|><|answer|>{a}<|/answer|>{eos}")
+            seq = (
+                f"<|system|>{persona_on}<|user|>{q}<|assistant|>"
+                f"<|think|>{r}<|/think|><|answer|>{a}<|/answer|>{eos}"
+            )
             lens.append(len(tok.encode(seq, add_special_tokens=False)))
             n += 1
             if n >= args.n:
                 break
         lens.sort()
         print(f"\n=== {name}  (n={n}) ===")
-        print(f"  len p50={_pct(lens,50)}  p90={_pct(lens,90)}  "
-              f"p95={_pct(lens,95)}  p99={_pct(lens,99)}  max={lens[-1] if lens else 0}")
+        maximum = lens[-1] if lens else 0
+        print(
+            f"  len p50={_pct(lens, 50)}  p90={_pct(lens, 90)}  "
+            f"p95={_pct(lens, 95)}  p99={_pct(lens, 99)}  max={maximum}"
+        )
         for t in THRESHOLDS:
             dropped = sum(1 for x in lens if x > t)
-            print(f"  > {t:>4} tok (DROPPED): {dropped:>5} / {n}  = {100*dropped/max(n,1):5.1f}%")
+            dropped_pct = 100 * dropped / max(n, 1)
+            print(
+                f"  > {t:>4} tok (DROPPED): {dropped:>5} / {n}  = {dropped_pct:5.1f}%"
+            )
     return 0
 
 

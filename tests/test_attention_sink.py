@@ -17,10 +17,19 @@ from osrt.model import OSRTForCausalLM
 
 def _config(**over):
     base = dict(
-        dim=128, heads=4, head_dim=32, num_kv_heads=2,
-        vocab_size=256, real_vocab_size=256, num_blocks=2, recursive_loops=3,
-        num_routed_experts=8, top_k_experts=2, expert_hidden=64,
-        shared_expert_hidden=64, max_position_embeddings=64,
+        dim=128,
+        heads=4,
+        head_dim=32,
+        num_kv_heads=2,
+        vocab_size=256,
+        real_vocab_size=256,
+        num_blocks=2,
+        recursive_loops=3,
+        num_routed_experts=8,
+        top_k_experts=2,
+        expert_hidden=64,
+        shared_expert_hidden=64,
+        max_position_embeddings=64,
         aux_loop_loss_weight=0.05,
     )
     base.update(over)
@@ -88,7 +97,9 @@ def test_sink_cached_decode_matches_full_forward():
     full = torch.randint(0, 256, (1, 6))
     pre = model(full[:, :5], use_cache=True)
     step = model(
-        full[:, 5:6], past_key_values=pre.past_key_values, use_cache=True,
+        full[:, 5:6],
+        past_key_values=pre.past_key_values,
+        use_cache=True,
     )
     ref = model(full, use_cache=False)
     assert torch.allclose(step.logits[:, -1], ref.logits[:, -1], atol=1e-4)
@@ -101,7 +112,9 @@ def test_sink_cached_decode_multi_token_chunk():
     full = torch.randint(0, 256, (1, 8))
     pre = model(full[:, :4], use_cache=True)
     chunk = model(
-        full[:, 4:8], past_key_values=pre.past_key_values, use_cache=True,
+        full[:, 4:8],
+        past_key_values=pre.past_key_values,
+        use_cache=True,
     )
     ref = model(full, use_cache=False)
     assert torch.allclose(chunk.logits[:, -1], ref.logits[:, -1], atol=1e-4)
@@ -164,16 +177,18 @@ def test_sink_rescale_matches_handcomputed_softmax():
 
     # Reference: explicit masked softmax-with-extra-denominator-term.
     scale = 1.0 / math.sqrt(hd)
-    scores = (q @ k.transpose(-2, -1)) * scale          # (B,H,S,S)
+    scores = (q @ k.transpose(-2, -1)) * scale  # (B,H,S,S)
     mask = torch.triu(torch.ones(S, S, dtype=torch.bool), diagonal=1)
     scores = scores.masked_fill(mask, float("-inf"))
     scores = scores.double()
-    sink = block.sink_logits.double().view(1, H, 1)     # (1,H,1)
+    sink = block.sink_logits.double().view(1, H, 1)  # (1,H,1)
     # denom = Σ_k exp(z) + exp(sink), computed stably relative to row max.
     row_max = scores.amax(dim=-1, keepdim=True)
     exp_scores = torch.exp(scores - row_max)
-    denom = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(sink.unsqueeze(-1) - row_max)
-    weights = exp_scores / denom                        # (B,H,S,S), rows sum < 1
+    denom = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(
+        sink.unsqueeze(-1) - row_max
+    )
+    weights = exp_scores / denom  # (B,H,S,S), rows sum < 1
     ref = weights @ v.double()
 
     assert torch.allclose(out.double(), ref, atol=1e-6), (

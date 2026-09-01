@@ -26,7 +26,7 @@ from osrt.monitoring import summarize
 from osrt.muon import HybridMuonAdamW, Muon, build_param_groups
 
 VOCAB = 128
-SEQ = 48           # half random, half copied
+SEQ = 48  # half random, half copied
 BATCH = 24
 STEPS = 250
 LOG_EVERY = 50
@@ -53,25 +53,37 @@ def main() -> None:
     torch.manual_seed(0)
     # The full canonical feature set, scaled down for CPU.
     cfg = OSRTConfig(
-        dim=256, heads=8, head_dim=32, num_kv_heads=2,    # GQA + MLA latent
-        vocab_size=VOCAB, real_vocab_size=VOCAB,
-        num_blocks=2, recursive_loops=4,
-        num_routed_experts=8, top_k_experts=2,
-        expert_hidden=128, shared_expert_hidden=128,
+        dim=256,
+        heads=8,
+        head_dim=32,
+        num_kv_heads=2,  # GQA + MLA latent
+        vocab_size=VOCAB,
+        real_vocab_size=VOCAB,
+        num_blocks=2,
+        recursive_loops=4,
+        num_routed_experts=8,
+        top_k_experts=2,
+        expert_hidden=128,
+        shared_expert_hidden=128,
         max_position_embeddings=SEQ,
-        use_mhc=True, n_hc=4, mhc_sinkhorn_iters=20,      # mHC
-        swiglu_clamp=10.0,                                # SwiGLU clamp
-        attention_sink=True,                              # attention sink
-        router_affinity="sqrt_softplus",                  # sqrt-softplus routing
+        use_mhc=True,
+        n_hc=4,
+        mhc_sinkhorn_iters=20,  # mHC
+        swiglu_clamp=10.0,  # SwiGLU clamp
+        attention_sink=True,  # attention sink
+        router_affinity="sqrt_softplus",  # sqrt-softplus routing
         router_balance_bias_enabled=True,
-        aux_loop_loss_weight=0.05,                        # anti loop-collapse
-        router_aux_loss_coeff=0.10, router_z_loss_coeff=1e-3,
+        aux_loop_loss_weight=0.05,  # anti loop-collapse
+        router_aux_loss_coeff=0.10,
+        router_z_loss_coeff=1e-3,
     )
     model = OSRTForCausalLM(cfg)
     model.train()
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model: {n_params/1e6:.2f}M params | features: GQA+MLA, mHC, "
-          f"sqrt_softplus, SwiGLU-clamp, attn-sink, aux-loop\n")
+    print(
+        f"model: {n_params / 1e6:.2f}M params | features: GQA+MLA, mHC, "
+        f"sqrt_softplus, SwiGLU-clamp, attn-sink, aux-loop\n"
+    )
 
     muon_params, adamw_groups = build_param_groups(model.named_parameters(), 0.01)
     # Conservative LR + a short warmup + gradient clipping — standard training
@@ -84,8 +96,10 @@ def main() -> None:
     warmup = 20
 
     uniform = torch.log(torch.tensor(float(VOCAB - 4)))
-    print(f"uniform-baseline task CE = {uniform:.3f}  (random half ~unpredictable; "
-          f"copied half is learnable -> task CE should fall well below this)\n")
+    print(
+        f"uniform-baseline task CE = {uniform:.3f}  (random half ~unpredictable; "
+        f"copied half is learnable -> task CE should fall well below this)\n"
+    )
     print(f"{'step':>5} {'total':>7} {'taskCE':>7}  {'grad':>6}  {'health'}")
 
     first = last = None
@@ -97,7 +111,7 @@ def main() -> None:
         for g in adamw.param_groups:
             g["lr"] = base_adamw_lr * scale
 
-        ids = make_batch()             # FRESH batch -> generalization, not memorization
+        ids = make_batch()  # FRESH batch -> generalization, not memorization
         opt.zero_grad()
         out = model(ids, labels=ids)
         loss = out.loss
@@ -115,10 +129,15 @@ def main() -> None:
             _, msg = summarize(model, ids, ids)
             print(f"{step:5d} {loss.item():7.3f} {task:7.3f}  {gnorm:6.2f}  {msg}")
 
-    print(f"\ntask CE {first:.3f} -> {last:.3f}  ({100*(first-last)/first:.0f}% drop)")
+    drop_pct = 100 * (first - last) / first
+    print(f"\ntask CE {first:.3f} -> {last:.3f}  ({drop_pct:.0f}% drop)")
     healthy = last < first * 0.85 and last < float(uniform)
-    print("RESULT:", "PASS — full stack trains, learns the copy task, no collapse"
-          if healthy else "INVESTIGATE — task CE did not fall as expected")
+    print(
+        "RESULT:",
+        "PASS — full stack trains, learns the copy task, no collapse"
+        if healthy
+        else "INVESTIGATE — task CE did not fall as expected",
+    )
 
 
 if __name__ == "__main__":

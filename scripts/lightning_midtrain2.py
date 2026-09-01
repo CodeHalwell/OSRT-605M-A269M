@@ -19,6 +19,7 @@ Prereqs: CUDA torch; checkpoints/v5/osrt_v5_midtrain_final.pt present;
 v6_tokenizer_export/ present. Streams the Nemotron/FineWeb/Cosmopedia mix from
 HF (set HF_TOKEN; the Nemotron configs are gated).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,17 +39,32 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt-dir", default="checkpoints/v5")
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
-    ap.add_argument("--total-steps", type=int, default=4000,
-                    help="cosine target; ~4000 ≈ ~1.1B tokens ≈ ~$110")
-    ap.add_argument("--peak-lr", type=float, default=None,
-                    help="override AdamW peak LR (Muon scales proportionally). "
-                         "The default 1e-4 re-warm was too hot for an annealed "
-                         "base (ppl 30→34, flat); ~3e-5 is a gentler continue. "
-                         "Applies on resume via the cosine at the resumed step.")
-    ap.add_argument("--min-lr", type=float, default=None,
-                    help="override cosine floor (default 1e-5)")
-    ap.add_argument("--sanity", action="store_true",
-                    help="run the 30-step MidtrainExtendSanityConfig gate")
+    ap.add_argument(
+        "--total-steps",
+        type=int,
+        default=4000,
+        help="cosine target; ~4000 ≈ ~1.1B tokens ≈ ~$110",
+    )
+    ap.add_argument(
+        "--peak-lr",
+        type=float,
+        default=None,
+        help="override AdamW peak LR (Muon scales proportionally). "
+        "The default 1e-4 re-warm was too hot for an annealed "
+        "base (ppl 30→34, flat); ~3e-5 is a gentler continue. "
+        "Applies on resume via the cosine at the resumed step.",
+    )
+    ap.add_argument(
+        "--min-lr",
+        type=float,
+        default=None,
+        help="override cosine floor (default 1e-5)",
+    )
+    ap.add_argument(
+        "--sanity",
+        action="store_true",
+        help="run the 30-step MidtrainExtendSanityConfig gate",
+    )
     args = ap.parse_args()
 
     import torch
@@ -59,8 +75,10 @@ def main() -> int:
     from osrt.train_config import MidtrainExtendConfig, MidtrainExtendSanityConfig
 
     if not torch.cuda.is_available():
-        print("WARNING: CUDA not available — this is meant for a GPU box. "
-              "Aborting.", flush=True)
+        print(
+            "WARNING: CUDA not available — this is meant for a GPU box. Aborting.",
+            flush=True,
+        )
         return 2
     print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
     print(f"HF_HUB_OFFLINE={os.environ.get('HF_HUB_OFFLINE', '0')}", flush=True)
@@ -69,15 +87,17 @@ def main() -> int:
     print(f"tokenizer: vocab={len(tok)}", flush=True)
 
     model_config = build_config(
-        vocab_size=len(tok), real_vocab_size=len(tok),
-        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
     )
 
     cfg = MidtrainExtendSanityConfig() if args.sanity else MidtrainExtendConfig()
     cfg.ckpt_dir = args.ckpt_dir
-    cfg.pretrained_checkpoint = os.path.join(
-        args.ckpt_dir, "osrt_v5_midtrain_final.pt")
+    cfg.pretrained_checkpoint = os.path.join(args.ckpt_dir, "osrt_v5_midtrain_final.pt")
     if not args.sanity:
         cfg.total_steps = args.total_steps
 
@@ -102,11 +122,13 @@ def main() -> int:
         f"{cfg.__class__.__name__}: {cfg.total_steps} steps @ seq {ph['seq_len']}, "
         f"eff batch {ph['batch_size'] * ph['grad_accum_steps']}, peak_lr "
         f"{cfg.peak_lr} (→{cfg.min_lr}), reasoning/STEM/math share 0.75, "
-        f"resume {cfg.pretrained_checkpoint}", flush=True,
+        f"resume {cfg.pretrained_checkpoint}",
+        flush=True,
     )
 
-    run_pretrain_extend(model_config, cfg, _LocalVol(), args.tokenizer,
-                        ckpt_dir=args.ckpt_dir)
+    run_pretrain_extend(
+        model_config, cfg, _LocalVol(), args.tokenizer, ckpt_dir=args.ckpt_dir
+    )
     return 0
 
 

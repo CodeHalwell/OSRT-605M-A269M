@@ -16,6 +16,12 @@ this doc is kept in sync with it (param counts via
 **Reading order:** read README.md first for context, then this doc for
 the technical details, then `src/osrt/` for the ground truth.
 
+> **v7 status.** The tables in this document remain the canonical v6
+> specification. The provisional `OSRT_V7` preset is 993,437,571 physical /
+> 288,004,995 active parameters and is documented in
+> `docs/V7_RUNBOOK.md` plus roadmap §14. A paid v7 stage does not exist until
+> its external launch gates close.
+
 ---
 
 ## Table of contents
@@ -636,11 +642,16 @@ b_route_bias ∈ ℝ^(8)           # per-expert bias for load balancing
 Affinity score:
 ```
 affinity = sqrt(softplus(W_route @ x))      # sqrt(softplus) — DeepSeek-V4
-balanced_affinity = affinity + b_route_bias  # static bias for balancing
-top_2_indices = argmax(balanced_affinity, k=2)
+raw_score = affinity / sum(affinity)
+selection_score = raw_score + b_route_bias
+top_k_indices = argmax(selection_score, k)
 
-normalized_weights = softmax(balanced_affinity[top_2_indices])
-# (DeepSeek-style: bias only in TOP-K selection, not in gating weights)
+if router_balance_method == "quantile":
+    # v7: bias selects experts but does not change their mixture weights.
+    normalized_weights = normalize(raw_score[top_k_indices])
+else:
+    # v6 compatibility: the fixed-step bias remains in mixture affinities.
+    normalized_weights = normalize(clamp(affinity + bias, min=0)[top_k_indices])
 ```
 
 ### 7.5 Hash routing for blocks 0 and 1
@@ -665,47 +676,39 @@ Block 2 uses normal learned routing.
 > (Resolved `review/SYNTHESIS.md` Tier 1 #6: Q1 top-1, Q2 loop-indexed,
 > Q3 hard binary at `hash_routing_blocks`.)
 
-### 7.6 Aux-loss-free load balancing
+### 7.6 Fixed-step load-balancing controller (v6)
 
 Per-expert balancing bias `b_route_bias[i]` accumulates per training
 step:
 ```
-mean_load = (1/8) × total_tokens_in_batch
-for i in range(8):
-    deviation = expert_load[i] - mean_load
-    if deviation > 0:
-        b_route_bias[i] -= γ              # nudge down
-    else:
-        b_route_bias[i] += γ              # nudge up
-# γ = 0.001 (per DeepSeek-V3)
-# This bias is HEURISTIC — not in the gradient
+target_fraction = 1 / num_routed_experts
+current_fraction = expert_load / total_assignments
+b_route_bias -= update_rate * (current_fraction - target_fraction)
+b_route_bias = clamp(b_route_bias, -bias_max, +bias_max)
+# v6 preset: update_rate=0.10, bias_max=1.5
+# This controller is HEURISTIC — not in the gradient
 ```
 
-Combined with a small sequence-balance loss (weight 0.0001) to prevent
-extreme imbalance within single sequences.
+The v6 preset also retains the gradient-driven learned-router balance loss
+at coefficient 0.10; its sequence-balance coefficient remains off.
 
-### 7.6 Aux-loss-free load balancing
+### 7.6a Quantile Balancing (v7)
 
-> 🔧 **Duplicate heading** — this section repeats §7.6 above (8 experts);
-> kept as-is to preserve numbering. Numbers below corrected from the
-> stale 12-expert form.
-
-Per-expert balancing bias `b_route_bias[i]` accumulates per training
-step:
+`router_balance_method="quantile"` replaces the fixed ±γ update with a
+next-step controller. For each token, let `alpha` be the `(k+1)`-th biased
+selection score and collect the required bias for every expert:
 ```
-mean_load = (1/8) × total_tokens_in_batch
-for i in range(8):
-    deviation = expert_load[i] - mean_load
-    if deviation > 0:
-        b_route_bias[i] -= γ              # nudge down
-    else:
-        b_route_bias[i] += γ              # nudge up
-# γ = 0.001 (per DeepSeek-V3)
-# This bias is HEURISTIC — not in the gradient
+r[token, expert] = alpha[token] - raw_score[token, expert]
+b_next[expert] = quantile(r[:, expert], k / num_routed_experts)
+b_next -= mean(b_next)
 ```
 
-Combined with a small sequence-balance loss (weight 0.0001) to prevent
-extreme imbalance within single sequences.
+The implementation accumulates a fixed-size per-loop histogram across every
+gradient-accumulation micro-batch, then commits the mean-centred bias once
+after `optimizer.step()`. Only the persistent bias is checkpointed. Bias is
+used only for selection; actual top-k mixture weights come from `raw_score`.
+The v7 preset also enables sequence balance at `1e-4` and retains the proven
+learned-router auxiliary loss until a matched ladder justifies removing it.
 
 ### 7.7 MoE output
 
@@ -751,6 +754,10 @@ linear_clamped = torch.clamp(up_pre, min=-10.0, max=10.0)  # clamp both
 
 output = w_down @ (SiLU(gate_clamped) ⊙ linear_clamped)
 ```
+
+The v7 preset instead enables `situ_glu=True`, replacing the hard-clamped
+SwiGLU branch with the differentiable SiTU-GLU implementation in
+`model.py::ExpertFFN`. The v6 preset retains the clamp.
 
 ---
 
@@ -1396,8 +1403,11 @@ to function as designed. Violating any of these is a bug.
 - Blocks with `block_idx < hash_routing_blocks` use hash routing; the
   canonical preset sets `hash_routing_blocks=0` so EVERY block uses the
   learned router (hash routing is an off-by-default A/B knob — §7.5)
-- Aux-loss-free bias `b_route_bias` MUST NOT receive gradient
+- Balance bias `b_route_bias` MUST NOT receive gradient
 - `affinity = sqrt(softplus(W_route @ x))` — NEVER negative
+- Under Quantile Balancing, bias MUST affect top-k selection only; selected
+  expert mixture weights MUST use unbiased raw scores, and the histogram MUST
+  span the complete logical optimizer batch before the next bias is committed
 
 ### 16.4 Attention correctness
 
@@ -1430,6 +1440,8 @@ to function as designed. Violating any of these is a bug.
   router_bias accumulator
 - Weight decay applied via decoupled scheme (Muon paper)
 - `b_route_bias` NEVER in optimizer (heuristic update only)
+- The v7 sanity recipe uses per-head Muon, 8 fast + 2 stabilising
+  Newton-Schulz steps, update RMS 0.18, and strict optimizer/config resume
 
 ---
 

@@ -13,6 +13,7 @@ Reuses rewards.extract_numeric_answer (parses <|answer|>) and
 extract_gsm8k_answer (ground-truth ####) — no new extraction logic. The held-out
 slice is a fixed GSM8K test split sample, cached once per process.
 """
+
 from __future__ import annotations
 
 import re
@@ -51,6 +52,7 @@ def _load_gsm8k_heldout(n: int, offset: int = 0) -> list[tuple[str, str]]:
     if _GSM8K_CACHE is not None and len(_GSM8K_CACHE) >= need:
         return _GSM8K_CACHE[offset:need]
     from datasets import load_dataset
+
     ds = load_dataset("openai/gsm8k", "main", split="test", streaming=True)
     out: list[tuple[str, str]] = []
     for row in ds:
@@ -62,8 +64,10 @@ def _load_gsm8k_heldout(n: int, offset: int = 0) -> list[tuple[str, str]]:
             break
     _GSM8K_CACHE = out
     if len(out) < need:
-        raise ValueError(f"GSM8K test yielded {len(out)} usable problems, "
-                         f"need offset({offset}) + n({n}) = {need}")
+        raise ValueError(
+            f"GSM8K test yielded {len(out)} usable problems, "
+            f"need offset({offset}) + n({n}) = {need}"
+        )
     return out[offset:need]
 
 
@@ -79,19 +83,31 @@ def _norm(s: str | None) -> str | None:
 
 
 @torch.no_grad()
-def _gen_one(model, tok, system_text: str, question: str, device,
-             max_new_tokens: int) -> str:
+def _gen_one(
+    model, tok, system_text: str, question: str, device, max_new_tokens: int
+) -> str:
     prompt = f"<|system|>{system_text}<|user|>{question}<|assistant|>"
-    ids = torch.tensor([tok.encode(prompt, add_special_tokens=False)],
-                       dtype=torch.long, device=device)
-    out = model.generate(ids, max_new_tokens=max_new_tokens, temperature=0.0,
-                         eos_token_id=tok.eos_token_id)
-    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=False)
+    ids = torch.tensor(
+        [tok.encode(prompt, add_special_tokens=False)], dtype=torch.long, device=device
+    )
+    out = model.generate(
+        ids,
+        max_new_tokens=max_new_tokens,
+        temperature=0.0,
+        eos_token_id=tok.eos_token_id,
+    )
+    return tok.decode(out[0, ids.shape[1] :], skip_special_tokens=False)
 
 
 @torch.no_grad()
-def _gen_batch(model, tok, prompts: list[str], device, max_new_tokens: int,
-               repetition_penalty: float = 1.0) -> list[str]:
+def _gen_batch(
+    model,
+    tok,
+    prompts: list[str],
+    device,
+    max_new_tokens: int,
+    repetition_penalty: float = 1.0,
+) -> list[str]:
     """Left-pad a list of prompt strings into ONE batch and decode each
     completion. Batched greedy is token-identical to per-prompt generation
     (see tests/test_batched_generate.py), so this is a pure speedup.
@@ -111,22 +127,35 @@ def _gen_batch(model, tok, prompts: list[str], device, max_new_tokens: int,
     input_ids = torch.tensor(ids_rows, dtype=torch.long, device=device)
     attn = torch.tensor(mask_rows, dtype=torch.long, device=device)
     out = model.generate(
-        input_ids, attention_mask=attn, max_new_tokens=max_new_tokens,
-        temperature=0.0, repetition_penalty=repetition_penalty,
+        input_ids,
+        attention_mask=attn,
+        max_new_tokens=max_new_tokens,
+        temperature=0.0,
+        repetition_penalty=repetition_penalty,
         eos_token_id=tok.eos_token_id,
     )
     # Every row's prompt occupies [0:width] (left-padded), so completions all
     # start at `width`.
-    return [tok.decode(out[i, width:], skip_special_tokens=False)
-            for i in range(out.shape[0])]
+    return [
+        tok.decode(out[i, width:], skip_special_tokens=False)
+        for i in range(out.shape[0])
+    ]
 
 
 def run_reasoning_eval(
-    model: nn.Module, tok, device, *,
-    n_problems: int = 50, max_new_tokens: int = 512, seed: int = 0,
-    batch_size: int = 16, repetition_penalty: float = 1.0,
-    on_persona: str = "", off_persona: str = "",
-    return_items: bool = False, problem_offset: int = 0,
+    model: nn.Module,
+    tok,
+    device,
+    *,
+    n_problems: int = 50,
+    max_new_tokens: int = 512,
+    seed: int = 0,
+    batch_size: int = 16,
+    repetition_penalty: float = 1.0,
+    on_persona: str = "",
+    off_persona: str = "",
+    return_items: bool = False,
+    problem_offset: int = 0,
 ) -> dict:
     """Reasoning-on vs -off accuracy on a held-out GSM8K slice.
 
@@ -159,16 +188,20 @@ def run_reasoning_eval(
     on_sys, off_sys = get_by_name(on_name), get_by_name(off_name)
 
     problems = _load_gsm8k_heldout(n_problems, problem_offset)
-    stats = {"on": {"correct": 0, "len": 0, "fmt": 0},
-             "off": {"correct": 0, "len": 0, "fmt": 0}}
+    stats = {
+        "on": {"correct": 0, "len": 0, "fmt": 0},
+        "off": {"correct": 0, "len": 0, "fmt": 0},
+    }
     # PER-ITEM outcomes, indexed by problem. Aggregates alone cannot support a
     # paired analysis: successive checkpoints are scored on the SAME 200
     # questions, so their errors are strongly correlated and an ordinary OLS
     # interval over checkpoint means overstates certainty. A paired item
     # bootstrap — resampling questions while preserving each item's trajectory
     # across checkpoints — needs the individual 0/1 outcomes.
-    items: dict[str, list[int]] = {"on": [0] * len(problems),
-                                   "off": [0] * len(problems)}
+    items: dict[str, list[int]] = {
+        "on": [0] * len(problems),
+        "off": [0] * len(problems),
+    }
 
     # One request per (problem, side); batched left-padded generation.
     # `idx` rides along so each outcome can be attributed to its problem.
@@ -179,9 +212,15 @@ def run_reasoning_eval(
             requests.append((side, gold, prompt, idx))
 
     for start in range(0, len(requests), batch_size):
-        chunk = requests[start:start + batch_size]
-        gens = _gen_batch(model, tok, [r[2] for r in chunk], device,
-                          max_new_tokens, repetition_penalty)
+        chunk = requests[start : start + batch_size]
+        gens = _gen_batch(
+            model,
+            tok,
+            [r[2] for r in chunk],
+            device,
+            max_new_tokens,
+            repetition_penalty,
+        )
         for (side, gold, _, idx), gen in zip(chunk, gens):
             pred = _norm(extract_numeric_answer(gen))
             if pred is not None and pred == _norm(gold):
@@ -212,6 +251,15 @@ def run_reasoning_eval(
         # Only when asked: a plain list is not wandb-loggable, and callers that
         # log this dict directly must not suddenly start shipping 200-element
         # arrays to a metrics backend.
-        **({"items": {"on": items["on"], "off": items["off"],
-                      "gold": [g for _, g in problems]}} if return_items else {}),
+        **(
+            {
+                "items": {
+                    "on": items["on"],
+                    "off": items["off"],
+                    "gold": [g for _, g in problems],
+                }
+            }
+            if return_items
+            else {}
+        ),
     }

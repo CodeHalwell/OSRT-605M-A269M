@@ -24,6 +24,7 @@ This test is deterministic, network-free, in-memory, and bounded (~seconds). It:
 Run: python scripts/repro_cycling_recursion.py
 Exit 0 iff: nesting shows the blow-up AND the fixed pattern stays fast.
 """
+
 from __future__ import annotations
 
 import signal
@@ -63,7 +64,9 @@ def characterize_buggy_nesting() -> bool:
         dt = time.time() - t
         print(f"  nest={k:>3}: first item in {dt:.3f}s")
         if dt > SLOW_THRESHOLD_S:
-            print(f"  nest={k:>3}: >{SLOW_THRESHOLD_S}s for ONE item — blow-up confirmed")
+            print(
+                f"  nest={k:>3}: >{SLOW_THRESHOLD_S}s for ONE item — blow-up confirmed"
+            )
             return True
     print("  (no blow-up observed up to nest=20 — unexpected on this platform)")
     return False

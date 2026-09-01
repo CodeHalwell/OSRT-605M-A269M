@@ -25,13 +25,13 @@ Targets ~60k rows → ~1.3 epochs at 1200 steps x eff-batch 64. Deterministic.
 
 Run: HF_TOKEN=... PYTHONPATH=src python scripts/build_sft_v2_data.py
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
 import os
 import re
-import sys
 from pathlib import Path
 
 _env = Path(__file__).parent.parent / ".env"
@@ -59,11 +59,22 @@ ROOT = Path(__file__).parent.parent
 # format. These neutral reasoners are coherent on ANY problem (math, code,
 # science, chat), so mismatches are structurally impossible while still
 # teaching system-prompt-following and the reasoning ON/OFF toggle.
-_GENERAL_ON = ["minimal_format", "concise_direct", "reasoning_3shot",
-               "instruction_strict", "verbose_teaching", "casual_helpful",
-               "general_default"]
-_GENERAL_OFF = ["direct_concise", "no_reasoning", "assistant_plain",
-                "instruction_direct", "chat_direct"]
+_GENERAL_ON = [
+    "minimal_format",
+    "concise_direct",
+    "reasoning_3shot",
+    "instruction_strict",
+    "verbose_teaching",
+    "casual_helpful",
+    "general_default",
+]
+_GENERAL_OFF = [
+    "direct_concise",
+    "no_reasoning",
+    "assistant_plain",
+    "instruction_direct",
+    "chat_direct",
+]
 MOPD = ROOT / "rollouts" / "mopd_v1.jsonl"
 CHAT = ROOT / "rollouts" / "system_prompt_sft.jsonl"
 OUT = ROOT / "rollouts" / "sft_v2.jsonl"
@@ -99,8 +110,10 @@ def main() -> int:  # noqa: PLR0915
     rng = random.Random(SEED)
 
     def assembled_len(system: str, q: str, think: str, ans: str) -> int:
-        seq = (f"<|system|>{system}<|user|>{q}<|assistant|>"
-               f"<|think|>{think}<|/think|><|answer|>{ans}<|/answer|>")
+        seq = (
+            f"<|system|>{system}<|user|>{q}<|assistant|>"
+            f"<|think|>{think}<|/think|><|answer|>{ans}<|/answer|>"
+        )
         if len(seq) > MAX_SEQ_CHARS:
             return 10**9  # obvious over-length; skip tokenizing
         return len(tok.encode(seq, add_special_tokens=False))
@@ -108,12 +121,11 @@ def main() -> int:  # noqa: PLR0915
     # ── GSM8K test decontamination set ────────────────────────────────
     print("building GSM8K-test decontamination set...", flush=True)
     contam = set()
-    for row in load_dataset("openai/gsm8k", "main", split="test",
-                            streaming=True):
+    for row in load_dataset("openai/gsm8k", "main", split="test", streaming=True):
         contam.add(_norm_prefix(row["question"]))
     print(f"  {len(contam)} test prefixes", flush=True)
 
-    seen: set[str] = set()          # within-corpus problem dedup
+    seen: set[str] = set()  # within-corpus problem dedup
     records: list[dict] = []
     stats = {"contaminated": 0, "toolong": 0, "dup": 0}
 
@@ -135,19 +147,26 @@ def main() -> int:  # noqa: PLR0915
         if L > MAX_SEQ_TOKENS:
             stats["toolong"] += 1
             return False
-        records.append({
-            "system": persona, "prompt": q,
-            "thinking": think if mode == "on" else "",
-            "response": ans, "mode": mode, "source": source,
-        })
+        records.append(
+            {
+                "system": persona,
+                "prompt": q,
+                "thinking": think if mode == "on" else "",
+                "response": ans,
+                "mode": mode,
+                "source": source,
+            }
+        )
         return True
 
     # ── 1. mopd math, re-verified against GSM8K-train gold ───────────
     print("verifying mopd math rollouts vs GSM8K-train gold...", flush=True)
     from osrt.rewards import extract_numeric_answer
+
     gold: dict[int, str] = {}
-    for i, row in enumerate(load_dataset("openai/gsm8k", "main", split="train",
-                                         streaming=True)):
+    for i, row in enumerate(
+        load_dataset("openai/gsm8k", "main", split="train", streaming=True)
+    ):
         if i >= 4200:
             break
         m = re.search(r"####\s*([\-0-9\.,]+)", row["answer"])
@@ -178,8 +197,9 @@ def main() -> int:  # noqa: PLR0915
     # ── 2. OpenR1-Math-220k: verified-correct generations ────────────
     print("streaming OpenR1-Math-220k (verified rows)...", flush=True)
     n_on_r1 = n_off_r1 = 0
-    ds = load_dataset("open-r1/OpenR1-Math-220k", "default", split="train",
-                      streaming=True)
+    ds = load_dataset(
+        "open-r1/OpenR1-Math-220k", "default", split="train", streaming=True
+    )
     for row in ds:
         if n_on_r1 >= ON_OPENR1_TARGET and n_off_r1 >= OFF_OPENR1_TARGET:
             break
@@ -197,8 +217,11 @@ def main() -> int:  # noqa: PLR0915
             head, _, post = pick.partition("</think>")
             think = head.replace("<think>", "").strip()
             post = post.strip()
-        ans = post if len(post) >= MIN_RESPONSE_CHARS else str(
-            row.get("answer") or "").strip()
+        ans = (
+            post
+            if len(post) >= MIN_RESPONSE_CHARS
+            else str(row.get("answer") or "").strip()
+        )
         if not ans:
             continue
         # INTERLEAVED ON/OFF assignment: roll per admitted row at the target
@@ -220,8 +243,7 @@ def main() -> int:  # noqa: PLR0915
     # ── 3. Bespoke-Stratos-17k: rejection-sampled R1 ─────────────────
     print("streaming Bespoke-Stratos-17k...", flush=True)
     n_on_bs = n_off_bs = 0
-    ds = load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train",
-                      streaming=True)
+    ds = load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train", streaming=True)
     for row in ds:
         if n_on_bs >= ON_STRATOS_TARGET and n_off_bs >= OFF_STRATOS_TARGET:
             break
@@ -232,10 +254,16 @@ def main() -> int:  # noqa: PLR0915
         if not q or not a or not admit(q):
             continue
         if "<|begin_of_thought|>" in a:
-            think = a.split("<|begin_of_thought|>")[1].split(
-                "<|end_of_thought|>")[0].strip()
-            ans = a.split("<|begin_of_solution|>")[-1].split(
-                "<|end_of_solution|>")[0].strip()
+            think = (
+                a.split("<|begin_of_thought|>")[1]
+                .split("<|end_of_thought|>")[0]
+                .strip()
+            )
+            ans = (
+                a.split("<|begin_of_solution|>")[-1]
+                .split("<|end_of_solution|>")[0]
+                .strip()
+            )
         else:
             think, ans = "", a.strip()
         if len(ans) < MIN_RESPONSE_CHARS or not think:
@@ -280,8 +308,16 @@ def main() -> int:  # noqa: PLR0915
         # (docs/specs/2026-07-26-ckpt-sync §3)
         if not admit(q):
             continue
-        records.append({"system": sysp, "prompt": q, "thinking": "",
-                        "response": ans, "mode": "chat", "source": "chat"})
+        records.append(
+            {
+                "system": sysp,
+                "prompt": q,
+                "thinking": "",
+                "response": ans,
+                "mode": "chat",
+                "source": "chat",
+            }
+        )
         n_chat += 1
     print(f"  chat kept: {n_chat}", flush=True)
 
@@ -298,8 +334,10 @@ def main() -> int:  # noqa: PLR0915
     print(f"\nwrote {total} records → {OUT}")
     for m, c in sorted(by_mode.items()):
         print(f"  {m:>4}: {c:>6}  ({100 * c / total:.1f}%)")
-    print(f"  dropped: contaminated={stats['contaminated']} "
-          f"dup={stats['dup']} toolong={stats['toolong']}")
+    print(
+        f"  dropped: contaminated={stats['contaminated']} "
+        f"dup={stats['dup']} toolong={stats['toolong']}"
+    )
     return 0
 
 

@@ -7,6 +7,7 @@ OSRT-specific — `router_balance_bias` and `gumbel_tau` are mutable persistent
 buffers read at eval time, so averaging parameters alone would pair averaged
 weights with the latest router state and produce a hybrid model.
 """
+
 from __future__ import annotations
 
 import torch
@@ -57,13 +58,13 @@ def test_ema_matches_closed_form_for_a_constant_target():
         m.lin.weight.fill_(2.0)
     ema = ema_init(m)
     with torch.no_grad():
-        ema["lin.weight"].fill_(0.0)          # e0 = 0, target w = 2
+        ema["lin.weight"].fill_(0.0)  # e0 = 0, target w = 2
     for _ in range(n):
         ema_update(ema, m, decay)
-    expected = 2.0 + (0.0 - 2.0) * decay ** n
-    assert torch.allclose(ema["lin.weight"],
-                          torch.full_like(ema["lin.weight"], expected),
-                          atol=1e-6), ema["lin.weight"].flatten()[0]
+    expected = 2.0 + (0.0 - 2.0) * decay**n
+    assert torch.allclose(
+        ema["lin.weight"], torch.full_like(ema["lin.weight"], expected), atol=1e-6
+    ), ema["lin.weight"].flatten()[0]
 
 
 def test_ema_update_does_not_mutate_the_model():
@@ -73,7 +74,7 @@ def test_ema_update_does_not_mutate_the_model():
         m.router_balance_bias.normal_()
     before = {k: v.detach().clone() for k, v in m.state_dict().items()}
     ema = ema_init(m)
-    with torch.no_grad():                     # make the shadow differ from live
+    with torch.no_grad():  # make the shadow differ from live
         for v in ema.values():
             v.add_(1.0)
     for _ in range(5):
@@ -91,7 +92,7 @@ def test_ema_tracks_a_moving_target_and_lags_it():
     ema = ema_init(m)
     for i in range(1, 21):
         with torch.no_grad():
-            m.lin.weight.fill_(float(i))      # live races ahead
+            m.lin.weight.fill_(float(i))  # live races ahead
         ema_update(ema, m, 0.99)
     live = float(m.lin.weight.detach().flatten()[0])
     shadow = float(ema["lin.weight"].flatten()[0])

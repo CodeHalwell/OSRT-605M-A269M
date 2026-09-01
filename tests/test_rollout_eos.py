@@ -5,6 +5,7 @@ EOS was never a training target and the SFT model never learned to stop
 (observed in SFT-v2: generations ran to the length cap in both modes). This
 locks the fix in RolloutDataset._build_sequence.
 """
+
 from transformers import AutoTokenizer
 
 from osrt.data import RolloutDataset
@@ -13,8 +14,7 @@ TOK = "v6_tokenizer_export"
 
 
 def _build(rec, seq_len=256):
-    ds = RolloutDataset(jsonl_path="/dev/null", seq_len=seq_len,
-                        tok_name=TOK, seed=0)
+    ds = RolloutDataset(jsonl_path="/dev/null", seq_len=seq_len, tok_name=TOK, seed=0)
     tok = AutoTokenizer.from_pretrained(TOK)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     out = ds._build_sequence(rec, tok, pad_id)
@@ -22,8 +22,12 @@ def _build(rec, seq_len=256):
 
 
 def test_rollout_target_ends_with_eos():
-    rec = {"system": "You are helpful.", "prompt": "What is 2+2?",
-           "thinking": "2 plus 2 is 4.", "response": "4"}
+    rec = {
+        "system": "You are helpful.",
+        "prompt": "What is 2+2?",
+        "thinking": "2 plus 2 is 4.",
+        "response": "4",
+    }
     out, tok = _build(rec)
     assert out is not None
     ids, labels = out
@@ -35,7 +39,8 @@ def test_rollout_target_ends_with_eos():
     assert real, "no supervised target tokens"
     last_idx, last_tok = real[-1]
     assert last_tok == tok.eos_token_id, (
-        f"last supervised token {last_tok} != eos {tok.eos_token_id}")
+        f"last supervised token {last_tok} != eos {tok.eos_token_id}"
+    )
     # and the label at that position equals the token (EOS is a real label)
     assert labels[last_idx] == tok.eos_token_id
 

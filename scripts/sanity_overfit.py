@@ -20,13 +20,19 @@ def main() -> None:
     torch.manual_seed(0)
     # Small proxy that keeps the architecture knobs we care about.
     cfg = OSRTConfig(
-        dim=256, heads=4, head_dim=64,
-        vocab_size=512, real_vocab_size=512,
-        num_blocks=2, recursive_loops=3,
-        num_routed_experts=8, top_k_experts=2,
-        expert_hidden=128, shared_expert_hidden=128,
+        dim=256,
+        heads=4,
+        head_dim=64,
+        vocab_size=512,
+        real_vocab_size=512,
+        num_blocks=2,
+        recursive_loops=3,
+        num_routed_experts=8,
+        top_k_experts=2,
+        expert_hidden=128,
+        shared_expert_hidden=128,
         max_position_embeddings=64,
-        aux_loop_loss_weight=0.05,      # the anti-collapse fix, ON
+        aux_loop_loss_weight=0.05,  # the anti-collapse fix, ON
         router_balance_bias_enabled=True,
     )
     model = OSRTForCausalLM(cfg)
@@ -37,7 +43,9 @@ def main() -> None:
     ids = torch.randint(0, cfg.real_vocab_size, (B, L))
     labels = ids.clone()
 
-    muon_params, adamw_groups = build_param_groups(model.named_parameters(), weight_decay=0.01)
+    muon_params, adamw_groups = build_param_groups(
+        model.named_parameters(), weight_decay=0.01
+    )
 
     # Part 1 — Muon+AdamW path executes cleanly (the real optimizer wiring).
     # NOTE: Muon's orthogonalized update is finicky on a ~2M-param toy (its
@@ -76,9 +84,13 @@ def main() -> None:
         if step % 25 == 0 or step == 149:
             print(f"step {step:3d}  loss {loss:.4f}")
 
-    print(f"\nloss {first:.3f} -> best {best:.3f}  ({100*(first-best)/first:.0f}% drop)")
+    drop_pct = 100 * (first - best) / first
+    print(f"\nloss {first:.3f} -> best {best:.3f}  ({drop_pct:.0f}% drop)")
     assert best < first * 0.4, "FAIL: architecture could not overfit one batch"
-    print("PASS: architecture learns (overfits a batch through GQA+MLA + recursion + MoE).")
+    print(
+        "PASS: architecture learns (overfits a batch through GQA+MLA + "
+        "recursion + MoE)."
+    )
 
 
 if __name__ == "__main__":

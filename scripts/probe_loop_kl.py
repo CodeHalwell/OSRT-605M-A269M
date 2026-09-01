@@ -17,8 +17,10 @@ with a measurable reasoning delta — this is the distributional half, bankable 
 
 Run:
   HF_TOKEN=... PYTHONPATH=src python scripts/probe_loop_kl.py \
-      --ckpt checkpoints/v5/osrt_v5_midtrain_final.pt --texts general --out /tmp/loop_kl.json
+      --ckpt checkpoints/v5/osrt_v5_midtrain_final.pt \
+      --texts general --out /tmp/loop_kl.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,7 +42,7 @@ if _env.exists():
 
 # Reuse the exact probe batches from the KV probe (scripts/ is on sys.path[0]
 # when run as a script). DEFAULT_PROBE_TEXTS is the math-heavy set.
-from probe_cross_loop_kv import (  # noqa: E402
+from probe_cross_loop_kv import (  # noqa: E402, I001
     DEFAULT_PROBE_TEXTS as MATH_PROBE_TEXTS,
     GENERAL_PROBE_TEXTS,
 )
@@ -51,48 +53,70 @@ def main() -> int:
     ap.add_argument("--ckpt", default="checkpoints/v5/osrt_v5_midtrain_final.pt")
     ap.add_argument("--tokenizer", default="v6_tokenizer_export")
     ap.add_argument("--texts", choices=["math", "general", "mixed"], default="general")
-    ap.add_argument("--text-file", default=None,
-                    help="One example per line; overrides --texts. Use a "
-                         "reasoning-token-dense corpus (e.g. GSM8K) so the "
-                         "math_op/connective flip-type categories have real N.")
+    ap.add_argument(
+        "--text-file",
+        default=None,
+        help="One example per line; overrides --texts. Use a "
+        "reasoning-token-dense corpus (e.g. GSM8K) so the "
+        "math_op/connective flip-type categories have real N.",
+    )
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from osrt.presets import build_config
+
     from osrt.model import OSRTForCausalLM
+    from osrt.presets import build_config
     from osrt.train import load_model_state_or_raise
 
-    device = (torch.device("cuda") if torch.cuda.is_available()
-              else torch.device("mps") if torch.backends.mps.is_available()
-              else torch.device("cpu"))
+    device = (
+        torch.device("cuda")
+        if torch.cuda.is_available()
+        else torch.device("mps")
+        if torch.backends.mps.is_available()
+        else torch.device("cpu")
+    )
     print(f"device={device}", flush=True)
 
     if args.text_file:
-        texts = [ln for ln in Path(args.text_file).read_text().splitlines()
-                 if ln.strip()]
+        texts = [
+            ln for ln in Path(args.text_file).read_text().splitlines() if ln.strip()
+        ]
         print(f"loaded {len(texts)} examples from {args.text_file}", flush=True)
     else:
-        texts = {"math": MATH_PROBE_TEXTS, "general": GENERAL_PROBE_TEXTS,
-                 "mixed": MATH_PROBE_TEXTS + GENERAL_PROBE_TEXTS}[args.texts]
+        texts = {
+            "math": MATH_PROBE_TEXTS,
+            "general": GENERAL_PROBE_TEXTS,
+            "mixed": MATH_PROBE_TEXTS + GENERAL_PROBE_TEXTS,
+        }[args.texts]
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    cfg = build_config(vocab_size=len(tok), real_vocab_size=len(tok),
-                       bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
-                       pad_token_id=tok.pad_token_id)
+    cfg = build_config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
     batch = (texts * ((args.batch // len(texts)) + 1))[: args.batch]
-    enc = tok(batch, return_tensors="pt", padding="max_length",
-              truncation=True, max_length=args.seq_len)
+    enc = tok(
+        batch,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=args.seq_len,
+    )
     input_ids = enc["input_ids"].to(device)
     attn = enc["attention_mask"].to(device)
 
     model = OSRTForCausalLM(cfg)
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-    load_model_state_or_raise(model, ck.get("model_state_dict", ck),
-                              context=f"loop-kl {args.ckpt}")
+    load_model_state_or_raise(
+        model, ck.get("model_state_dict", ck), context=f"loop-kl {args.ckpt}"
+    )
     model = model.to(device).eval()
 
     full_loops = cfg.recursive_loops
@@ -104,7 +128,7 @@ def main() -> int:
         return out.logits[..., :rv].float()
 
     # Valid NEXT-token positions: predict token t+1 from position t, both real.
-    valid = (attn[:, 1:].bool()).reshape(-1)            # (B*(S-1),)
+    valid = (attn[:, 1:].bool()).reshape(-1)  # (B*(S-1),)
     gold = input_ids[:, 1:].reshape(-1)[valid]
 
     def ce_ppl(lg):
@@ -120,23 +144,28 @@ def main() -> int:
     ce_full, ppl_full = ce_ppl(full)
 
     rows = []
-    argmax_by_k = {full_loops: full_argmax}   # per-loop-count argmax (valid pos)
+    argmax_by_k = {full_loops: full_argmax}  # per-loop-count argmax (valid pos)
     for k in range(2, full_loops):
         lg = logits_at(k)
         lp = F.log_softmax(lg[:, :-1, :], dim=-1).reshape(-1, rv)[valid]
-        kl = float((full_p * (full_lp - lp)).sum(-1).mean())   # KL(full || k)
+        kl = float((full_p * (full_lp - lp)).sum(-1).mean())  # KL(full || k)
         k_argmax = lg[:, :-1, :].reshape(-1, rv)[valid].argmax(-1)
         top1 = float((k_argmax == full_argmax).float().mean())
         ce_k, ppl_k = ce_ppl(lg)
-        rows.append({"loops": k, "kl_full_given_k": round(kl, 4),
-                     "top1_agree": round(top1, 4),
-                     "ce": round(ce_k, 4), "ppl": round(ppl_k, 3)})
+        rows.append(
+            {
+                "loops": k,
+                "kl_full_given_k": round(kl, 4),
+                "top1_agree": round(top1, 4),
+                "ce": round(ce_k, 4),
+                "ppl": round(ppl_k, 3),
+            }
+        )
         argmax_by_k[k] = k_argmax
     drop1_argmax = argmax_by_k.get(full_loops - 1)  # 6->5 headline boundary
 
     # ---- 6->5 flip-type analysis: what KIND of token does the last loop
     # change its mind about, and are those flips low-confidence near-ties?
-    import re
 
     def categorize(tid: int) -> str:
         s = tok.decode([int(tid)]).strip().lower()
@@ -146,17 +175,26 @@ def main() -> int:
             return "digit"
         if all(not c.isalnum() for c in s):
             return "punct/space"
-        if s in {"therefore", "thus", "hence", "because", "since", "so",
-                 "if", "then", "implies", "equals"}:
+        if s in {
+            "therefore",
+            "thus",
+            "hence",
+            "because",
+            "since",
+            "so",
+            "if",
+            "then",
+            "implies",
+            "equals",
+        }:
             return "reasoning_connective"
         return "word/other"
 
     flip_report = None
     if drop1_argmax is not None:
-        flip = (drop1_argmax != full_argmax)                  # (N_valid,) bool
-        conf = full_p.max(-1).values                          # full-model top prob
-        cats = ["digit", "math_op", "reasoning_connective", "punct/space",
-                "word/other"]
+        flip = drop1_argmax != full_argmax  # (N_valid,) bool
+        conf = full_p.max(-1).values  # full-model top prob
+        cats = ["digit", "math_op", "reasoning_connective", "punct/space", "word/other"]
         # math operators live in the gold token string; fold into categorize via
         # a quick override set.
         op_chars = set("+-*/=<>%^")
@@ -179,33 +217,43 @@ def main() -> int:
         n_all = max(sum(all_counts.values()), 1)
         n_flip = max(sum(flip_counts.values()), 1)
         # over-representation = (flip share of category) / (overall share)
-        enrich = {c: round((flip_counts[c] / n_flip) /
-                           max(all_counts[c] / n_all, 1e-9), 2) for c in cats}
+        enrich = {
+            c: round((flip_counts[c] / n_flip) / max(all_counts[c] / n_all, 1e-9), 2)
+            for c in cats
+        }
         # P(flip | category) — the legible metric ("digits flip 22% vs words 9%").
-        flip_rate_by_cat = {c: round(flip_counts[c] / max(all_counts[c], 1), 3)
-                            for c in cats}
+        flip_rate_by_cat = {
+            c: round(flip_counts[c] / max(all_counts[c], 1), 3) for c in cats
+        }
         flip_report = {
             "boundary": f"{full_loops}->{full_loops - 1}",
             "flip_rate": round(float(flip.float().mean()), 4),
             "mean_conf_flipped": round(float(conf[flip].mean()), 4)
-            if flip.any() else None,
+            if flip.any()
+            else None,
             "mean_conf_unflipped": round(float(conf[~flip].mean()), 4)
-            if (~flip).any() else None,
+            if (~flip).any()
+            else None,
             "gold_category_counts_all": all_counts,
             "gold_category_counts_flipped": flip_counts,
             "enrichment_flip_vs_all": enrich,
             "flip_rate_by_category": flip_rate_by_cat,
         }
         print("\n6->5 FLIP-TYPE ANALYSIS (gold-token category at flipped positions)")
-        print(f"  flip rate {flip_report['flip_rate']:.3f} | mean full-model "
-              f"confidence: flipped {flip_report['mean_conf_flipped']} vs "
-              f"unflipped {flip_report['mean_conf_unflipped']}")
-        print(f"  {'category':>22}  {'P(flip|cat)':>11}  {'enrich':>6}  "
-              f"{'flip/all':>10}")
+        print(
+            f"  flip rate {flip_report['flip_rate']:.3f} | mean full-model "
+            f"confidence: flipped {flip_report['mean_conf_flipped']} vs "
+            f"unflipped {flip_report['mean_conf_unflipped']}"
+        )
+        print(
+            f"  {'category':>22}  {'P(flip|cat)':>11}  {'enrich':>6}  {'flip/all':>10}"
+        )
         for c in cats:
             flag = "  <LOW-N" if all_counts[c] < 20 else ""
-            print(f"    {c:>20}  {flip_rate_by_cat[c]:>11.3f}  {enrich[c]:>6}  "
-                  f"{flip_counts[c]:>4}/{all_counts[c]:<5}{flag}")
+            print(
+                f"    {c:>20}  {flip_rate_by_cat[c]:>11.3f}  {enrich[c]:>6}  "
+                f"{flip_counts[c]:>4}/{all_counts[c]:<5}{flag}"
+            )
 
         # All-boundary sweep: per-category P(flip) at each adjacent k->k+1, to
         # test whether reasoning-token specialization lives in the early/mid
@@ -222,26 +270,38 @@ def main() -> int:
                 if f:
                     flc[gc] += 1
             boundary_rates[f"{kk + 1}->{kk}"] = {
-                c: round(flc[c] / max(allc[c], 1), 3) for c in cats}
+                c: round(flc[c] / max(allc[c], 1), 3) for c in cats
+            }
         flip_report["per_boundary_flip_rate_by_category"] = boundary_rates
         bnames = list(boundary_rates)
         print("\n  ALL-BOUNDARY P(flip|cat) — is specialization in the early loops?")
         print(f"    {'category':>20}  " + "  ".join(f"{b:>8}" for b in bnames))
         for c in cats:
-            print(f"    {c:>20}  "
-                  + "  ".join(f"{boundary_rates[b][c]:>8.3f}" for b in bnames))
+            print(
+                f"    {c:>20}  "
+                + "  ".join(f"{boundary_rates[b][c]:>8.3f}" for b in bnames)
+            )
 
-    report = {"ckpt": args.ckpt, "texts": args.texts, "full_loops": full_loops,
-              "full_ce": round(ce_full, 4), "full_ppl": round(ppl_full, 3),
-              "rows": rows, "flip_types": flip_report}
+    report = {
+        "ckpt": args.ckpt,
+        "texts": args.texts,
+        "full_loops": full_loops,
+        "full_ce": round(ce_full, 4),
+        "full_ppl": round(ppl_full, 3),
+        "rows": rows,
+        "flip_types": flip_report,
+    }
     print("\n" + "=" * 60)
-    print(f"VARIABLE-LOOP OUTPUT PERTURBATION (full L={full_loops}, "
-          f"ppl={ppl_full:.2f})")
+    print(
+        f"VARIABLE-LOOP OUTPUT PERTURBATION (full L={full_loops}, ppl={ppl_full:.2f})"
+    )
     print("=" * 60)
     print(f"{'loops':>5} {'KL(full||k)':>12} {'top1-agree':>11} {'ppl':>8}")
     for r in rows:
-        print(f"{r['loops']:>5} {r['kl_full_given_k']:>12.4f} "
-              f"{r['top1_agree']:>11.3f} {r['ppl']:>8.2f}")
+        print(
+            f"{r['loops']:>5} {r['kl_full_given_k']:>12.4f} "
+            f"{r['top1_agree']:>11.3f} {r['ppl']:>8.2f}"
+        )
     print(f"{full_loops:>5} {0.0:>12.4f} {1.0:>11.3f} {ppl_full:>8.2f}  (full)")
     print("=" * 60)
     if args.out:

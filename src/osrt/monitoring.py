@@ -23,11 +23,11 @@ from dataclasses import dataclass, field
 import torch
 
 # ── thresholds (tune per scale; defaults are deliberately conservative) ──
-DEAD_EXPERT_FRAC = 0.5      # expert is "dead" below 0.5x its uniform share
-MIN_LOAD_ENTROPY = 0.55     # normalized load entropy below this = collapsing
-MAX_EXPERT_SHARE = 0.45     # one expert taking >45% of tokens = collapsing
+DEAD_EXPERT_FRAC = 0.5  # expert is "dead" below 0.5x its uniform share
+MIN_LOAD_ENTROPY = 0.55  # normalized load entropy below this = collapsing
+MAX_EXPERT_SHARE = 0.45  # one expert taking >45% of tokens = collapsing
 MAX_LOOP_GAIN_SHARE = 0.70  # one loop doing >70% of CE reduction = loop collapse
-MIN_LATE_LOOP_GAIN = 0.01   # a late loop adding <1% relative = wasted depth
+MIN_LATE_LOOP_GAIN = 0.01  # a late loop adding <1% relative = wasted depth
 
 
 def _entropy(p: torch.Tensor) -> float:
@@ -43,7 +43,7 @@ def _base(model):
 @dataclass
 class MoEHealth:
     # per [block][loop]
-    load_entropy: list[list[float]] = field(default_factory=list)   # normalized 0..1
+    load_entropy: list[list[float]] = field(default_factory=list)  # normalized 0..1
     max_share: list[list[float]] = field(default_factory=list)
     dead_experts: list[list[int]] = field(default_factory=list)
     drop_rate: list[list[float]] = field(default_factory=list)
@@ -65,7 +65,9 @@ def moe_health(model) -> MoEHealth:
         moe = block.moe
         h.num_experts = moe.num_routed
         uniform = 1.0 / moe.num_routed
-        fracs = getattr(moe, "last_clean_expert_fraction", None) or moe.last_expert_fraction
+        fracs = (
+            getattr(moe, "last_clean_expert_fraction", None) or moe.last_expert_fraction
+        )
         drops = getattr(moe, "last_drop_rate", [0.0] * moe.num_loops)
         be, bm, bd, bdr = [], [], [], []
         for loop in range(moe.num_loops):
@@ -75,16 +77,26 @@ def moe_health(model) -> MoEHealth:
             ent = _entropy(load) / math.log(moe.num_routed)
             mx = float(load.max())
             dead = int((load < DEAD_EXPERT_FRAC * uniform).sum())
-            be.append(ent); bm.append(mx); bd.append(dead); bdr.append(float(drops[loop]))
-            if ent < MIN_LOAD_ENTROPY or mx > MAX_EXPERT_SHARE or dead >= moe.num_routed // 2:
+            be.append(ent)
+            bm.append(mx)
+            bd.append(dead)
+            bdr.append(float(drops[loop]))
+            if (
+                ent < MIN_LOAD_ENTROPY
+                or mx > MAX_EXPERT_SHARE
+                or dead >= moe.num_routed // 2
+            ):
                 h.collapsing = True
                 worst_msgs.append(
                     f"block{b}/loop{loop}: entropy={ent:.2f} max={mx:.2f} dead={dead}"
                 )
-        h.load_entropy.append(be); h.max_share.append(bm)
-        h.dead_experts.append(bd); h.drop_rate.append(bdr)
+        h.load_entropy.append(be)
+        h.max_share.append(bm)
+        h.dead_experts.append(bd)
+        h.drop_rate.append(bdr)
     h.summary = (
-        "MoE COLLAPSE RISK — " + "; ".join(worst_msgs[:3]) if h.collapsing
+        "MoE COLLAPSE RISK — " + "; ".join(worst_msgs[:3])
+        if h.collapsing
         else "MoE balanced across experts and loops"
     )
     return h
@@ -94,7 +106,7 @@ def moe_health(model) -> MoEHealth:
 class LoopDepth:
     per_loop_ce: list[float] = field(default_factory=list)  # CE at end of each loop
     marginal_gain: list[float] = field(default_factory=list)  # CE reduction per loop
-    gain_share: list[float] = field(default_factory=list)     # fraction of total reduction
+    gain_share: list[float] = field(default_factory=list)  # fraction of total reduction
     total_reduction: float = 0.0
     collapsing: bool = False
     summary: str = ""
@@ -114,7 +126,7 @@ def loop_depth_probe(model, input_ids, labels) -> LoopDepth:
     # Guard against an unpopulated attribute (aux loop disabled, or a model
     # that never set it) — iterating None would raise.
     per_loop_losses = getattr(model, "last_per_loop_aux_losses", None) or []
-    per_loop = [float(l) for l in per_loop_losses]  # loops 0..n-2
+    per_loop = [float(loss) for loss in per_loop_losses]  # loops 0..n-2
     final = float(model.last_task_loss)
     d = LoopDepth(per_loop_ce=per_loop + [final])
     if len(d.per_loop_ce) < 2:
@@ -127,7 +139,9 @@ def loop_depth_probe(model, input_ids, labels) -> LoopDepth:
     if d.total_reduction > 1e-6:
         d.gain_share = [g / d.total_reduction for g in d.marginal_gain]
         max_share = max(d.gain_share)
-        late_wasted = any(s < MIN_LATE_LOOP_GAIN for s in d.gain_share[len(d.gain_share) // 2:])
+        late_wasted = any(
+            s < MIN_LATE_LOOP_GAIN for s in d.gain_share[len(d.gain_share) // 2 :]
+        )
         if max_share > MAX_LOOP_GAIN_SHARE or late_wasted:
             d.collapsing = True
     else:
@@ -136,7 +150,10 @@ def loop_depth_probe(model, input_ids, labels) -> LoopDepth:
     d.summary = (
         f"LOOP DEPTH UNDERUSED — gain shares {[round(s, 2) for s in d.gain_share]}"
         if d.collapsing
-        else f"depth utilized — CE {ce[0]:.2f}->{ce[-1]:.2f} spread across {len(ce)} loops"
+        else (
+            f"depth utilized — CE {ce[0]:.2f}->{ce[-1]:.2f} "
+            f"spread across {len(ce)} loops"
+        )
     )
     return d
 

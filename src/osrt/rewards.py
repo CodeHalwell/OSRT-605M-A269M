@@ -38,7 +38,8 @@ def extract_numeric_answer(
         start = text.rindex(answer_open) + len(answer_open)
         end = (
             text.index(answer_close, start)
-            if answer_close in text[start:] else len(text)
+            if answer_close in text[start:]
+            else len(text)
         )
         inside = text[start:end]
         numbers = re.findall(r"-?[\d,]+\.?\d*", inside)
@@ -93,7 +94,7 @@ def extract_numeric_answer_strict(
     end_rel = text[start:].find(answer_close)
     if end_rel < 0:
         return None, "no_answer_close"
-    inside = text[start:start + end_rel].strip()
+    inside = text[start : start + end_rel].strip()
 
     # All numbers in the answer block (allow integers, decimals, neg, commas)
     numbers = re.findall(r"-?\d+(?:[,.]\d+)*", inside)
@@ -172,6 +173,7 @@ def check_format(
 # also exposed independently so we can ablate which signals help.
 # ─────────────────────────────────────────────────────────────────────
 
+
 def _format_regex(
     think_open: str,
     think_close: str,
@@ -184,10 +186,14 @@ def _format_regex(
     Returns the answer content in group(1).
     """
     return re.compile(
-        re.escape(think_open) + r".*?"
-        + re.escape(think_close) + r"\s*"
-        + re.escape(answer_open) + r"(.+?)"
-        + re.escape(answer_close) + r"\s*$",
+        re.escape(think_open)
+        + r".*?"
+        + re.escape(think_close)
+        + r"\s*"
+        + re.escape(answer_open)
+        + r"(.+?)"
+        + re.escape(answer_close)
+        + r"\s*$",
         flags=re.MULTILINE | re.DOTALL,
     )
 
@@ -276,7 +282,9 @@ def check_answer_score(
     """
     if strict_extraction:
         guess, confidence = extract_numeric_answer_strict(
-            text, answer_open=answer_open, answer_close=answer_close,
+            text,
+            answer_open=answer_open,
+            answer_close=answer_close,
         )
         if confidence == "ambiguous":
             # Model is hedging — small negative reward instead of just zero
@@ -286,8 +294,10 @@ def check_answer_score(
         # Use the loose format-aware numeric extractor — picks the LAST
         # number inside the answer tag. Backwards-compatible default.
         guess = extract_numeric_answer(
-            text, think_close=think_close,
-            answer_open=answer_open, answer_close=answer_close,
+            text,
+            think_close=think_close,
+            answer_open=answer_open,
+            answer_close=answer_close,
         )
 
     if guess is None or guess == "":
@@ -335,8 +345,10 @@ def check_numbers_score(
     if ground_truth is None:
         return 0.0, "no_ground_truth"
     guess = extract_numeric_answer(
-        text, think_close="</think>",  # fallback, doesn't matter here
-        answer_open=answer_open, answer_close=answer_close,
+        text,
+        think_close="</think>",  # fallback, doesn't matter here
+        answer_open=answer_open,
+        answer_close=answer_close,
     )
     if guess is None:
         return 0.0, "no_number"
@@ -382,7 +394,8 @@ class RewardEMA:
         extras (e.g. `exact_hits=2, parse_fails=1`) get included in the
         throttled diagnostic print."""
         self.value = (
-            batch_mean if self.value is None
+            batch_mean
+            if self.value is None
             else self.alpha * batch_mean + (1.0 - self.alpha) * self.value
         )
         self.n_calls += 1
@@ -444,13 +457,15 @@ def strict_template_score(
     n_think_close = text.count(think_close)
     has_user = user_marker in text
 
-    breakdown.update({
-        "n_answer_open": n_answer_open,
-        "n_answer_close": n_answer_close,
-        "n_think_open": n_think_open,
-        "n_think_close": n_think_close,
-        "user_in_completion": has_user,
-    })
+    breakdown.update(
+        {
+            "n_answer_open": n_answer_open,
+            "n_answer_close": n_answer_close,
+            "n_think_open": n_think_open,
+            "n_think_close": n_think_close,
+            "user_in_completion": has_user,
+        }
+    )
 
     # Hardest failure: tried to start a new turn
     if has_user:
@@ -465,8 +480,8 @@ def strict_template_score(
         return -0.3, {**breakdown, "verdict": "multiple_answers"}
 
     # Single answer pair from here. Check think structure.
-    has_one_think = (n_think_open == 1 and n_think_close == 1)
-    extra_think = (n_think_open > 1 or n_think_close > 1)
+    has_one_think = n_think_open == 1 and n_think_close == 1
+    extra_think = n_think_open > 1 or n_think_close > 1
     if extra_think:
         return 0.3, {**breakdown, "verdict": "multiple_thinks"}
 
@@ -480,7 +495,7 @@ def strict_template_score(
             return 0.3, {**breakdown, "verdict": "out_of_order"}
 
     # Single clean answer. Check for trailing content after `<|/answer|>`.
-    trailing = text[text.index(answer_close) + len(answer_close):].strip()
+    trailing = text[text.index(answer_close) + len(answer_close) :].strip()
     breakdown["trailing_chars"] = len(trailing)
     if trailing:
         return 0.6, {**breakdown, "verdict": "clean_with_trailing"}
@@ -517,7 +532,8 @@ def count_reasoning_steps(thinking: str) -> int:
     # Count numbered steps (1. 2. 3. or Step 1, Step 2)
     numbered = re.findall(
         r"(?:^|\n)\s*(?:\d+[\.\):]|step\s+\d+)",
-        thinking, re.IGNORECASE,
+        thinking,
+        re.IGNORECASE,
     )
     if len(numbered) >= 2:
         return len(numbered)
@@ -631,7 +647,7 @@ def few_shot_echo_score(
         words = _SPECIAL_TAG.sub(" ", text).split()
         if len(words) < n:
             return []
-        return [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+        return [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
 
     ex = set(grams(exemplar))
     comp = grams(completion)
@@ -736,7 +752,7 @@ def compute_reward(
 
     tier_score, tier_label = correctness_partial_credit(predicted, gt)
     correctness_r = tier_score * correctness_weight
-    correct = (tier_label in ("exact", "exact_numeric"))
+    correct = tier_label in ("exact", "exact_numeric")
     reward += correctness_r
     breakdown["correct"] = correct
     breakdown["correctness_tier"] = tier_label
@@ -767,8 +783,7 @@ def compute_reward(
         reward += strict_r
         breakdown["strict_template_score"] = strict_score
         breakdown["strict_template_reward"] = strict_r
-        breakdown["strict_template_verdict"] = strict_breakdown.get(
-            "verdict", "")
+        breakdown["strict_template_verdict"] = strict_breakdown.get("verdict", "")
     else:
         breakdown["strict_template_score"] = 0.0
         breakdown["strict_template_reward"] = 0.0
@@ -821,9 +836,7 @@ def compute_reward(
     )
     # Keep `truncated` flag for compatibility with downstream logging
     # — true iff we hit the cap (≥ 100 %).
-    breakdown["truncated"] = (
-        max_tokens > 0 and completion_tokens >= max_tokens
-    )
+    breakdown["truncated"] = max_tokens > 0 and completion_tokens >= max_tokens
     breakdown["truncation_penalty"] = 0.0  # deprecated; see length_ramp_penalty
 
     # 5. Empty thinking penalty (gaming format with no content)
@@ -866,7 +879,7 @@ def extract_answer_text(
     end_rel = completion[start:].find(answer_close)
     if end_rel < 0:
         return None
-    return completion[start:start + end_rel].strip()
+    return completion[start : start + end_rel].strip()
 
 
 def ifeval_constraint_reward(
@@ -1069,7 +1082,9 @@ def mbpp_test_reward(
     test_program = (
         code
         + "\n\n"
-        + "__mbpp_tests = " + _tests_repr + "\n"
+        + "__mbpp_tests = "
+        + _tests_repr
+        + "\n"
         + "__mbpp_passed = 0\n"
         + "for __mbpp_t in __mbpp_tests:\n"
         + "    try:\n"
@@ -1126,7 +1141,6 @@ def mbpp_test_reward(
                 pass
             return penalty_fail, {"verdict": "timeout"}
 
-        rc = proc.returncode
         # Cap captured output so we don't accidentally log megabytes of
         # model stdout (and any secrets it might have printed if the
         # sandbox somehow leaked).
@@ -1147,6 +1161,7 @@ def mbpp_test_reward(
         # Best-effort cleanup of the cwd tempdir.
         try:
             import shutil
+
             shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
             pass
@@ -1154,7 +1169,9 @@ def mbpp_test_reward(
     total = len(test_list)
     if passed == total:
         return reward_pass, {
-            "verdict": "all_pass", "passed": passed, "total": total,
+            "verdict": "all_pass",
+            "passed": passed,
+            "total": total,
         }
     if passed > 0:
         # Partial credit. Linear in pass rate so 1-of-4 and 3-of-4 give
@@ -1162,10 +1179,14 @@ def mbpp_test_reward(
         # gradient signal that GRPO needs to escape uniform-reward
         # groups (LEARNINGS.md "uniform reward groups" failure mode).
         return reward_partial * (passed / total), {
-            "verdict": "partial", "passed": passed, "total": total,
+            "verdict": "partial",
+            "passed": passed,
+            "total": total,
         }
     return penalty_fail, {
-        "verdict": "all_fail", "passed": 0, "total": total,
+        "verdict": "all_fail",
+        "passed": 0,
+        "total": total,
     }
 
 
@@ -1222,11 +1243,11 @@ def regurgitation_penalty(
     # Build n-gram sets. Lowercase so capitalization differences don't
     # hide regurgitation.
     sys_ngrams = {
-        tuple(w.lower() for w in sys_words[i:i + ngram_size])
+        tuple(w.lower() for w in sys_words[i : i + ngram_size])
         for i in range(len(sys_words) - ngram_size + 1)
     }
     comp_ngrams = {
-        tuple(w.lower() for w in comp_words[i:i + ngram_size])
+        tuple(w.lower() for w in comp_words[i : i + ngram_size])
         for i in range(len(comp_words) - ngram_size + 1)
     }
     if not sys_ngrams:
@@ -1302,8 +1323,10 @@ def compose_template_rewards(
     # 1. Exact format
     exact = match_format_exactly_score(
         completion,
-        think_open=think_open, think_close=think_close,
-        answer_open=answer_open, answer_close=answer_close,
+        think_open=think_open,
+        think_close=think_close,
+        answer_open=answer_open,
+        answer_close=answer_close,
         reward=exact_format_reward,
     )
     total += exact
@@ -1312,8 +1335,10 @@ def compose_template_rewards(
     # 2. Per-tag approximate format
     approx, approx_bd = match_format_approximately_score(
         completion,
-        think_open=think_open, think_close=think_close,
-        answer_open=answer_open, answer_close=answer_close,
+        think_open=think_open,
+        think_close=think_close,
+        answer_open=answer_open,
+        answer_close=answer_close,
         per_tag_pos=approx_format_pos,
         per_tag_neg=approx_format_neg,
     )
@@ -1326,9 +1351,12 @@ def compose_template_rewards(
         # Allow ground truth in gsm8k "#### N" format too.
         gt = extract_gsm8k_answer(ground_truth_answer) or ground_truth_answer
         ans_score, ans_tier = check_answer_score(
-            completion, gt,
-            think_open=think_open, think_close=think_close,
-            answer_open=answer_open, answer_close=answer_close,
+            completion,
+            gt,
+            think_open=think_open,
+            think_close=think_close,
+            answer_open=answer_open,
+            answer_close=answer_close,
             strict_extraction=strict_extraction,
             ambiguous_penalty=ambiguous_penalty,
         )
@@ -1338,8 +1366,10 @@ def compose_template_rewards(
 
         # 4. Strict number double-check (cheap independent signal)
         num_score, num_tier = check_numbers_score(
-            completion, gt,
-            answer_open=answer_open, answer_close=answer_close,
+            completion,
+            gt,
+            answer_open=answer_open,
+            answer_close=answer_close,
             reward_match=number_check_reward,
             penalty_wrong=number_check_penalty,
         )
@@ -1351,8 +1381,10 @@ def compose_template_rewards(
     if strict_template_weight > 0.0:
         strict_s, strict_bd = strict_template_score(
             completion,
-            think_open=think_open, think_close=think_close,
-            answer_open=answer_open, answer_close=answer_close,
+            think_open=think_open,
+            think_close=think_close,
+            answer_open=answer_open,
+            answer_close=answer_close,
             user_marker=user_marker,
         )
         strict_r = strict_template_weight * strict_s
@@ -1393,7 +1425,7 @@ def compute_group_advantages(rewards: list[float]) -> list[float]:
 
     mean = sum(rewards) / n
     var = sum((r - mean) ** 2 for r in rewards) / n
-    std = var ** 0.5
+    std = var**0.5
 
     if std < 1e-8:
         return [0.0] * n

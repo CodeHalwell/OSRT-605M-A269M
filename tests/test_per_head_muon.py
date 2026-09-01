@@ -9,6 +9,7 @@ Guards the properties that make it a safe A/B toggle:
   3. build_param_groups only splits out the attention group when opted in;
      default returns the flat list unchanged.
 """
+
 import os
 import sys
 
@@ -21,6 +22,7 @@ from osrt.muon import (  # noqa: E402
     build_param_groups,
     newton_schulz5,
     newton_schulz5_perhead,
+    newton_schulz_v4,
 )
 
 
@@ -30,9 +32,9 @@ def test_perhead_reshape_matches_blockwise_ns():
     g = torch.randn(n_heads * head_dim, cols)
     out = newton_schulz5_perhead(g, head_dim)
     # Must equal stacking NS on each contiguous head-block of rows.
-    ref = torch.cat([
-        newton_schulz5(g[h * head_dim:(h + 1) * head_dim]) for h in range(n_heads)
-    ])
+    ref = torch.cat(
+        [newton_schulz5(g[h * head_dim : (h + 1) * head_dim]) for h in range(n_heads)]
+    )
     assert out.shape == g.shape
     assert torch.allclose(out, ref, atol=1e-5)
 
@@ -41,12 +43,12 @@ def test_perhead_blocks_are_normalized():
     # NS5 (bf16, 5 steps) pulls each block's singular values toward 1, so an
     # orthonormal-rows block has Frobenius norm ~ sqrt(head_dim). Checks each
     # head-block was independently normalised (not left at its raw random scale).
-    head_dim, n_heads, cols = 8, 4, 32   # head_dim < cols → orthonormal rows
+    head_dim, n_heads, cols = 8, 4, 32  # head_dim < cols → orthonormal rows
     g = torch.randn(n_heads * head_dim, cols) * 7.0  # arbitrary raw scale
     out = newton_schulz5_perhead(g, head_dim).float()
-    target = head_dim ** 0.5
+    target = head_dim**0.5
     for h in range(n_heads):
-        blk = out[h * head_dim:(h + 1) * head_dim]
+        blk = out[h * head_dim : (h + 1) * head_dim]
         assert 0.75 * target <= blk.norm().item() <= 1.25 * target, f"head {h}"
 
 
@@ -76,8 +78,8 @@ def test_per_head_step_differs_from_full_same_magnitude():
     w0 = torch.randn(n_heads * head_dim, cols)
     grad = torch.randn_like(w0)
 
-    d_full = _one_step(w0, grad)                                  # no head_dim
-    d_head = _one_step(w0, grad, {"head_dim": head_dim})          # per-head
+    d_full = _one_step(w0, grad)  # no head_dim
+    d_head = _one_step(w0, grad, {"head_dim": head_dim})  # per-head
 
     # The per-head branch was taken → a genuinely different update direction …
     assert not torch.allclose(d_full, d_head, atol=1e-4)
@@ -109,6 +111,32 @@ def test_default_muon_unchanged():
     assert torch.allclose(p.data - w0, ref, atol=1e-5)
 
 
+def test_v4_hybrid_ns_is_finite_and_shape_preserving():
+    g = torch.randn(16, 32)
+    out = newton_schulz_v4(g)
+    assert out.shape == g.shape
+    assert torch.isfinite(out).all()
+
+
+def test_v4_update_rms_target():
+    torch.manual_seed(1)
+    w0 = torch.randn(16, 32)
+    p = torch.nn.Parameter(w0.clone())
+    p.grad = torch.randn_like(p)
+    lr = 0.01
+    Muon(
+        [p],
+        lr=lr,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=8,
+        ns_stable_steps=2,
+        update_rms=0.18,
+    ).step()
+    update = (p.data - w0) / -lr
+    assert abs(update.square().mean().sqrt().item() - 0.18) < 0.015
+
+
 # ── 3. build_param_groups split ─────────────────────────────────────────────
 def _named():
     mk = lambda *s: torch.nn.Parameter(torch.randn(*s))  # noqa: E731
@@ -132,13 +160,16 @@ def test_default_keeps_flat_muon_list():
 
 def test_per_head_splits_attention_into_its_own_group():
     muon, _ = build_param_groups(
-        _named(), weight_decay=0.1, per_head_attn=True, head_dim=8,
+        _named(),
+        weight_decay=0.1,
+        per_head_attn=True,
+        head_dim=8,
     )
     assert isinstance(muon, list) and isinstance(muon[0], dict)
     attn_grp, other_grp = muon[0], muon[1]
     assert attn_grp["head_dim"] == 8
-    assert len(attn_grp["params"]) == 3      # q_proj, kv_down, v_from_k
-    assert len(other_grp["params"]) == 2     # out_proj, w_gate (full-matrix)
+    assert len(attn_grp["params"]) == 3  # q_proj, kv_down, v_from_k
+    assert len(other_grp["params"]) == 2  # out_proj, w_gate (full-matrix)
     # Optimizer accepts the grouped output and steps without error.
     for p in attn_grp["params"] + other_grp["params"]:
         p.grad = torch.randn_like(p)

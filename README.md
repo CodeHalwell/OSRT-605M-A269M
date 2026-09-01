@@ -5,10 +5,12 @@
 
 **Author:** post-mortem of nano-osrt-100M (363M params, ~12 months of iteration)
 **Date:** 2026-06-07 (design); 2026-06-08 (implementation landed)
-**Status:** **architecture implemented** — `src/osrt/` builds the full
-605M-class stack, 144 unit tests + `dummy_train`/`sanity_overfit` smoke
-tests pass on CPU. **No GPU training run yet** — the model is in CPU
-pre-flight; pretraining starts at GPU bring-up.
+**Status (2026-09-01):** the v6 pipeline has run through pretraining,
+mid-training, SFT, and GRPO. The committed ~993M/~288M-active v7 shape and
+30-step launch gate are implemented; the paid v7 trunk remains a **NO-GO**
+until its roadmap gates close. See [`docs/V7_RUNBOOK.md`](docs/V7_RUNBOOK.md)
+for the current commands and decision record. The CPU suite currently passes
+254 tests plus the `dummy_train` / `sanity_overfit` full-stack smokes.
 
 This document captures **everything we would do differently** to build the
 next-generation OSRT model from scratch, given full hindsight on the v5

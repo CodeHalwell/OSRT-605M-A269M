@@ -11,8 +11,9 @@ preset's GQA-8, and mtp_heads=0). A partial override silently builds a
 different model. Prefer the default (whole preset) run.
 
 Usage:
-    PYTHONPATH=src python scripts/compute_budget.py                 # canonical preset (default)
-    PYTHONPATH=src python scripts/compute_budget.py --solve 600e6   # widen experts to hit a target
+    PYTHONPATH=src python scripts/compute_budget.py
+    PYTHONPATH=src python scripts/compute_budget.py --preset v7
+    PYTHONPATH=src python scripts/compute_budget.py --solve 600e6
 """
 
 from __future__ import annotations
@@ -23,12 +24,26 @@ import torch
 
 from osrt.config import OSRTConfig
 from osrt.model import OSRTForCausalLM
-from osrt.presets import OSRT_605M_A288M
+from osrt.presets import OSRT_605M_A288M, OSRT_V7
 
 # Map a parameter name to a budget category. Ordered: first match wins.
 _CATEGORIES = [
     ("embedding", lambda n: "embedding" in n or "lm_head" in n),
-    ("attention", lambda n: any(k in n for k in ("q_proj", "kv_down", "v_from_k", "out_proj", "norm_q", "norm_k", "norm_attn"))),
+    (
+        "attention",
+        lambda n: any(
+            k in n
+            for k in (
+                "q_proj",
+                "kv_down",
+                "v_from_k",
+                "out_proj",
+                "norm_q",
+                "norm_k",
+                "norm_attn",
+            )
+        ),
+    ),
     ("mhc", lambda n: "mhc" in n),
     ("shared_expert", lambda n: "shared_expert" in n),
     ("routed_experts", lambda n: ".experts." in n),
@@ -87,15 +102,26 @@ def report(cfg: OSRTConfig) -> tuple[int, int]:
         f"rank={cfg.adapter_rank} mtp={cfg.mtp_heads} mhc={cfg.use_mhc}"
     )
     print("-" * 64)
-    for cat in ("embedding", "attention", "mhc", "shared_expert",
-                "routed_experts", "router", "adapters", "mtp_heads",
-                "loop_emb", "norms_misc"):
+    for cat in (
+        "embedding",
+        "attention",
+        "mhc",
+        "shared_expert",
+        "routed_experts",
+        "router",
+        "adapters",
+        "mtp_heads",
+        "loop_emb",
+        "norms_misc",
+    ):
         if cat in cats:
             print(f"  {cat:<16} {cats[cat]:>14,}")
     print("-" * 64)
-    print(f"  {'TOTAL PHYSICAL':<16} {total:>14,}  (~{total/1e6:.0f}M)")
-    print(f"  {'ACTIVE / TOKEN':<16} {active:>14,}  (~{active/1e6:.0f}M, "
-          f"{100*active/total:.1f}% of physical, inference — excl. MTP)")
+    print(f"  {'TOTAL PHYSICAL':<16} {total:>14,}  (~{total / 1e6:.0f}M)")
+    print(
+        f"  {'ACTIVE / TOKEN':<16} {active:>14,}  (~{active / 1e6:.0f}M, "
+        f"{100 * active / total:.1f}% of physical, inference — excl. MTP)"
+    )
     return total, active
 
 
@@ -103,8 +129,9 @@ def solve_expert_hidden(target: int, base: OSRTConfig, step: int = 128) -> int:
     """Smallest expert_hidden (multiple of `step`) whose total >= target."""
     h = step
     while True:
-        cfg = OSRTConfig(**{**base.to_dict(), "expert_hidden": h,
-                                "expert_orthogonal_init": False})
+        cfg = OSRTConfig(
+            **{**base.to_dict(), "expert_hidden": h, "expert_orthogonal_init": False}
+        )
         if sum(budget(cfg).values()) >= target:
             return h
         h += step
@@ -112,30 +139,47 @@ def solve_expert_hidden(target: int, base: OSRTConfig, step: int = 128) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--solve", type=float, default=None,
-                    help="target physical params; widens expert_hidden to hit it")
     ap.add_argument(
-        "--override", nargs="*", default=[],
+        "--preset",
+        choices=("v6", "v7"),
+        default="v6",
+        help="whole model preset to report (default: v6)",
+    )
+    ap.add_argument(
+        "--solve",
+        type=float,
+        default=None,
+        help="target physical params; widens expert_hidden to hit it",
+    )
+    ap.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
         help="key=value overrides on top of the canonical preset, e.g. "
-             "--override expert_hidden=4096 num_routed_experts=12. Use with "
-             "care: the preset is the config that actually trains.",
+        "--override expert_hidden=4096 num_routed_experts=12. Use with "
+        "care: the preset is the config that actually trains.",
     )
     args = ap.parse_args()
 
     # Start from the REAL canonical preset, not loose defaults. This is the
     # config that trains; reporting anything else silently misleads (the
     # old CLI fell back to MHA + no-MTP defaults and over-reported by ~6M).
-    preset = dict(OSRT_605M_A288M)
+    preset = dict(OSRT_V7 if args.preset == "v7" else OSRT_605M_A288M)
     for kv in args.override:
         k, _, v = kv.partition("=")
         # int-ify where possible, else leave as string/bool
         if v.lower() in ("true", "false"):
             preset[k] = v.lower() == "true"
+        elif v.lower() == "none":
+            preset[k] = None
         else:
             try:
                 preset[k] = int(v)
             except ValueError:
-                preset[k] = v
+                try:
+                    preset[k] = float(v)
+                except ValueError:
+                    preset[k] = v
     base = OSRTConfig(**preset)
 
     if args.solve:

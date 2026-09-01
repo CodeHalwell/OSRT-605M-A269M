@@ -37,7 +37,12 @@ def test_fused_ce_matches_reference_loss_and_grads():
     h2 = hidden.clone().requires_grad_(True)
     w2 = weight.clone().requires_grad_(True)
     fused = fused_linear_cross_entropy(
-        h2, w2, labels, real_vocab_size=V, ignore_index=-100, n_chunks=4,
+        h2,
+        w2,
+        labels,
+        real_vocab_size=V,
+        ignore_index=-100,
+        n_chunks=4,
     )
     fused.backward()
 
@@ -63,7 +68,11 @@ def test_fused_ce_real_vocab_slice_matches_reference():
     h2 = hidden.clone().requires_grad_(True)
     w2 = weight.clone().requires_grad_(True)
     fused = fused_linear_cross_entropy(
-        h2, w2, labels, real_vocab_size=V_real, n_chunks=3,
+        h2,
+        w2,
+        labels,
+        real_vocab_size=V_real,
+        n_chunks=3,
     )
     fused.backward()
 
@@ -81,12 +90,17 @@ def test_fused_ce_single_chunk_equals_reference():
     weight = torch.randn(V, D, requires_grad=True)
     labels = torch.randint(0, V, (N,))
     fused = fused_linear_cross_entropy(
-        hidden, weight, labels, real_vocab_size=V, n_chunks=1,
+        hidden,
+        weight,
+        labels,
+        real_vocab_size=V,
+        n_chunks=1,
     )
     ref = _reference(
         hidden.detach().requires_grad_(True),
         weight.detach().requires_grad_(True),
-        labels, V,
+        labels,
+        V,
     )
     assert torch.allclose(fused, ref, atol=1e-6, rtol=1e-5)
 
@@ -113,13 +127,20 @@ from osrt.model import OSRTForCausalLM  # noqa: E402
 
 def _tiny_cfg(**overrides) -> OSRTConfig:
     defaults = dict(
-        dim=64, heads=4, head_dim=16,
-        vocab_size=128, real_vocab_size=128,
-        num_blocks=2, recursive_loops=3,
-        num_routed_experts=4, top_k_experts=2,
-        expert_hidden=32, shared_expert_hidden=64,
+        dim=64,
+        heads=4,
+        head_dim=16,
+        vocab_size=128,
+        real_vocab_size=128,
+        num_blocks=2,
+        recursive_loops=3,
+        num_routed_experts=4,
+        top_k_experts=2,
+        expert_hidden=32,
+        shared_expert_hidden=64,
         max_position_embeddings=32,
-        aux_loop_loss_weight=0.1, mtp_heads=2,
+        aux_loop_loss_weight=0.1,
+        mtp_heads=2,
     )
     defaults.update(overrides)
     return OSRTConfig(**defaults)
@@ -127,6 +148,7 @@ def _tiny_cfg(**overrides) -> OSRTConfig:
 
 def test_config_rejects_negative_fused_ce_chunks():
     import pytest
+
     with pytest.raises(ValueError):
         _tiny_cfg(fused_cross_entropy_chunks=-1)
 
@@ -135,6 +157,7 @@ def test_fused_ce_invoked_only_when_enabled(monkeypatch):
     """The fused path must actually be called for the aux/MTP heads when the
     flag is > 0, and never when it is 0. Drives the model wiring."""
     import osrt.fused_ce as fce
+
     real = fce.fused_linear_cross_entropy
     calls = {"n": 0}
 
@@ -185,6 +208,7 @@ def test_model_loss_and_grad_unchanged_when_fused_ce_enabled():
     loss_on, g_on = run(4)
 
     assert torch.allclose(loss_off, loss_on, atol=1e-4, rtol=1e-4), (
-        loss_off.item(), loss_on.item(),
+        loss_off.item(),
+        loss_on.item(),
     )
     assert torch.allclose(g_off, g_on, atol=1e-4, rtol=1e-4)
