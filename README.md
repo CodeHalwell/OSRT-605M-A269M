@@ -1,5 +1,15 @@
 # OSRT-600M — "If we started again" design doc
 
+> ## ⚠ This repository is the v3–v6 archive
+>
+> **v7 development lives in [`CodeHalwell/OSRT-Ostinato`](https://github.com/CodeHalwell/OSRT-Ostinato).**
+> Nothing here should be trained from. The v7 shape and tokenizer were
+> converged into this repo so its docs are not misleading, but the live code,
+> the ladder, the Modal app, the Colab notebook and the tests are maintained
+> in Ostinato only. Two repos carrying the same model diverged twice in one
+> day — this note exists so it does not happen a third time.
+
+
 **OSRT** = **Optimized Sparse Recursive Transformer**
 (Muon-optimized · MoE-sparse · depth-recursive · transformer backbone)
 
