@@ -366,8 +366,8 @@ We have presented OSRT, an architecture that combines depth-recursive transforme
 \end{document}
 """
 
-print("Writing paper.tex...")
-with open("paper.tex", "w") as f:
+print("Writing ../paper/paper.tex...")
+with open("../paper/paper.tex", "w") as f:
     f.write(latex_content.strip() + "\n")
 
 print("Converting SVG to PNG using qlmanage...")
@@ -388,13 +388,13 @@ else:
 
 print("Running tectonic compiler...")
 result = subprocess.run([
-    "/opt/homebrew/bin/tectonic", "paper.tex"
+    "/opt/homebrew/bin/tectonic", "../paper/paper.tex"
 ], capture_output=True, text=True)
 
 print(result.stdout)
 print(result.stderr)
 
 if result.returncode == 0:
-    print("Compilation successful! paper.pdf created.")
+    print("Compilation successful! ../paper/paper.pdf created.")
 else:
     print(f"Compilation failed with exit code {result.returncode}")

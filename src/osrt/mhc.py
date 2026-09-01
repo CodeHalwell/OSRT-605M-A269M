@@ -1,7 +1,7 @@
 """Manifold-Constrained Hyper-Connections (mHC).
 
 Replaces the standard residual with a learned, per-token mix over an
-`n_hc`-channel residual stream (ARCHITECTURE.md §8). For each sub-block:
+`n_hc`-channel residual stream (../../docs/ARCHITECTURE.md §8). For each sub-block:
 
     X_{l+1} = B_l @ X_l  +  C_l ⊗ F_l(A_l · X_l)
 

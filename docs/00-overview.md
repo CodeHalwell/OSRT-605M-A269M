@@ -2,7 +2,7 @@
 
 *The entry point to the `docs/` architecture series. Read this first, then
 follow the numbered chapters. Each chapter is grounded in `src/osrt/` and
-cites `file:line`; where the code and the older spec (`ARCHITECTURE.md`)
+cites `file:line`; where the code and the older spec (`../docs/ARCHITECTURE.md`)
 disagree, the chapters trust the code and flag the drift.*
 
 ---
@@ -131,16 +131,16 @@ shrinks it for deployment.
 
 ## How these docs relate to the other files
 
-- **`ARCHITECTURE.md`** (repo root) — the terse spec / single source of
+- **`../docs/ARCHITECTURE.md`** (repo root) — the terse spec / single source of
   truth for config values. These `docs/` chapters are the *explanatory*
   companion: they teach the WHY and walk the code. Where the two
   disagree, the chapters cite the code and flag it (the spec predates
   some implementation choices).
 - **`README.md`** — design philosophy and the integrated training plan.
-- **`LEARNINGS.md`** — what the v5 (363M) runs taught us (loop collapse,
+- **`../docs/LEARNINGS.md`** — what the v5 (363M) runs taught us (loop collapse,
   router collapse, reward hacking) — the failure modes this architecture
   is built to avoid.
-- **`RESEARCH.md`** — the external papers behind each technique.
+- **`../docs/RESEARCH.md`** — the external papers behind each technique.
 - **`src/osrt/`** — the implementation. The ground truth for exact
   behaviour. When in doubt, read the code; these docs point you to the
   right `file:line`.
@@ -149,7 +149,7 @@ shrinks it for deployment.
 
 Every chapter was written by reading the actual `src/osrt/` source, not
 by paraphrasing the spec. As a result they surface several places where
-`ARCHITECTURE.md` had drifted from the code (e.g. where loop embeddings
+`../docs/ARCHITECTURE.md` had drifted from the code (e.g. where loop embeddings
 are applied, which params go to which optimizer, the exact balance-bias
 update). Those flags are features, not bugs — they're the difference
 between documentation you can trust and documentation you can't. If a

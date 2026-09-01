@@ -50,7 +50,7 @@ class OSRTConfig(PretrainedConfig):
         recursive_loops: int = 6,
         adapter_rank: int = 16,
         adapter_alpha: float = 16.0,
-        # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8). When
+        # Manifold-Constrained Hyper-Connections (../../docs/ARCHITECTURE.md §8). When
         # enabled the residual stream carries n_hc channels mixed per-token by
         # a doubly-stochastic (Birkhoff/Sinkhorn) matrix. use_mhc=False keeps
         # the proven standard single-stream residual.
@@ -70,7 +70,7 @@ class OSRTConfig(PretrainedConfig):
         situ_glu: bool = False,
         situ_beta_gate: float = 4.0,
         situ_beta_up: float = 25.0,
-        # Attention sink (ARCHITECTURE.md §6.6). When True, each RecursiveBlock
+        # Attention sink (../../docs/ARCHITECTURE.md §6.6). When True, each RecursiveBlock
         # carries a per-head learnable sink logit that is added to the softmax
         # DENOMINATOR only (the sink has a zero "value", so it never contributes
         # to the output). This lets a query's attention weights sum to < 1 —
@@ -150,7 +150,7 @@ class OSRTConfig(PretrainedConfig):
         # info and need more help to become useful). When None, all
         # intermediate loops are weighted uniformly by aux_loop_loss_weight.
         per_loop_aux_weights: list[float] | None = None,
-        # --- Multi-Token Prediction heads (ARCHITECTURE.md §9.3, §11.4) ---
+        # --- Multi-Token Prediction heads (../../docs/ARCHITECTURE.md §9.3, §11.4) ---
         # TRAINING-TIME auxiliary objective. In addition to the main +1
         # next-token prediction, mtp_heads extra heads predict tokens at
         # further future offsets (+2, +3, ...) from the FINAL hidden state.
@@ -229,7 +229,7 @@ class OSRTConfig(PretrainedConfig):
         # 28 experts), while quantile resolution is fine enough for the
         # probability-normalised sqrt(softplus) router scores.
         router_qb_histogram_bins: int = 2048,
-        # --- Router affinity transform (ARCHITECTURE.md §7.4, §16.3) ---
+        # --- Router affinity transform (../../docs/ARCHITECTURE.md §7.4, §16.3) ---
         # How per-expert router logits become routing affinities:
         #   "softmax"       — Mixtral/v5 behavior: softmax over logits gives
         #                     gating weights and the balance-bias is added to
@@ -246,7 +246,7 @@ class OSRTConfig(PretrainedConfig):
         # default stays 0.0 so unit tests and standalone/eval forwards are
         # deterministic unless the trainer explicitly enables exploration.
         router_gumbel_tau_init: float = 0.0,
-        # --- Speculative decoding draft loop count (ARCHITECTURE.md §12.3) ---
+        # --- Speculative decoding draft loop count (../../docs/ARCHITECTURE.md §12.3) ---
         # When generate(speculative=True) is used, the cheap DRAFT pass runs
         # this many recursive loops (the aux per-loop LM head makes a low-loop
         # output predictive), and the full recursive_loops pass VERIFIES the
@@ -255,7 +255,7 @@ class OSRTConfig(PretrainedConfig):
         # this is purely an inference-time knob — it does not affect training
         # or the default (non-speculative) generation path.
         spec_draft_loops: int = 3,
-        # --- Hash routing for early blocks (ARCHITECTURE.md §7.5) ---
+        # --- Hash routing for early blocks (../../docs/ARCHITECTURE.md §7.5) ---
         # Physical blocks with block_idx < hash_routing_blocks use deterministic
         # HASH routing instead of the learned router: top-1 selection with
         #   expert_id = (token_id + loop_idx) % num_routed_experts

@@ -1177,7 +1177,7 @@ def mbpp_test_reward(
         # Partial credit. Linear in pass rate so 1-of-4 and 3-of-4 give
         # meaningfully different rewards — restores the per-test
         # gradient signal that GRPO needs to escape uniform-reward
-        # groups (LEARNINGS.md "uniform reward groups" failure mode).
+        # groups (../../docs/LEARNINGS.md "uniform reward groups" failure mode).
         return reward_partial * (passed / total), {
             "verdict": "partial",
             "passed": passed,

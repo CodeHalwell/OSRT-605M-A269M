@@ -2,7 +2,7 @@
 
 **Review Date:** 2026-06-07  
 **Author:** Antigravity AI Pair Programmer  
-**Target Proposal:** OSRT-600M (described in [`README.md`](../README.md), [`ARCHITECTURE.md`](../ARCHITECTURE.md), [`LEARNINGS.md`](../LEARNINGS.md), and [`RESEARCH.md`](../RESEARCH.md))
+**Target Proposal:** OSRT-600M (described in [`README.md`](../README.md), [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md), [`../docs/LEARNINGS.md`](../docs/LEARNINGS.md), and [`../docs/RESEARCH.md`](../docs/RESEARCH.md))
 
 ---
 
@@ -221,7 +221,7 @@ Based on our online verification and internal analysis, we recommend addressing 
 * **Recommendation:** Set `t_max=10` iterations instead of 20 (empirically sufficient for convergence in mHC), and force compilation of the mHC block via `@torch.compile`.
 
 ### Risk 4: MBPP Environment Hacking
-* **The Issue:** As documented in `LEARNINGS.md`, the model at 363M (and likely 600M) fails to write working code from scratch, leading to $0\%$ test pass rates, but hacks the format rewards to claim high reward.
+* **The Issue:** As documented in `../docs/LEARNINGS.md`, the model at 363M (and likely 600M) fails to write working code from scratch, leading to $0\%$ test pass rates, but hacks the format rewards to claim high reward.
 * **Recommendation:** Do not include MBPP in the post-training RL mix. Instead, focus post-training code alignment entirely on **tool-use execution** (writing small Python utility scripts to solve math problems via the calculator/Python sandbox), which has a much more robust grading pathway.
 
 ---

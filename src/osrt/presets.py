@@ -34,12 +34,12 @@ OSRT_605M_A288M: dict = dict(
     shared_expert_hidden=2816,  # trial-and-error to fit budget; revisit at GPU phase
     adapter_rank=256,  # real HRA capacity (NOT LoRA-style 16)
     adapter_alpha=256.0,  # match rank so scale = 1.0
-    # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8): 4-channel
+    # Manifold-Constrained Hyper-Connections (../../docs/ARCHITECTURE.md §8): 4-channel
     # residual stream, Birkhoff/Sinkhorn doubly-stochastic mixing. Enabled for
     # GPU-phase testing — CPU pre-flight (scripts/ablate_features.py) showed
     # gradient amplification + NaN under sustained training, needs profiling on
     # real hardware to see if it's a CPU-precision artifact or a real bug.
-    # See ARCHITECTURE.md §8 + LEARNINGS.md when v6 GPU runs begin.
+    # See ../../docs/ARCHITECTURE.md §8 + ../../docs/LEARNINGS.md when v6 GPU runs begin.
     use_mhc=True,
     n_hc=4,
     mhc_sinkhorn_iters=20,
@@ -68,7 +68,7 @@ OSRT_605M_A288M: dict = dict(
     router_aux_loss_coeff=0.10,  # v5-proven balance pressure
     router_z_loss_coeff=1e-3,
     router_balance_bias_enabled=True,
-    # sqrt(softplus) routing affinity (ARCHITECTURE.md §7.4, §16.3): the
+    # sqrt(softplus) routing affinity (../../docs/ARCHITECTURE.md §7.4, §16.3): the
     # balance bias steers TOP-K selection on the non-negative affinity, gating
     # weights renormalise the selected balanced affinities. Hash routing stays
     # off (hash_routing_blocks default 0) — reserved for later A/B testing.

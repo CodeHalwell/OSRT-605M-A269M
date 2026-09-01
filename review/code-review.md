@@ -11,7 +11,7 @@
 A complete verification run of the test suite (`uv run pytest`) was executed:
 - **Result:** `135 passed, 14 warnings in 27.05s`.
 - **Package Layout:** The project metadata (`pyproject.toml`) and import paths have been successfully updated to package `src/osrt`. All test files successfully collect and execute, proving that the repository is in a cohesive, runnable state.
-- **Spec vs. Code Discrepancies:** A key finding of this review is that **the codebase's implementation is significantly more mature and robust than the design proposals** (specifically `ARCHITECTURE.md` drafts). Several critical bugs flagged by Codex in the design documents are already correctly resolved in the code:
+- **Spec vs. Code Discrepancies:** A key finding of this review is that **the codebase's implementation is significantly more mature and robust than the design proposals** (specifically `../docs/ARCHITECTURE.md` drafts). Several critical bugs flagged by Codex in the design documents are already correctly resolved in the code:
   - **mHC shape errors** are avoided using explicit `torch.einsum` contractions.
   - **Expand aliasing** is prevented by using `.repeat()` instead of `.expand()`.
   - **Final mHC collapse** is cleanly handled via a dedicated `mhc_collapse` parameter.
@@ -118,7 +118,7 @@ Muon (Momentum Orthogonalized by Newton-Schulz) updates 2D weight matrices by ap
    - BF16 weight memory.
    - Optimizer memory.
    - Estimated FLOPs per token.
-   Use the script's output to replace hand-written totals in `README.md` and `ARCHITECTURE.md` to prevent discrepancies (e.g., the vocab dimensions and attention parameter mismatches in the docs).
+   Use the script's output to replace hand-written totals in `README.md` and `../docs/ARCHITECTURE.md` to prevent discrepancies (e.g., the vocab dimensions and attention parameter mismatches in the docs).
 2. **Clarify Training Loss Terminology:**
    To prevent implementer confusion, ensure the configuration and training logs distinguish clearly between:
    - `loop_lm_aux_loss_weight` (LM-head prediction on intermediate loops)

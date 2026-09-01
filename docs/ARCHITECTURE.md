@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — OSRT-600M technical specification
+# ../docs/ARCHITECTURE.md — OSRT-600M technical specification
 
 **Scope:** the technical specification of the OSRT-600M model — every
 layer, dimension, formula, and connection. The model is **implemented**
@@ -8,9 +8,9 @@ this doc is kept in sync with it (param counts via
 `scripts/compute_budget.py`, behaviour via `src/osrt/model.py`).
 
 **Companion docs:**
-- [`README.md`](README.md) — design philosophy, why each choice was made
-- [`LEARNINGS.md`](LEARNINGS.md) — v5 lessons that shaped these choices
-- [`RESEARCH.md`](RESEARCH.md) — external research cited
+- [`README.md`](../README.md) — design philosophy, why each choice was made
+- [`../docs/LEARNINGS.md`](../docs/LEARNINGS.md) — v5 lessons that shaped these choices
+- [`../docs/RESEARCH.md`](../docs/RESEARCH.md) — external research cited
 - `review/` — code reviews; `archive/` — pre-implementation plan reviews
 
 **Reading order:** read README.md first for context, then this doc for

@@ -18,18 +18,18 @@ training run. The design decisions below are now realised in code; where a
 choice was made during implementation it is noted inline.
 
 **Companion docs (read in order for full context):**
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — technical specification of the
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — technical specification of the
   implemented model (every layer, dimension, formula), kept in sync
   with `src/osrt/`.
-- [`LEARNINGS.md`](LEARNINGS.md) — full v5 (363M) lessons captured
-- [`RESEARCH.md`](RESEARCH.md) — external research bibliography (Muon,
+- [`docs/LEARNINGS.md`](docs/LEARNINGS.md) — full v5 (363M) lessons captured
+- [`docs/RESEARCH.md`](docs/RESEARCH.md) — external research bibliography (Muon,
   DeepSeek V2/V3/V4, LFM2, Ouro/Huginn, AlphaQ, TurboQuant, ...)
 - `src/osrt/` — the implementation (ground truth for exact behaviour)
 - `review/` — code reviews; `archive/` — pre-implementation plan reviews
 - `archive/v5/` — v5-era code and historical docs preserved
 
 This README is the WHY (design philosophy + integrated plan).
-ARCHITECTURE.md is the HOW (technical spec).
+docs/ARCHITECTURE.md is the HOW (technical spec).
 
 The target is a **600M-parameter recursive MoE** — bigger than v5 (363M)
 where it matters (more routed experts, more knowledge), with EVERY
@@ -100,7 +100,7 @@ active. "600M" in the model name rounds the physical count.
 | FFN family | Dense SwiGLU h=6912 | 1 shared (h=2,816) + **8 routed** top-2 (h=3,840) MoE |
 | Attention | GQA 24q/8kv head=64 | GQA 24q/8kv head=64 ✓ |
 | FLOPs per token | ~1.4B | ~2.5B (6× loop multiplier) |
-| Active params per token | 700M | **278M** (top-2 of 8 = 25% routing density; see ARCHITECTURE.md §2.1) |
+| Active params per token | 700M | **278M** (top-2 of 8 = 25% routing density; see docs/ARCHITECTURE.md §2.1) |
 
 **Why these specific choices:**
 - **65K vocab + 1536 hidden** matches LFM2-700M exactly. Gives us
@@ -824,7 +824,7 @@ more development time.
 
 All architecture and training decisions in this doc cite specific
 prior work. The full summary of every paper, finding, and
-recommendation that shaped OSRT-600M lives in [`RESEARCH.md`](RESEARCH.md).
+recommendation that shaped OSRT-600M lives in [`docs/RESEARCH.md`](docs/RESEARCH.md).
 
 The headline references baked into this plan:
 
@@ -840,9 +840,9 @@ The headline references baked into this plan:
 - **MLA + matrix absorption** (DeepSeek-V2/V3) → §1.5 attention variant
 - **modded-nanoGPT** → §14 codebase reference
 
-See [`RESEARCH.md`](RESEARCH.md) for the deeper-dive summaries,
+See [`docs/RESEARCH.md`](docs/RESEARCH.md) for the deeper-dive summaries,
 specific paper citations, and which findings we adopted vs deferred.
-See [`LEARNINGS.md`](LEARNINGS.md) for everything we learned from
+See [`docs/LEARNINGS.md`](docs/LEARNINGS.md) for everything we learned from
 v5 (363M) training that shaped the v6 600M plan.
 
 ---
@@ -985,7 +985,7 @@ These are genuinely unresolved and worth ablating:
 
 ## Sources
 
-- v5 lineage: `archive/v5/` (PLAN.md, ARCHITECTURE.md, TRAINING.md,
+- v5 lineage: `archive/v5/` (PLAN.md, docs/ARCHITECTURE.md, TRAINING.md,
   MULTIMODAL.md — all moved to archive when v6 code landed)
 - Muon: Moonshot "Muon is Scalable for LLM Training" (arXiv 2502.16982);
   KellerJordan/Muon repo

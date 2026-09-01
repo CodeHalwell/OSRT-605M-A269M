@@ -1,13 +1,13 @@
-# RESEARCH.md — External research summarised
+# ../docs/RESEARCH.md — External research summarised
 
 **Scope:** every paper, technical report, and research synthesis that
 shaped OSRT-600M's design. Each entry: what it is, the key findings,
 and what we adopted (vs deferred or rejected).
 
 **Companion docs:**
-- [`README.md`](README.md) — the v6 design that cites these
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — v6 technical spec
-- [`LEARNINGS.md`](LEARNINGS.md) — what v5 (363M) taught us
+- [`README.md`](../README.md) — the v6 design that cites these
+- [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) — v6 technical spec
+- [`../docs/LEARNINGS.md`](../docs/LEARNINGS.md) — what v5 (363M) taught us
 
 ---
 

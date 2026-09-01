@@ -1,6 +1,6 @@
 # OSRT In-Depth Project Review — 2026-07-16
 
-**Scope:** full read of architecture (`ARCHITECTURE.md`, `docs/`), implementation
+**Scope:** full read of architecture (`../docs/ARCHITECTURE.md`, `docs/`), implementation
 (`src/osrt/`), tests, training pipeline (`train.py`, `train_config.py`),
 infrastructure (`app.py`, `scripts/`), prior reviews (`review/`), git history,
 and live verification: `uv run pytest` (194 passed, 1 skipped),
@@ -33,7 +33,7 @@ Chinchilla, GSM8K ~0.05).
 1. **Documentation rigor.** README → ARCHITECTURE → LEARNINGS → RESEARCH →
    `docs/` chapters form a coherent reading path. The "code is ground truth,
    docs cite file:line" rule and `compute_budget.py` as the single source for
-   param counts are good discipline. The honesty in `ARCHITECTURE.md` §6.3
+   param counts are good discipline. The honesty in `../docs/ARCHITECTURE.md` §6.3
    ("it is NOT accurate to say KDV loses no expressivity") and README §12
    (flagging its own 10× cost error) is commendable.
 2. **Measurement-first, wired from step 1.** Per-loop CE, dead-expert count,
@@ -45,7 +45,7 @@ Chinchilla, GSM8K ~0.05).
    RMSNorm, SwiGLU clamp, log-domain Sinkhorn (the code notes the exp form
    NaN'd), orthogonal expert init with a documented std-correction bug fix
    (`model.py:148`), aux-loop losses + loop dropout. Each is tied to a specific
-   failure mode in `LEARNINGS.md`.
+   failure mode in `../docs/LEARNINGS.md`.
 4. **Hard-won implementation fixes that show depth:** grouped-GEMM dispatch
    removing the only `torch.compile` graph break (`_dispatch_grouped`);
    persistent RoPE buffers to survive HF `from_pretrained` meta-init; the
@@ -57,7 +57,7 @@ Chinchilla, GSM8K ~0.05).
    decode, MTP, mHC, quantization, router features, checkpoint drift.
    Checkpoint loading uses `strict=False` only to produce a *custom* mismatch
    error then raises — avoids the silent partial-load trap.
-6. **Honest lineage accounting.** `LEARNINGS.md` is unusually frank about v5's
+6. **Honest lineage accounting.** `../docs/LEARNINGS.md` is unusually frank about v5's
    failures (loop collapse at month 4, reward hacking after $50, system
    prompts never trained for 12 months). That honesty is the project's best
    asset.
@@ -76,7 +76,7 @@ Chinchilla, GSM8K ~0.05).
   novel component may not work, and it's on by default.
 - **Architecture complexity vs. zero evidence of composition.** ~8 risky
   techniques are stacked simultaneously. Each is a failure surface; with no
-  end-to-end run, there's no evidence they compose at scale. `LEARNINGS.md`
+  end-to-end run, there's no evidence they compose at scale. `../docs/LEARNINGS.md`
   §12 itself concludes "training-pipeline discipline matters more than
   architectural novelty" — yet v6 expanded the novelty surface considerably.
   That's the project's central tension.
@@ -91,25 +91,25 @@ Chinchilla, GSM8K ~0.05).
 The repo's greatest strength (docs) is also its biggest maintenance risk.
 Concrete contradictions found:
 
-- **`ARCHITECTURE.md` §5.4 vs §2.4:** §5.4 says "87 HRA injection points
+- **`../docs/ARCHITECTURE.md` §5.4 vs §2.4:** §5.4 says "87 HRA injection points
   across Q/K/V/O + every expert + router" with `x + adapter_b(adapter_a(x))`;
   §2.4 and `model.py:1127` say 18 points on the attention sub-block only,
   applied as `x_in @ adapter_a @ adapter_b` (parallel, additive inside
   attention). §5.4 is stale and wrong.
-- **`ARCHITECTURE.md` §10** keeps pseudocode the doc itself calls buggy ("the
+- **`../docs/ARCHITECTURE.md` §10** keeps pseudocode the doc itself calls buggy ("the
   pseudocode below reads the OLD buggy form in places; treat it as a
   conceptual sketch"). Known-wrong pseudocode in the spec is worse than no
   pseudocode.
-- **`ARCHITECTURE.md` §7.6** is a duplicated heading the doc keeps "to
+- **`../docs/ARCHITECTURE.md` §7.6** is a duplicated heading the doc keeps "to
   preserve numbering." Technical debt as policy.
 - **Gated short convolutions:** README §10a.1 lists them as an LFM2 lesson;
-  ARCHITECTURE.md §1 says "NOT in the architecture: gated short convolutions
+  ../docs/ARCHITECTURE.md §1 says "NOT in the architecture: gated short convolutions
   … never specified or implemented." Direct contradiction.
 - **Four different test counts:** README "144 unit tests", CLAUDE.md "193
   unit tests", AGENT_HANDOFF "196 pass", actual `194 passed, 1 skipped`.
 - **`presets.py` docstring** says "~607M physical / ~288M active (47.5%)" —
   wrong on all three counts (601M / 278M / 46.3%).
-- **`ARCHITECTURE.md` §2.1** table is "hand-adjusted by −72 pending a clean
+- **`../docs/ARCHITECTURE.md` §2.1** table is "hand-adjusted by −72 pending a clean
   regen" — manual edits to a code-generated table.
 - **`hra.py` docstring** references `RecursiveOSRT(cfg)` and `load_pretrained`
   — a class that doesn't exist (only `OSRTForCausalLM`).
@@ -141,7 +141,7 @@ contributor.
 
 ### Medium: premature research output
 
-`paper.pdf`, `paper.tex`, `compile_expanded_paper.py`,
+`../paper/paper.pdf`, `../paper/paper.tex`, `../paper/compile_expanded_paper.py`,
 `review/cross-loop-results-draft.tex` exist, but there are no v6 cross-loop
 results (no surviving midtrain3 checkpoint). The legitimate finding (loop
 collapse discovered and fixed in v5 at 363M) is being presented under a
@@ -156,7 +156,7 @@ principle the project otherwise champions.
   advertise "~2× faster inference + rollout, ~$50-100 saved per GRPO run."
   GRPO rollouts need *sampling*, where this path is not valid. The headline
   RL benefit is overstated.
-- **mHC numbers wrong and feature unproven.** `ARCHITECTURE.md` §8.6 claims
+- **mHC numbers wrong and feature unproven.** `../docs/ARCHITECTURE.md` §8.6 claims
   "~720K params, ~6.7% overhead"; `compute_budget.py` reports 921,766.
   README §10b.8 rates mHC "medium" priority, yet it's on in the canonical
   preset with an acknowledged NaN risk. There's a strong case to default
@@ -264,7 +264,7 @@ git log --oneline --since="3 months ago" | wc -l
 
 ## Files inspected (non-exhaustive)
 
-- `CLAUDE.md`, `ARCHITECTURE.md`, `README.md`, `LEARNINGS.md`
+- `CLAUDE.md`, `../docs/ARCHITECTURE.md`, `README.md`, `../docs/LEARNINGS.md`
 - `src/osrt/`: `config.py`, `presets.py`, `model.py`, `mhc.py`, `muon.py`,
   `hra.py`, `train.py`, `train_config.py`
 - `tests/`: all 16 test files (full `pytest` run)

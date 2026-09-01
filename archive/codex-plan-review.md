@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-07  
 **Reviewer:** Codex  
-**Reviewed files:** `README.md`, `ARCHITECTURE.md`, `RESEARCH.md`, `LEARNINGS.md`  
+**Reviewed files:** `README.md`, `../docs/ARCHITECTURE.md`, `../docs/RESEARCH.md`, `../docs/LEARNINGS.md`  
 **Verification run:** `uv run --group dev pytest -q`
 
 ## Executive Summary
@@ -59,7 +59,7 @@ future plan, but the root project metadata and tests still expect a live
 **Impact**
 
 No root test, package build validation, or Modal run can be trusted until the
-package location is resolved. This also weakens the claim in `ARCHITECTURE.md`
+package location is resolved. This also weakens the claim in `../docs/ARCHITECTURE.md`
 that someone could implement from the doc alone, because the local project does
 not have an implementation target.
 
@@ -79,7 +79,7 @@ Do this before model changes.
 
 **Evidence**
 
-- `ARCHITECTURE.md:151-169` reserves:
+- `../docs/ARCHITECTURE.md:151-169` reserves:
   - BOS 0, EOS 1, PAD 2
   - `<|end_turn|>` 14
   - tool call/result tokens 15-18
@@ -90,7 +90,7 @@ Do this before model changes.
   - no tool call/result tokens
   - no image/audio tokens
 - `tokenizer/tokenizer.json:237-251` confirms current ID 14 is `"!"`.
-- `ARCHITECTURE.md:809-810` uses stop IDs `[10, 14, 18]`.
+- `../docs/ARCHITECTURE.md:809-810` uses stop IDs `[10, 14, 18]`.
 
 **Impact**
 
@@ -131,18 +131,18 @@ Do not start pretraining until this is validated by an encode/decode test.
 
 **Evidence**
 
-- `ARCHITECTURE.md:58` says `32,768 x 1,536` but gives
+- `../docs/ARCHITECTURE.md:58` says `32,768 x 1,536` but gives
   `100,663,296`, which is `65,536 x 1,536`.
-- `ARCHITECTURE.md:62-65` says attention is `28,311,552` params and describes
+- `../docs/ARCHITECTURE.md:62-65` says attention is `28,311,552` params and describes
   `4 x 1536^2` per block.
-- `ARCHITECTURE.md:311-318` specifies attention as:
+- `../docs/ARCHITECTURE.md:311-318` specifies attention as:
   - `W_Q`: 2.36M
   - `W_K_DOWN`: 0.79M
   - `W_V_FROM_K`: 0.26M
   - `W_O`: 2.36M
   - total ~5.76M per block, ~17.3M across 3 blocks.
 - `README.md:67` says active per token is ~206M.
-- `ARCHITECTURE.md:94` says active per token is ~232.5M.
+- `../docs/ARCHITECTURE.md:94` says active per token is ~232.5M.
 - `README.md:107` says 625M total / 210M active.
 
 **Impact**
@@ -166,7 +166,7 @@ output. It should compute:
 - quantized deployment memory
 - forward FLOPs per token with and without LM head
 
-Then replace hand-written totals in `README.md` and `ARCHITECTURE.md`.
+Then replace hand-written totals in `README.md` and `../docs/ARCHITECTURE.md`.
 
 ### 4. Tier 1 Cost Estimate Is Off By About 10x
 
@@ -200,10 +200,10 @@ Then recompute Tier 1 and Tier 2 from the same formula.
 
 **Evidence**
 
-- `RESEARCH.md:93` labels arXiv `2511.23404` as DeepSeek-V4.
+- `../docs/RESEARCH.md:93` labels arXiv `2511.23404` as DeepSeek-V4.
 - arXiv `2511.23404` is the LFM2 Technical Report.
 - Official DeepSeek docs place DeepSeek-V4 Preview on 2026-04-24.
-- `RESEARCH.md:608` and `RESEARCH.md:671` cite "Nov 2026" reports in a repo
+- `../docs/RESEARCH.md:608` and `../docs/RESEARCH.md:671` cite "Nov 2026" reports in a repo
   dated 2026-06-07.
 
 **Impact**
@@ -214,7 +214,7 @@ synthesis.
 
 **Recommendation**
 
-Refactor `RESEARCH.md` into:
+Refactor `../docs/RESEARCH.md` into:
 
 - `Primary sources`: official papers/model cards/docs.
 - `Secondary summaries`: blogs, reports, synthesis docs.
@@ -229,11 +229,11 @@ Correct the DeepSeek-V4 and LFM2 citation blocks.
 
 **Evidence**
 
-- `ARCHITECTURE.md:514-516` defines:
+- `../docs/ARCHITECTURE.md:514-516` defines:
   - `A_l` as `1 x 4`
   - `B_l` as `4 x 4`
   - `C_l` as `4 x 1`
-- `ARCHITECTURE.md:668` computes:
+- `../docs/ARCHITECTURE.md:668` computes:
 
 ```python
 x_view = (A_l @ X.reshape(B, L, 4, 1536).transpose(2, 3)).squeeze(-1)
@@ -243,7 +243,7 @@ After transpose, the tensor shape is `[B, L, 1536, 4]`. A normal
 `1 x 4` matrix multiply against this shape does not produce the intended
 `[B, L, 1536]` view.
 
-- `ARCHITECTURE.md:677-678` and `ARCHITECTURE.md:694` have the same class of
+- `../docs/ARCHITECTURE.md:677-678` and `../docs/ARCHITECTURE.md:694` have the same class of
   issue for `B_l` and `C_l`.
 
 **Impact**
@@ -274,13 +274,13 @@ Then write tests for tiny shapes.
 
 **Evidence**
 
-- `ARCHITECTURE.md:655` initializes with:
+- `../docs/ARCHITECTURE.md:655` initializes with:
 
 ```python
 X = x.unsqueeze(-2).expand(-1, -1, 4, -1)
 ```
 
-- `ARCHITECTURE.md:662` mutates channel 0:
+- `../docs/ARCHITECTURE.md:662` mutates channel 0:
 
 ```python
 X[:, :, 0, :] = X[:, :, 0, :] + loop_bias
@@ -309,7 +309,7 @@ Then test that changing channel 0 does not change channels 1-3.
 
 **Evidence**
 
-- `ARCHITECTURE.md:701-702` extracts final hidden state with the last `A_l`:
+- `../docs/ARCHITECTURE.md:701-702` extracts final hidden state with the last `A_l`:
 
 ```python
 x_final = (A_l @ X.transpose(-1, -2)).squeeze(-1)
@@ -338,10 +338,10 @@ learned nonnegative weighted sum.
 
 **Evidence**
 
-- `ARCHITECTURE.md:895-903` says cache stores only `K_DOWN`, not V.
-- `ARCHITECTURE.md:912-915` computes raw cache size from that K-only layout:
+- `../docs/ARCHITECTURE.md:895-903` says cache stores only `K_DOWN`, not V.
+- `../docs/ARCHITECTURE.md:912-915` computes raw cache size from that K-only layout:
   `18 x 512 x 2 = 18KB/token`, 72MB at 4K.
-- `ARCHITECTURE.md:922-924` then applies `+ V-from-K (cache K only)` again to
+- `../docs/ARCHITECTURE.md:922-924` then applies `+ V-from-K (cache K only)` again to
   reduce 72MB to 36MB.
 
 **Impact**
@@ -361,10 +361,10 @@ Then apply int4/TurboQuant once.
 
 **Evidence**
 
-- `ARCHITECTURE.md:968` says routed experts are `319 MB -> 80 MB FP4`.
+- `../docs/ARCHITECTURE.md:968` says routed experts are `319 MB -> 80 MB FP4`.
   318.5M parameters at 4 bits is about 159MB before metadata, not 80MB.
-- `ARCHITECTURE.md:969` says HRA bf16 is 172MB.
-- `ARCHITECTURE.md:972-973` says total disk is ~390MB and active inference is
+- `../docs/ARCHITECTURE.md:969` says HRA bf16 is 172MB.
+- `../docs/ARCHITECTURE.md:972-973` says total disk is ~390MB and active inference is
   ~150MB.
 
 **Impact**
@@ -387,8 +387,8 @@ Recompute memory under explicit assumptions:
 
 **Evidence**
 
-- `ARCHITECTURE.md:105` says routed experts use top-2.
-- `ARCHITECTURE.md:441-445` says hash routing selects one fixed expert.
+- `../docs/ARCHITECTURE.md:105` says routed experts use top-2.
+- `../docs/ARCHITECTURE.md:441-445` says hash routing selects one fixed expert.
 - `README.md:708-710` says replacing first 1-2 physical block routers with
   hash routing affects only the first loop iteration's first blocks.
 
@@ -429,8 +429,8 @@ Then update active parameter accounting.
 
 **Evidence**
 
-- `ARCHITECTURE.md:284` says 87 HRA injection points.
-- `ARCHITECTURE.md:291-292` says HRA is injected into Q/K/V projections,
+- `../docs/ARCHITECTURE.md:284` says 87 HRA injection points.
+- `../docs/ARCHITECTURE.md:291-292` says HRA is injected into Q/K/V projections,
   attention output, gate/up/down of each expert, and router projection.
 
 Naively counting per block:
@@ -465,11 +465,11 @@ Then recompute the 86.1M total.
 
 - `README.md:176-183` says start with DeepSeek-V3 loss-free bias balancing
   and only fall back to aux loss 0.01.
-- `ARCHITECTURE.md:748-750` sets `aux_loop_loss_weight` to 0.05 for
+- `../docs/ARCHITECTURE.md:748-750` sets `aux_loop_loss_weight` to 0.05 for
   pretrain/MOPD/SFT and 0.03 for GRPO.
-- `LEARNINGS.md:72-75` says v5 tightened aux loop loss to 0.10 during GRPO
+- `../docs/LEARNINGS.md:72-75` says v5 tightened aux loop loss to 0.10 during GRPO
   and v6 should make per-loop aux losses permanent.
-- `RESEARCH.md:655-656` says Cell C uses Muon + 0.10 aux loss as recipe while
+- `../docs/RESEARCH.md:655-656` says Cell C uses Muon + 0.10 aux loss as recipe while
   trialing 0.01 and loss-free.
 
 These refer to two different aux concepts:
@@ -499,10 +499,10 @@ Then state defaults by stage.
 
 **Evidence**
 
-- `ARCHITECTURE.md:862-866` drafts tokens greedily from loop 3.
-- `ARCHITECTURE.md:869-880` verifies by greedy full-loop predictions and
+- `../docs/ARCHITECTURE.md:862-866` drafts tokens greedily from loop 3.
+- `../docs/ARCHITECTURE.md:869-880` verifies by greedy full-loop predictions and
   accepts matching prefix.
-- `ARCHITECTURE.md:806-827` normal generation uses temperature and top-p
+- `../docs/ARCHITECTURE.md:806-827` normal generation uses temperature and top-p
   sampling.
 
 **Impact**
@@ -525,9 +525,9 @@ Measure acceptance rate and output quality separately.
 
 **Evidence**
 
-- `ARCHITECTURE.md:650` defines `forward(input_ids, kv_cache=None, training=False)`.
-- `ARCHITECTURE.md:833` calls `forward(next_token, kv_cache=kv_cache, loops=loops)`.
-- `ARCHITECTURE.md:674` indexes `kv_cache[r, b]` even when `kv_cache=None`
+- `../docs/ARCHITECTURE.md:650` defines `forward(input_ids, kv_cache=None, training=False)`.
+- `../docs/ARCHITECTURE.md:833` calls `forward(next_token, kv_cache=kv_cache, loops=loops)`.
+- `../docs/ARCHITECTURE.md:674` indexes `kv_cache[r, b]` even when `kv_cache=None`
   during prefill.
 
 **Impact**
@@ -555,10 +555,10 @@ and specify:
 
 **Evidence**
 
-- `ARCHITECTURE.md:43-45` says the architecture uses gated short
+- `../docs/ARCHITECTURE.md:43-45` says the architecture uses gated short
   convolutions plus GQA attention.
-- No convolution sub-block is specified in `ARCHITECTURE.md`.
-- `README.md:570-571` and `RESEARCH.md:176-182` discuss LFM2 gated short
+- No convolution sub-block is specified in `../docs/ARCHITECTURE.md`.
+- `README.md:570-571` and `../docs/RESEARCH.md:176-182` discuss LFM2 gated short
   convolutions as research context.
 
 **Impact**
@@ -577,7 +577,7 @@ an explicit conv block, placement schedule, params, FLOPs, and cache behavior.
 
 - `README.md:762-763` says HCA sequence compression must be baked into
   pretraining and is not retrofittable.
-- `ARCHITECTURE.md` only specifies K-only cache, TurboQuant, and optional
+- `../docs/ARCHITECTURE.md` only specifies K-only cache, TurboQuant, and optional
   sliding window.
 
 **Impact**
@@ -619,7 +619,7 @@ Define separate cadence:
 - `README.md:433` says 20-50 held-out prompts.
 - `README.md:539` says 50 diverse prompts.
 - `README.md:869` says Tier 2 uses the 12-prompt subset.
-- `LEARNINGS.md:309-314` says the validated v5 OOD probe is 12 prompts.
+- `../docs/LEARNINGS.md:309-314` says the validated v5 OOD probe is 12 prompts.
 
 **Impact**
 
@@ -659,11 +659,11 @@ Use three levels:
 
 **Evidence**
 
-- `ARCHITECTURE.md:581-588` says mHC adds ~720K params and ~6.7% wall-clock
+- `../docs/ARCHITECTURE.md:581-588` says mHC adds ~720K params and ~6.7% wall-clock
   overhead.
-- `ARCHITECTURE.md:538-540` uses up to 20 Sinkhorn iterations per generated
+- `../docs/ARCHITECTURE.md:538-540` uses up to 20 Sinkhorn iterations per generated
   matrix.
-- `ARCHITECTURE.md:551-567` generates `A/B/C` dynamically per token.
+- `../docs/ARCHITECTURE.md:551-567` generates `A/B/C` dynamically per token.
 
 **Impact**
 

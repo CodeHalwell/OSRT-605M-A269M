@@ -3,7 +3,7 @@
 *Part of the OSRT-605M `docs/` architecture series. This chapter explains the
 single most mathematically subtle block in the model. Ground truth is
 `src/osrt/mhc.py` and the mHC integration in `src/osrt/model.py`; design intent
-is `ARCHITECTURE.md` §8. Where my prose and the code disagree, the code wins —
+is `../docs/ARCHITECTURE.md` §8. Where my prose and the code disagree, the code wins —
 discrepancies are flagged inline.*
 
 ---
@@ -11,7 +11,7 @@ discrepancies are flagged inline.*
 ## 1. Purpose — why deep recursive residual stacks need this
 
 OSRT is a *recursive* transformer: 3 physical blocks are run 6 times in a loop,
-giving **18 effective layers** (`ARCHITECTURE.md:131`). Recursion is how the
+giving **18 effective layers** (`../docs/ARCHITECTURE.md:131`). Recursion is how the
 model gets depth for cheap — the same weights are reused, so 18 layers cost the
 parameters of 3. But weight reuse turns a benign property of a single layer into
 a compounding one across the loop.
@@ -83,7 +83,7 @@ back into the 4 channels (the `C` matrix). The attention/MoE code never sees
 > Why `.repeat` and not `.expand`? `.expand` returns a *view* — all four
 > channels would alias the same memory, and an in-place write to one would
 > corrupt the others. This was "Bug 1" in an early design draft
-> (`src/osrt/model.py:1353-1354`, `ARCHITECTURE.md:793-795`); the real code uses
+> (`src/osrt/model.py:1353-1354`, `../docs/ARCHITECTURE.md:793-795`); the real code uses
 > `.repeat` to get four genuinely separate buffers.
 
 The cost of widening is paid *only* on the residual tensor and the small mixing
@@ -119,7 +119,7 @@ the docstring (`src/osrt/mhc.py:6`).
 ### The three einsums
 
 The contractions are spelled out explicitly so the index bookkeeping is correct
-by construction (this was "Bug 2" in the old draft — `ARCHITECTURE.md:797-800`).
+by construction (this was "Bug 2" in the old draft — `../docs/ARCHITECTURE.md:797-800`).
 
 **Input view** — weight each channel by `A` and sum over channels `c`
 (`src/osrt/mhc.py:92-95`):
@@ -197,7 +197,7 @@ The constraint: **B is doubly stochastic.** That means
 2. every **row** sums to 1, and
 3. every **column** sums to 1.
 
-The set of all such `n×n` matrices is the **Birkhoff polytope** (`ARCHITECTURE.md`
+The set of all such `n×n` matrices is the **Birkhoff polytope** (`../docs/ARCHITECTURE.md`
 §8.3). Permutation matrices are its corners; convex combinations of permutations
 fill its interior. "Manifold-constrained" in the block's name refers to
 constraining `B` to lie on this set.
@@ -225,11 +225,11 @@ Two consequences make this the right tool for a recursive stack:
 - **Closed under composition.** The product of two doubly-stochastic matrices is
   doubly-stochastic. So stacking 18 effective layers keeps the *composed*
   residual transform doubly-stochastic and still ‖·‖₂ ≤ 1 — the property does
-  not erode with depth (`ARCHITECTURE.md:688-689`).
+  not erode with depth (`../docs/ARCHITECTURE.md:688-689`).
 
 This is the 1,478× → 1.0× conversion promised in §1, now earned.
-`ARCHITECTURE.md` §16.2 lists it as a hard invariant: *"`B_l` MUST satisfy
-‖B_l‖₂ ≤ 1 at every step (doubly stochastic)"* (`ARCHITECTURE.md:1239`). The
+`../docs/ARCHITECTURE.md` §16.2 lists it as a hard invariant: *"`B_l` MUST satisfy
+‖B_l‖₂ ≤ 1 at every step (doubly stochastic)"* (`../docs/ARCHITECTURE.md:1239`). The
 test `tests/test_mhc.py::test_sinkhorn_is_doubly_stochastic_and_nonexpansive`
 checks `matrix_norm(b, ord=2) ≤ 1.01` empirically.
 
@@ -301,13 +301,13 @@ applied to values already ≤ 0 (each entry was divided by a sum it belongs to),
 the result lands in `(0, 1]` — and the gradient path is a chain of stable
 `subtract`/`logsumexp` ops instead of 20 divides.
 
-> **Note vs. `ARCHITECTURE.md` §8.3.** The design sketch shows `M_0 = exp(~B_l)`
-> followed by row/col normalization on `M` (`ARCHITECTURE.md:679-682`) — i.e. the
+> **Note vs. `../docs/ARCHITECTURE.md` §8.3.** The design sketch shows `M_0 = exp(~B_l)`
+> followed by row/col normalization on `M` (`../docs/ARCHITECTURE.md:679-682`) — i.e. the
 > *naive* form. The shipped code does **not** do that; it treats the raw logits
 > directly as the log-domain matrix and never forms `exp(~B)` at all (the
 > docstring even says the naive form "drives training to NaN"). Trust the code:
 > the log-domain version in `mhc.py` is the real one, and the §8.3 pseudocode is
-> an illustrative sketch (`ARCHITECTURE.md:788` flags the whole §10 walkthrough
+> an illustrative sketch (`../docs/ARCHITECTURE.md:788` flags the whole §10 walkthrough
 > as illustrative for the same reason).
 
 A practical caveat worth knowing: 20 iterations gives *approximate* double
@@ -399,7 +399,7 @@ head (`src/osrt/model.py:1524-1527`).
 
 ### Why a dedicated head, not a reused A
 
-This was "Bug 3" in the early design (`ARCHITECTURE.md:802-805`). The dynamic
+This was "Bug 3" in the early design (`../docs/ARCHITECTURE.md:802-805`). The dynamic
 `A` matrices are generated *inside* each sub-block to pick that sub-block's
 input view, conditioned on the residual at that moment. Reusing the *last*
 sub-block's `A` to collapse for the LM head would be using a stale, purpose-built
@@ -463,7 +463,7 @@ Reading it:
 Each piece = `static bias` + `alpha · dynamic`. The static bias supplies the
 identity-init behaviour (§6); `alpha` (small at init) gates how much the
 per-token dynamic term is allowed to perturb it. The `W_*` are 2D matrices, so
-they are optimized by Muon (`ARCHITECTURE.md:1273-1274`).
+they are optimized by Muon (`../docs/ARCHITECTURE.md:1273-1274`).
 
 ### The sigmoid bounds on A and C — why
 
@@ -474,7 +474,7 @@ they are optimized by Muon (`ARCHITECTURE.md:1273-1274`).
   cancellation artifact.
 - `C ∈ [0,2]`: the output is scattered into channels with non-negative weights,
   but the factor 2 (rather than 1) leaves headroom to *amplify* a sub-block's
-  contribution into a channel when useful (`ARCHITECTURE.md:713-721`: "Prevents
+  contribution into a channel when useful (`../docs/ARCHITECTURE.md:713-721`: "Prevents
   signal cancellation. The factor 2 on C_l preserves the ability to scale layer
   contributions").
 
@@ -520,7 +520,7 @@ total                                 =  921,766   ✓ matches compute_budget.py
 The crucial line is **shared across loop iterations** (`src/osrt/mhc.py:14-16`).
 If mHC re-created generators per loop it would be 6× the params; instead one
 attn-generator and one ffn-generator per block are reused all 6 loops, which is
-why the count is ~922K and not ~5.5M. `ARCHITECTURE.md:723` rounds this to
+why the count is ~922K and not ~5.5M. `../docs/ARCHITECTURE.md:723` rounds this to
 "~720K, ~6.7% overhead" — the precise figure from `compute_budget.py` is
 **921,766**; trust the script.
 
@@ -530,7 +530,7 @@ The parameter overhead is negligible; the *compute* overhead is the Sinkhorn
 projections. Per forward pass:
 
 ```
-18 effective layers × 2 sub-blocks = 36 mHC applications   (ARCHITECTURE.md:727)
+18 effective layers × 2 sub-blocks = 36 mHC applications   (../docs/ARCHITECTURE.md:727)
 each runs Sinkhorn with 20 iterations
 each iteration = 2 logsumexp + 2 subtracts over (B, S, 4, 4)
 → 36 × 20 = 720 row/col normalization rounds per forward
@@ -541,7 +541,7 @@ Each individual op is tiny (a `4×4` per token), but there are a lot of them, an
 Unfused, that is ~720 small kernel launches per forward — death by a thousand
 cuts on GPU. **This block wants `torch.compile` or a fused Sinkhorn kernel** to
 collapse the per-iteration ops into one graph; eager-mode small-tensor Sinkhorn
-is the dominant mHC runtime cost. `ARCHITECTURE.md:730` budgets ~6.7%
+is the dominant mHC runtime cost. `../docs/ARCHITECTURE.md:730` budgets ~6.7%
 wall-clock overhead, which assumes the projections are reasonably fused.
 
 ### The NaN watch-item
@@ -565,7 +565,7 @@ bound. This is the open item, not a settled property.
   bare (without the preset) runs the standard single-stream residual. The block
   is fully wired and tested (`tests/test_mhc.py`: Sinkhorn double-stochasticity
   + non-expansion, shape correctness, finite forward).
-- **Pending a GPU-phase stability gate.** `ARCHITECTURE.md:138` and `:1483`
+- **Pending a GPU-phase stability gate.** `../docs/ARCHITECTURE.md:138` and `:1483`
   flag mHC as "NaN-prone on [sustained] training — needs GPU profiling." The
   feature is on by design intent but carries a stability caveat: the proof gives
   per-step boundedness; the empirical question is whether full training stays

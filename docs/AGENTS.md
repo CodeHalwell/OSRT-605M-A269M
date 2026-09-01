@@ -1,4 +1,4 @@
-# AGENTS.md
+# ../docs/AGENTS.md
 
 Guidance for AI assistants (Codex et al.) working in this repository.
 
@@ -56,10 +56,10 @@ tests/                # pytest suite (run on CPU)
 configs/              # exported HF config.json
 tokenizer/            # 65K byte-level BPE tokenizer artefacts (v6 contract)
 docs/                 # numbered architecture chapters (00-overview → 10-...)
-ARCHITECTURE.md       # terse technical spec (config-value source of truth)
+../docs/ARCHITECTURE.md       # terse technical spec (config-value source of truth)
 README.md             # design philosophy + the "why" / integrated training plan
-LEARNINGS.md          # v5 (363M) failure modes this design avoids
-RESEARCH.md           # external paper bibliography behind each technique
+../docs/LEARNINGS.md          # v5 (363M) failure modes this design avoids
+../docs/RESEARCH.md           # external paper bibliography behind each technique
 archive/              # v3/v4/v5 historical code + docs — NOT importable, reference only
 ```
 
@@ -131,17 +131,17 @@ that subclass each other (e.g. `MidtrainConfig(PretrainConfig)`, `SFTv2Config`,
   `OSRT_605M_A288M`, and `OSRT_605M_A279M` (a back-compat alias → same preset)
   all predate the corrected count. The instantiated model is **601M physical /
   278M active**. Trust `compute_budget.py` and `presets.py`, not the names.
-- **Doc precedence.** When `docs/` chapters and `ARCHITECTURE.md` disagree, the
+- **Doc precedence.** When `docs/` chapters and `../docs/ARCHITECTURE.md` disagree, the
   chapters cite the code (`file:line`) and **the code wins**. `src/osrt/` is
   ground truth. When you change behaviour, update the relevant `docs/0X-*.md`
-  chapter and the `ARCHITECTURE.md` section it maps to.
+  chapter and the `../docs/ARCHITECTURE.md` section it maps to.
 - **`archive/` (v3/v4/v5) is reference only** — not importable, do not edit as
   if it were live code. Only `src/osrt/` is the current architecture.
 - **Checkpoints, data, tokenizer binaries, wandb runs are git-ignored**
   (`*.pt`, `*.safetensors`, `data/*.bin`, `checkpoints/`, `wandb/`). Don't commit
   weights; commit code and configs.
 - **Run a `*_sanity` / smoke variant before any real GPU spend.** The repo's
-  whole philosophy (see README §0, LEARNINGS.md) is "measure before you build" —
+  whole philosophy (see README §0, ../docs/LEARNINGS.md) is "measure before you build" —
   loop collapse, router collapse, and reward hacking all bit the v5 lineage late.
 - **Stability features are load-bearing**, not optional: QK-norm, sandwich
   RMSNorm, per-loop routing accounting, aux-loss-free balancing, SwiGLU clamp.
@@ -159,6 +159,6 @@ that subclass each other (e.g. `MidtrainConfig(PretrainConfig)`, `SFTv2Config`,
 
 - Architecture deep-dive: start at `docs/00-overview.md`, then chapters 01–10.
 - The "why" and training plan: `README.md`.
-- Config-value spec: `ARCHITECTURE.md`.
-- What went wrong before (and why the design is shaped this way): `LEARNINGS.md`.
-- Papers behind each technique: `RESEARCH.md`.
+- Config-value spec: `../docs/ARCHITECTURE.md`.
+- What went wrong before (and why the design is shaped this way): `../docs/LEARNINGS.md`.
+- Papers behind each technique: `../docs/RESEARCH.md`.

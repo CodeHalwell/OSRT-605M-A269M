@@ -238,7 +238,7 @@ them contradict the "obvious" description — read these carefully.
 | `loop_embeddings` | `nn.Embedding`, `model.py:213` | **AdamW**, wd=0 |
 | `router_balance_bias` | registered buffer, `model.py:237` | **no optimizer** (heuristic) |
 
-This matches `ARCHITECTURE.md` §16.7 (Muon = attention / experts / HRA / mHC;
+This matches `../docs/ARCHITECTURE.md` §16.7 (Muon = attention / experts / HRA / mHC;
 AdamW = embedding, LM head, norms, biases; router bias = heuristic only).
 
 ### Two surprises worth flagging (code beats the docstring)
@@ -291,7 +291,7 @@ downstream.
 Decoupled weight decay is the counterweight: the `(1 − lr·wd)` factor pulls every
 weight geometrically toward zero each step, independent of the gradient, capping
 the spectral drift. This is why the Muon recipe treats decoupled WD as part of
-the algorithm, not an optional regulariser (`ARCHITECTURE.md` §16.7: "Weight
+the algorithm, not an optional regulariser (`../docs/ARCHITECTURE.md` §16.7: "Weight
 decay applied via decoupled scheme (Muon paper)").
 
 ### Surprise: in OSRT, *all* the weight decay is Muon's

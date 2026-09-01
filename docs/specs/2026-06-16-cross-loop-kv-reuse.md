@@ -3,14 +3,14 @@
 **Date:** 2026-06-16
 **Status:** Investigation / hypothesis — NOT approved, NOT implemented.
 **Owner axis:** decode memory bandwidth (the project's stated attention thesis).
-**Companion:** `ARCHITECTURE.md` §6.2–6.3 (KDV), `docs/02-attention.md`.
+**Companion:** `../../docs/ARCHITECTURE.md` §6.2–6.3 (KDV), `docs/02-attention.md`.
 
 ---
 
 ## 1. Why this note exists
 
 OSRT's attention design is justified on **memory bandwidth**, not expressivity
-(`ARCHITECTURE.md` §6.2): autoregressive decode is HBM-bandwidth-bound, so
+(`../../docs/ARCHITECTURE.md` §6.2): autoregressive decode is HBM-bandwidth-bound, so
 decode throughput scales as `1 / (cache bytes per token per layer)`. KDV banks a
 **constant 2×** on that axis (cache 512 scalars/token/layer instead of 1024).
 
@@ -73,7 +73,7 @@ YOCO (decoder-decoder, one global KV), and RRT-style recursive KV sharing.
 
 Recursion in OSRT is sold as **iterative refinement** — each loop is supposed
 to *change* the representation (the recursion-for-reasoning premise,
-`paper.tex` related work). If loops genuinely refine, then their keys/values
+`../../paper/paper.tex` related work). If loops genuinely refine, then their keys/values
 **should** differ across loops, and sharing them is lossy *by construction*.
 
 > Cross-loop KV reuse trades against the exact thing the architecture bets on.

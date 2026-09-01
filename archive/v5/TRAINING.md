@@ -30,7 +30,7 @@ experts per block plus one always-on shared expert (no dense FFN).
 | RoPE θ | 10,000 |
 
 Architectural decisions and the v4 → v5 lessons that justify them are
-documented separately in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+documented separately in [`../../docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
 ---
 

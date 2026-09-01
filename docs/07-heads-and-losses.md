@@ -9,7 +9,7 @@
 
 A note on sourcing. Where this document states a *mechanic* it cites
 `src/osrt/model.py`, `src/osrt/config.py`, and `src/osrt/presets.py` by line —
-that is the source of truth. `ARCHITECTURE.md` is cited only for *intent* and
+that is the source of truth. `../docs/ARCHITECTURE.md` is cited only for *intent* and
 *history*. Its §9/§11 pseudocode is explicitly "illustrative ... the
 implementation in `model.py` is the source of truth," and in a few places the
 prose has drifted from the code. **When they disagree, the code wins, and the
@@ -243,7 +243,7 @@ projection. The *vocab* projection still reuses the tied embedding — only this
 small per-head transform is new. So an MTP head is "partly tied": new
 `dim×dim` projection, tied final readout.
 
-> **Discrepancy flag.** `ARCHITECTURE.md §9.3` says MTP heads "are tied with
+> **Discrepancy flag.** `../docs/ARCHITECTURE.md §9.3` says MTP heads "are tied with
 > embedding too — no separate params." That is wrong for the projection layer:
 > the `RMSNorm + Linear(dim,dim)` per head is genuinely new weight. The
 > `compute_budget.py` `mtp_heads` category confirms **4,721,664 params** for the
@@ -279,7 +279,7 @@ Mechanics:
   main LM head already covers +1; MTP extends past it. (The brief's "+2/+3" is
   correct and matches code.)
 
-  > **Discrepancy flag.** `ARCHITECTURE.md §9.3/§11.4` describes MTP at offsets
+  > **Discrepancy flag.** `../docs/ARCHITECTURE.md §9.3/§11.4` describes MTP at offsets
   > **+1/+2**. The code uses **+2/+3** (`offset = k + 2`,
   > `src/osrt/model.py:1762`). The ARCHITECTURE doc is stale here; the code and
   > this chapter use +2/+3.
@@ -371,7 +371,7 @@ balanced — a long-context (phase 3, `seq_len=8192`) failure mode.
 > *logged* every step but contributes **exactly 0** to the gradient until you
 > opt in (intended for the long-context phase). It appears in the total-loss
 > formula below for completeness; in the standard run its coefficient zeroes it
-> out. (Ignore `ARCHITECTURE.md §11.3`'s `α=0.0001` — that section is stale and
+> out. (Ignore `../docs/ARCHITECTURE.md §11.3`'s `α=0.0001` — that section is stale and
 > conflates the global and sequence balance losses.)
 
 The aux-loss-**free** balance-bias controller is a *separate* heuristic: a
@@ -565,5 +565,5 @@ Takeaways:
 - **The aux-loss-free balance-bias controller** (the non-gradient heuristic that
   shares load at deploy time) — chapter 03 (MoE & routing). It is *not* one of
   the three differentiable router losses in §5.
-- **MTP / DeepSeek-V3-V4 intent** — `ARCHITECTURE.md §9.3, §11.4` (note the
+- **MTP / DeepSeek-V3-V4 intent** — `../docs/ARCHITECTURE.md §9.3, §11.4` (note the
   +1/+2 vs code's +2/+3 drift flagged in §4.3).

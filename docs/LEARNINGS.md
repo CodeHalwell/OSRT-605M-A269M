@@ -1,4 +1,4 @@
-# LEARNINGS.md — Everything we learned from nano-osrt v5 (363M)
+# ../docs/LEARNINGS.md — Everything we learned from nano-osrt v5 (363M)
 
 **Scope:** the full lineage of v5 nano-osrt training, from pretrain →
 SFT → GRPO → MOPD distillation → grpo_multi → system-prompt
@@ -8,9 +8,9 @@ discovery. Every failure, every fix, every metric that surprised us.
 repeat any of the v5 mistakes.
 
 **Companion docs:**
-- [`README.md`](README.md) — the v6 design that bakes in these lessons
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — v6 technical spec
-- [`RESEARCH.md`](RESEARCH.md) — external research that shaped v6
+- [`README.md`](../README.md) — the v6 design that bakes in these lessons
+- [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) — v6 technical spec
+- [`../docs/RESEARCH.md`](../docs/RESEARCH.md) — external research that shaped v6
 
 ---
 
@@ -736,7 +736,7 @@ isn't trained" followed by "oh no GRPO is hacking the rewards"
 followed by "oh wait some of this actually works."
 
 v6 (OSRT-600M) is "measure first, then build". Everything in 
-[`README.md`](README.md) is a direct response to a specific v5
+[`README.md`](../README.md) is a direct response to a specific v5
 failure mode documented above.
 
 The biggest single takeaway: **for a small model, training-pipeline

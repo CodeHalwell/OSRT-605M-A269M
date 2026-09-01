@@ -13,7 +13,7 @@ Recursive Mixtral-style MoE transformer. 363M physical params, ~192M active per 
 - **Eval-time drop-free capacity:** chunk-stable inference by construction.
 - **KV-cached generate:** prefill + decode with per-effective-layer cache.
 
-See `ARCHITECTURE.md` for full design rationale and the ablation sequence that led here.
+See `../../docs/ARCHITECTURE.md` for full design rationale and the ablation sequence that led here.
 
 ## Layout
 

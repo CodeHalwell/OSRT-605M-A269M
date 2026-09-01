@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-07
 **Source reviews:** `agy-plan-reviewed.md` (Antigravity), `codex-plan-review.md` (Codex)
-**Reviewed docs:** `README.md`, `ARCHITECTURE.md`, `LEARNINGS.md`, `RESEARCH.md`
+**Reviewed docs:** `README.md`, `../docs/ARCHITECTURE.md`, `../docs/LEARNINGS.md`, `../docs/RESEARCH.md`
 
 ## Verdict
 
@@ -67,15 +67,15 @@ churn but not silent breakage if caught at integration time.
 
 See `MECHANICAL_FIXES.md` for the diff applied. Specifically:
 
-- ARCHITECTURE.md §1: typo fix (32,768 → 65,536)
-- ARCHITECTURE.md §3: clarify tokenizer/ on disk is v5; v6 needs regen with spec IDs
-- ARCHITECTURE.md §13/§14: KV cache double-count removed, one baseline only
-- ARCHITECTURE.md §2: pick canonical active-param number
+- ../docs/ARCHITECTURE.md §1: typo fix (32,768 → 65,536)
+- ../docs/ARCHITECTURE.md §3: clarify tokenizer/ on disk is v5; v6 needs regen with spec IDs
+- ../docs/ARCHITECTURE.md §13/§14: KV cache double-count removed, one baseline only
+- ../docs/ARCHITECTURE.md §2: pick canonical active-param number
 - README.md cost section: reconcile 50K H100-hr line with stated $/hr
-- RESEARCH.md: fix DeepSeek-V4 citation (point at real DeepSeek-V4 paper, mark LFM2 separately)
+- ../docs/RESEARCH.md: fix DeepSeek-V4 citation (point at real DeepSeek-V4 paper, mark LFM2 separately)
 - Repo state: README header note that `pyproject.toml`/`tests/` still
   point at archived v5 package; v6 package layout TBD
-- ARCHITECTURE.md §17 / new §18: explicit `DECISION REQUIRED` callouts
+- ../docs/ARCHITECTURE.md §17 / new §18: explicit `DECISION REQUIRED` callouts
   for Tier-1 items the user needs to resolve
 
 ## What this synthesis did NOT touch (needs your decision)
@@ -92,7 +92,7 @@ These are deferred to you, not silently changed:
 ## Recommended next moves
 
 1. **Read SYNTHESIS.md (this doc) + the inline `DECISION REQUIRED`
-   callouts now in ARCHITECTURE.md**
+   callouts now in ../docs/ARCHITECTURE.md**
 2. Resolve the 6 design decisions above
 3. Then I write a `compute_budget.py` that generates all the
    parameter/FLOP/memory numbers from canonical config, replace
